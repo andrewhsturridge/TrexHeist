@@ -1,7 +1,7 @@
 #define TREX_TRANSPORT_ESPNOW
 #include <Arduino.h>
-#include <TREX_Shared/Protocol.h>
-#include <TREX_Shared/Transport.h>
+#include <TrexProtocol.h>
+#include <TrexTransport.h>
 
 constexpr uint8_t  STATION_ID   = 1;   // pick 1..5 for your loot station IDs
 constexpr uint8_t  WIFI_CHANNEL = 6;
