@@ -1,1 +1,14 @@
+# Compiled output
+*.bin
+*.elf
+*.hex
+*.map
+
+# Build directory
+build/
+
+# VS Code settings
+.vscode/
+
+# macOS Finder metadata
 .DS_Store
