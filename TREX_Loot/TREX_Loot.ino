@@ -21,6 +21,9 @@
 #include <TrexProtocol.h>
 #include <TrexTransport.h>
 
+volatile bool gameActive = true;   // becomes false on GAME_OVER; true on GAME_START
+volatile bool wasPaused  = false;     // tracks transitions into/out of pause
+
 /* ── IDs & radio ───────────────────────────────────────────── */
 constexpr uint8_t  STATION_ID    = 1;    // ← set unique 1..5 for each loot station
 constexpr uint8_t  WIFI_CHANNEL  = 6;    // ← must match the T-Rex server
@@ -255,10 +258,20 @@ void onRx(const uint8_t* data, uint16_t len) {
       break;
     }
 
+    case MsgType::GAME_START: {
+      gameActive = true;
+      Serial.println("[LOOT] GAME_START");
+      // optional: visual "ready" hint; ring stays RED until a valid hold
+      break;
+    }
+
     case MsgType::GAME_OVER: {
+      gameActive = false;
       holdActive = false; holdId = 0;
+      carried = 0;
       fillRing(RED);
       stopAudio();
+      Serial.println("[LOOT] GAME_OVER");
       break;
     }
 
@@ -294,6 +307,8 @@ void setup() {
     while (1) { delay(1000); }
   }
 
+  Serial.printf("Trex header ver: %d\n", TREX_PROTO_VERSION);
+
   // Draw last known station inventory (0 until first update)
   drawGaugeInventory(inv, cap);
 }
@@ -301,6 +316,35 @@ void setup() {
 /* ── loop ─────────────────────────────────────────────────── */
 void loop() {
   Transport::loop();
+
+  // ---- PAUSED / GAME OVER: only listen for messages ----
+  if (!gameActive) {
+    if (!wasPaused) {
+      // one-time on entering pause
+      wasPaused = true;
+      holdActive = false; holdId = 0; carried = 0;
+      // clear RFID latches so a still-present band will retrigger on resume
+      tagPresent = false; absentStartMs = 0;
+      // kill any audio just in case
+      if (playing) stopAudio();
+      // show paused state
+      fillRing(RED);
+    }
+
+    // optional: hello ping
+    static uint32_t lastHelloMs = 0;
+    uint32_t now = millis();
+    if (now - lastHelloMs > 1000) { sendHello(); lastHelloMs = now; }
+
+    // STATION_UPDATE will still come in via onRx and refresh the gauge
+    return;  // skip RFID scanning & audio engine entirely
+  } else if (wasPaused) {
+    // we just became active again
+    wasPaused = false;
+    // keep ring red until a valid ACK is received; gauge will update via onRx
+  }
+
+  // ---- NORMAL ACTIVE LOOP BELOW ----
   pumpAudio();
 
   const uint32_t now = millis();

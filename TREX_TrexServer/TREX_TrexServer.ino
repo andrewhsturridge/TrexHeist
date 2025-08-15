@@ -34,8 +34,8 @@ constexpr uint32_t PIR_DEBOUNCE_MS = 60;
 /* ── Sprite 4K serial (non-blocking cues) ─────────────────── */
 constexpr uint32_t SPRITE_BAUD = 9600;
 // Clip map (change to match your SD layout)
-constexpr uint8_t CLIP_NOT_LOOKING = 1;   // GREEN loop
-constexpr uint8_t CLIP_LOOKING     = 2;   // RED loop
+constexpr uint8_t CLIP_NOT_LOOKING = 0;   // GREEN loop
+constexpr uint8_t CLIP_LOOKING     = 1;   // RED loop
 constexpr uint8_t CLIP_GAME_OVER   = 3;   // one-shot
 
 /* ── Team & station config ────────────────────────────────── */
@@ -54,6 +54,12 @@ Phase       g_phase      = Phase::PLAYING;
 LightState  g_lightState = LightState::GREEN;
 uint32_t    g_nextSwitch = 0;
 uint16_t    g_seq        = 1;
+
+struct PendingStart {
+  bool    needGameStart = false;
+  uint8_t nextStation   = 0;  // 1..5
+  bool    needScore     = false;
+} g_pending;
 
 struct PlayerRec {
   TrexUid  uid{};
@@ -106,6 +112,13 @@ void sendStateTick(uint32_t msLeft) {
   p->state = (uint8_t)g_lightState;
   p->msLeft = msLeft;
   Transport::broadcast(buf,sizeof(buf));
+}
+
+void bcastGameStart() {
+  uint8_t buf[sizeof(MsgHeader)];
+  packHeader((uint8_t)MsgType::GAME_START, 0, buf);
+  bool ok = Transport::broadcast(buf, sizeof(buf));
+  Serial.printf("[TREX] GAME_START broadcast %s\n", ok ? "OK" : "FAILED");
 }
 
 void bcastGameOver(uint8_t reason /*GameOverReason*/) {
@@ -205,9 +218,13 @@ void startNewGame() {
   teamScore = 0;
   for (int i=0;i<MAX_PLAYERS;i++) { players[i].used=false; players[i].carried=0; players[i].banked=0; }
   for (int i=0;i<MAX_HOLDS;i++) holds[i].active=false;
-  for (uint8_t sid=1; sid<=5; ++sid) { stationInventory[sid]=stationCapacity[sid]; bcastStation(sid); }
-  bcastScore();
-  enterGreen();
+  for (uint8_t sid=1; sid<=5; ++sid) stationInventory[sid]=stationCapacity[sid];
+
+  g_pending.needGameStart = true;   // send this first
+  g_pending.nextStation   = 1;      // then stations 1..5
+  g_pending.needScore     = true;   // then score
+
+  enterGreen();                     // cadence starts; ticks will still go out
 }
 
 /* ── RX handler (stations → server) ───────────────────────── */
@@ -351,6 +368,8 @@ void setup() {
     while (1) delay(1000);
   }
 
+  Serial.printf("Trex header ver: %d\n", TREX_PROTO_VERSION);
+
   // Start game
   startNewGame();
 }
@@ -360,6 +379,23 @@ void loop() {
   Transport::loop();
 
   uint32_t now = millis();
+
+  // Game start drip broadcast
+  static uint32_t lastSend = 0;
+  if (millis() - lastSend >= 50) { // ~20 msgs/sec, avoids queue overflow
+    if (g_pending.needGameStart) {
+      bcastGameStart();
+      g_pending.needGameStart = false;
+      lastSend = millis();
+    } else if (g_pending.nextStation >= 1 && g_pending.nextStation <= 5) {
+      bcastStation(g_pending.nextStation++);
+      lastSend = millis();
+    } else if (g_pending.needScore) {
+      bcastScore();
+      g_pending.needScore = false;
+      lastSend = millis();
+    }
+  }
 
   // 1) Broadcast STATE_TICK at ~5 Hz
   static uint32_t lastTick = 0;
