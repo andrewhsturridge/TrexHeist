@@ -3,11 +3,16 @@
   ------------------------------------------------------------------
   • RC522              CS=5  RST=6   SPI: SCK=36 MISO=37 MOSI=35
   • 14-px ring         GPIO 38
-  • 85-px pipe gauge   GPIO 18   (set GAUGE_LEN to your strip length)
+  • 56-px pipe gauge   GPIO 18   (set GAUGE_LEN to your strip length)
   • MOSFET light       GPIO 17
-  • I²S audio          BCLK 43 | LRCLK 44 | DOUT 33  (48 kHz WAV)
+  • I²S audio          BCLK 43 | LRCLK 44 | DOUT 33
   • Transport          ESP-NOW via TrexTransport (channel must match T-Rex)
 */
+
+// ======= AUDIO BACKEND SELECTOR =======
+// 1 = PROGMEM (embed .wav in code)   |  0 = LittleFS (+ buffer)
+#define TREX_AUDIO_PROGMEM 1
+// =====================================
 
 #include <Arduino.h>
 #include <SPI.h>
@@ -16,14 +21,18 @@
 #include <AudioGeneratorWAV.h>
 #include <AudioOutputI2S.h>
 
-#include <AudioFileSourcePROGMEM.h>
-#include "replenish.h"  // defines: unsigned char replenish_wav[]; unsigned int replenish_wav_len;
+#if TREX_AUDIO_PROGMEM
+  #include <AudioFileSourcePROGMEM.h>
+  #include "replenish.h"  // const … PROGMEM array + length
+#else
+  #include <LittleFS.h>
+  #include <AudioFileSourceLittleFS.h>
+  #include <AudioFileSourceBuffer.h>
+  constexpr char CLIP_PATH[] = "/replenish.wav";
+#endif
 
 #include <TrexProtocol.h>
 #include <TrexTransport.h>
-
-volatile bool gameActive = true;   // becomes false on GAME_OVER; true on GAME_START
-volatile bool wasPaused  = false;     // tracks transitions into/out of pause
 
 /* ── IDs & radio ───────────────────────────────────────────── */
 constexpr uint8_t  STATION_ID    = 1;    // ← set unique 1..5 for each loot station
@@ -48,17 +57,22 @@ constexpr uint8_t PIN_MOSFET   = 17;
 constexpr int PIN_I2S_BCLK     = 43;
 constexpr int PIN_I2S_LRCLK    = 44;
 constexpr int PIN_I2S_DOUT     = 33;
-constexpr char CLIP_PATH[]     = "/replenish.wav";
 
 /* ── objects ───────────────────────────────────────────────── */
 MFRC522 rfid(PIN_RFID_CS, PIN_RFID_RST);
 Adafruit_NeoPixel ring (14,         PIN_RING,  NEO_GRB + NEO_KHZ800);
 Adafruit_NeoPixel gauge(GAUGE_LEN,  PIN_GAUGE, NEO_GRB + NEO_KHZ800);
 
-AudioFileSourcePROGMEM *wavMem = nullptr;   // NEW: read from flash array
-AudioGeneratorWAV      *decoder = nullptr;
-AudioOutputI2S         *i2sOut  = nullptr;
-bool                    playing = false;
+/* audio (conditional) */
+#if TREX_AUDIO_PROGMEM
+  AudioFileSourcePROGMEM *wavSrc = nullptr;
+#else
+  AudioFileSourceLittleFS *wavFile = nullptr;
+  AudioFileSourceBuffer   *wavBuf  = nullptr;
+#endif
+AudioGeneratorWAV *decoder = nullptr;
+AudioOutputI2S    *i2sOut  = nullptr;
+bool               playing = false;
 
 /* ── colours ──────────────────────────────────────────────── */
 static inline uint32_t C_RGB(uint8_t r,uint8_t g,uint8_t b){ return Adafruit_NeoPixel::Color(r,g,b); }
@@ -72,25 +86,74 @@ constexpr uint32_t ABSENCE_MS = 150;   // debounce removal
 bool          tagPresent      = false;
 uint32_t      absentStartMs   = 0;
 
-/* ── Hold/session state (from server) ─────────────────────── */
-uint32_t  holdId       = 0;
-bool      holdActive   = false;
-uint8_t   carried      = 0;    // player carried (server-auth)
-uint8_t   maxCarry     = 8;    // provided in ACK
-uint16_t  inv          = 0;    // station inventory (server-auth)
-uint16_t  cap          = GAUGE_LEN;  // capacity (server config)
-TrexUid   currentUid{};        // last seen UID
+/* ── Game/hold state (server-auth) ────────────────────────── */
+volatile bool gameActive = true;     // flipped by GAME_OVER/START in onRx()
+volatile bool holdActive = false;    // true only after accepted ACK
+bool      wasPaused  = false;        // local pause latch
 
-/* ── Broadcast state ──────────────────────────────────────── */
+uint32_t  holdId       = 0;
+uint8_t   carried      = 0;
+uint8_t   maxCarry     = 8;
+uint16_t  inv          = 0;
+uint16_t  cap          = GAUGE_LEN;
+TrexUid   currentUid{};
+
 LightState g_lightState = LightState::GREEN;
 
 /* ── misc ─────────────────────────────────────────────────── */
 uint16_t g_seq = 1;            // outgoing message seq
 uint32_t lastHelloMs = 0;
 
-/* ── helpers ──────────────────────────────────────────────── */
-static inline void pumpAudio() { if (playing && decoder) decoder->loop(); }
+/* ── audio helpers ────────────────────────────────────────── */
+static bool openChain() {
+  if (decoder && decoder->isRunning()) decoder->stop();
 
+#if TREX_AUDIO_PROGMEM
+  if (wavSrc) { delete wavSrc; wavSrc = nullptr; }
+  wavSrc = new AudioFileSourcePROGMEM(replenish_wav, replenish_wav_len);
+#else
+  if (wavBuf)  { delete wavBuf;  wavBuf  = nullptr; }
+  if (wavFile) { delete wavFile; wavFile = nullptr; }
+  wavFile = new AudioFileSourceLittleFS(CLIP_PATH);
+  if (!wavFile) { Serial.println("[LOOT] wavFile alloc fail"); return false; }
+  // 4 KB buffer smooths over LED .show() stalls
+  wavBuf = new AudioFileSourceBuffer(wavFile, 4096);
+  if (!wavBuf) { Serial.println("[LOOT] wavBuf alloc fail"); return false; }
+#endif
+
+  if (!decoder) decoder = new AudioGeneratorWAV();
+#if TREX_AUDIO_PROGMEM
+  bool ok = decoder->begin(wavSrc, i2sOut);
+#else
+  bool ok = decoder->begin(wavBuf, i2sOut);
+#endif
+  if (!ok) Serial.println("[LOOT] decoder.begin() failed");
+  return ok;
+}
+
+bool startAudio() {
+  if (playing) return true;
+  playing = openChain();
+  return playing;
+}
+
+void stopAudio() {
+  if (!playing) return;
+  decoder->stop();        // clean stop so next begin() works
+  playing = false;
+}
+
+inline void handleAudio() {
+  if (!playing || !decoder) return;
+
+  if (!decoder->loop()) {       // EOF or starvation
+    decoder->stop();
+    playing = openChain();      // reopen and continue
+    if (!playing) Serial.println("[LOOT] audio re-begin failed");
+  }
+}
+
+/* ── helpers ──────────────────────────────────────────────── */
 bool isAnyCardPresent(MFRC522 &m) {
   byte atqa[2]; byte len = 2;
   return m.PICC_WakeupA(atqa, &len) == MFRC522::STATUS_OK;
@@ -113,46 +176,9 @@ void packHeader(uint8_t type, uint16_t payLen, uint8_t* buf) {
   h->seq          = g_seq++;
 }
 
-// --- PROGMEM audio chain: robust, loops cleanly ---
-
-static bool openChain() {
-  // Stop previous run if any
-  if (decoder && decoder->isRunning()) decoder->stop();
-
-  // Recreate the PROGMEM source each time (cheap, reliable)
-  if (wavMem) { delete wavMem; wavMem = nullptr; }
-  wavMem = new AudioFileSourcePROGMEM(replenish_wav, replenish_wav_len);
-
-  if (!decoder) decoder = new AudioGeneratorWAV();
-
-  bool ok = decoder->begin(wavMem, i2sOut);   // lets WAV header set the sample rate
-  if (!ok) Serial.println("[LOOT] decoder.begin(PROGMEM) failed");
-  return ok;
-}
-
-bool startAudio() {
-  if (playing) return true;
-  playing = openChain();
-  return playing;
-}
-
-void stopAudio() {
-  if (!playing) return;
-  decoder->stop();        // critical: clean stop so next begin() works
-  playing = false;
-}
-
-inline void handleAudio() {
-  if (!playing || !decoder) return;
-
-  if (!decoder->loop()) {          // EOF or starvation
-    decoder->stop();
-    playing = openChain();         // reopen from PROGMEM and continue
-    if (!playing) Serial.println("[LOOT] re-begin(PROGMEM) failed");
-  }
-}
-
 /* ── LED drawing ──────────────────────────────────────────── */
+inline void pumpAudio() { handleAudio(); }  // feed while we block on LED shows
+
 void drawRingCarried(uint8_t cur, uint8_t maxC) {
   pumpAudio();
   const uint16_t n = ring.numPixels();
@@ -218,7 +244,6 @@ void onRx(const uint8_t* data, uint16_t len) {
       if (h->payloadLen != sizeof(StateTickPayload)) break;
       auto* p = (const StateTickPayload*)(data + sizeof(MsgHeader));
       g_lightState = (p->state == (uint8_t)LightState::GREEN) ? LightState::GREEN : LightState::RED;
-      // Optional: if RED and you want immediate local visual
       if (g_lightState == LightState::RED && !holdActive) fillRing(RED);
       break;
     }
@@ -238,7 +263,6 @@ void onRx(const uint8_t* data, uint16_t len) {
         drawRingCarried(carried, maxCarry);
         drawGaugeInventory(inv, cap);
       } else {
-        // Denied: FULL / EMPTY / DENIED
         fillRing(RED);
       }
       break;
@@ -261,7 +285,6 @@ void onRx(const uint8_t* data, uint16_t len) {
       if (p->holdId != holdId) break;
       holdActive = false; holdId = 0;
       stopAudio();
-      // Visual: leave ring showing last carried or go RED
       fillRing(RED);
       break;
     }
@@ -279,7 +302,6 @@ void onRx(const uint8_t* data, uint16_t len) {
     case MsgType::GAME_START: {
       gameActive = true;
       Serial.println("[LOOT] GAME_START");
-      // optional: visual "ready" hint; ring stays RED until a valid hold
       break;
     }
 
@@ -287,6 +309,7 @@ void onRx(const uint8_t* data, uint16_t len) {
       gameActive = false;
       holdActive = false; holdId = 0;
       carried = 0;
+      tagPresent = false; absentStartMs = 0;
       fillRing(RED);
       stopAudio();
       Serial.println("[LOOT] GAME_OVER");
@@ -304,7 +327,7 @@ void setup() {
   Serial.println("\n[LOOT] Boot");
 
   pinMode(PIN_MOSFET, OUTPUT);
-  digitalWrite(PIN_MOSFET, HIGH);   // simple: on; adjust to taste
+  digitalWrite(PIN_MOSFET, HIGH);
 
   SPI.begin(PIN_SCK, PIN_MISO, PIN_MOSI);
   rfid.PCD_Init();
@@ -315,6 +338,15 @@ void setup() {
   i2sOut = new AudioOutputI2S(0, AudioOutputI2S::EXTERNAL_I2S);
   i2sOut->SetPinout(PIN_I2S_BCLK, PIN_I2S_LRCLK, PIN_I2S_DOUT);
   i2sOut->SetGain(1.0f);
+  // Do NOT force SetRate(); let WAV header choose the rate
+
+#if !TREX_AUDIO_PROGMEM
+  LittleFS.begin();
+  // Optional sanity check:
+  File f = LittleFS.open(CLIP_PATH, "r");
+  if (!f) Serial.println("[LOOT] Missing /replenish.wav on LittleFS");
+  else { Serial.printf("[LOOT] WAV size: %u bytes\n", (unsigned)f.size()); f.close(); }
+#endif
 
   TransportConfig cfg{ /*maintenanceMode=*/false, /*wifiChannel=*/WIFI_CHANNEL };
   if (!Transport::init(cfg, onRx)) {
@@ -322,9 +354,7 @@ void setup() {
     while (1) { delay(1000); }
   }
 
-  Serial.printf("Trex header ver: %d\n", TREX_PROTO_VERSION);
-
-  // Draw last known station inventory (0 until first update)
+  Serial.printf("Trex proto ver: %d\n", TREX_PROTO_VERSION);
   drawGaugeInventory(inv, cap);
 }
 
@@ -335,37 +365,26 @@ void loop() {
   // ---- PAUSED / GAME OVER: only listen for messages ----
   if (!gameActive) {
     if (!wasPaused) {
-      // one-time on entering pause
       wasPaused = true;
       holdActive = false; holdId = 0; carried = 0;
-      // clear RFID latches so a still-present band will retrigger on resume
       tagPresent = false; absentStartMs = 0;
-      // kill any audio just in case
       if (playing) stopAudio();
-      // show paused state
       fillRing(RED);
     }
-
-    // optional: hello ping
-    static uint32_t lastHelloMs = 0;
+    static uint32_t pausedHelloMs = 0;
     uint32_t now = millis();
-    if (now - lastHelloMs > 1000) { sendHello(); lastHelloMs = now; }
-
-    // STATION_UPDATE will still come in via onRx and refresh the gauge
+    if (now - pausedHelloMs > 1000) { sendHello(); pausedHelloMs = now; }
     return;  // skip RFID scanning & audio engine entirely
   } else if (wasPaused) {
-    // we just became active again
     wasPaused = false;
-    // keep ring red until a valid ACK is received; gauge will update via onRx
+    // keep ring red until a valid ACK arrives
   }
 
-  // ---- NORMAL ACTIVE LOOP BELOW ----
-  pumpAudio();
-
+  // ---- NORMAL ACTIVE LOOP ----
   const uint32_t now = millis();
 
-  // HELLO ping (nice for logs; harmless if you omit)
-  if (now - lastHelloMs > 1000) { sendHello(); lastHelloMs = now; }
+  // HELLO ping (light load during active play)
+  if (!holdActive && (now - lastHelloMs > 2000)) { sendHello(); lastHelloMs = now; }
 
   // RFID presence handling
   const bool present = isAnyCardPresent(rfid);
@@ -375,10 +394,9 @@ void loop() {
     if (readUid(rfid, currentUid)) {
       tagPresent    = true;
       absentStartMs = 0;
-      carried = 0; // display will be updated by ACK/TICK
+      carried       = 0;
       sendHoldStart(currentUid);
-      // (Optional) optimistic visual while waiting:
-      fillRing(GREEN);
+      fillRing(GREEN);   // optimistic cue while waiting for ACK
     }
   }
 
@@ -405,5 +423,4 @@ void loop() {
   } else if (playing) {
     stopAudio();
   }
-
 }
