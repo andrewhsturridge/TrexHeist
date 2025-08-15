@@ -13,10 +13,11 @@
 #include <SPI.h>
 #include <MFRC522.h>
 #include <Adafruit_NeoPixel.h>
-#include <LittleFS.h>
-#include <AudioFileSourceLittleFS.h>
 #include <AudioGeneratorWAV.h>
 #include <AudioOutputI2S.h>
+
+#include <AudioFileSourcePROGMEM.h>
+#include "replenish.h"  // defines: unsigned char replenish_wav[]; unsigned int replenish_wav_len;
 
 #include <TrexProtocol.h>
 #include <TrexTransport.h>
@@ -54,10 +55,10 @@ MFRC522 rfid(PIN_RFID_CS, PIN_RFID_RST);
 Adafruit_NeoPixel ring (14,         PIN_RING,  NEO_GRB + NEO_KHZ800);
 Adafruit_NeoPixel gauge(GAUGE_LEN,  PIN_GAUGE, NEO_GRB + NEO_KHZ800);
 
-AudioFileSourceLittleFS *wavSrc = nullptr;
-AudioGeneratorWAV       *decoder= nullptr;
-AudioOutputI2S          *i2sOut = nullptr;
-bool                     playing = false;
+AudioFileSourcePROGMEM *wavMem = nullptr;   // NEW: read from flash array
+AudioGeneratorWAV      *decoder = nullptr;
+AudioOutputI2S         *i2sOut  = nullptr;
+bool                    playing = false;
 
 /* ── colours ──────────────────────────────────────────────── */
 static inline uint32_t C_RGB(uint8_t r,uint8_t g,uint8_t b){ return Adafruit_NeoPixel::Color(r,g,b); }
@@ -112,26 +113,43 @@ void packHeader(uint8_t type, uint16_t payLen, uint8_t* buf) {
   h->seq          = g_seq++;
 }
 
-/* ── audio control ────────────────────────────────────────── */
+// --- PROGMEM audio chain: robust, loops cleanly ---
+
+static bool openChain() {
+  // Stop previous run if any
+  if (decoder && decoder->isRunning()) decoder->stop();
+
+  // Recreate the PROGMEM source each time (cheap, reliable)
+  if (wavMem) { delete wavMem; wavMem = nullptr; }
+  wavMem = new AudioFileSourcePROGMEM(replenish_wav, replenish_wav_len);
+
+  if (!decoder) decoder = new AudioGeneratorWAV();
+
+  bool ok = decoder->begin(wavMem, i2sOut);   // lets WAV header set the sample rate
+  if (!ok) Serial.println("[LOOT] decoder.begin(PROGMEM) failed");
+  return ok;
+}
+
 bool startAudio() {
   if (playing) return true;
-  wavSrc  = new AudioFileSourceLittleFS(CLIP_PATH);
-  decoder = new AudioGeneratorWAV();
-  if (decoder && wavSrc && decoder->begin(wavSrc, i2sOut)) {
-    i2sOut->SetRate(48000);
-    playing = true;
-    return true;
-  }
-  if (decoder) { delete decoder; decoder=nullptr; }
-  if (wavSrc)  { delete wavSrc;  wavSrc=nullptr;  }
-  return false;
+  playing = openChain();
+  return playing;
 }
+
 void stopAudio() {
   if (!playing) return;
-  decoder->stop();
-  delete decoder; decoder=nullptr;
-  delete wavSrc;  wavSrc=nullptr;
+  decoder->stop();        // critical: clean stop so next begin() works
   playing = false;
+}
+
+inline void handleAudio() {
+  if (!playing || !decoder) return;
+
+  if (!decoder->loop()) {          // EOF or starvation
+    decoder->stop();
+    playing = openChain();         // reopen from PROGMEM and continue
+    if (!playing) Serial.println("[LOOT] re-begin(PROGMEM) failed");
+  }
 }
 
 /* ── LED drawing ──────────────────────────────────────────── */
@@ -285,8 +303,6 @@ void setup() {
   delay(50);
   Serial.println("\n[LOOT] Boot");
 
-  LittleFS.begin();
-
   pinMode(PIN_MOSFET, OUTPUT);
   digitalWrite(PIN_MOSFET, HIGH);   // simple: on; adjust to taste
 
@@ -299,7 +315,6 @@ void setup() {
   i2sOut = new AudioOutputI2S(0, AudioOutputI2S::EXTERNAL_I2S);
   i2sOut->SetPinout(PIN_I2S_BCLK, PIN_I2S_LRCLK, PIN_I2S_DOUT);
   i2sOut->SetGain(1.0f);
-  i2sOut->SetRate(48000);
 
   TransportConfig cfg{ /*maintenanceMode=*/false, /*wifiChannel=*/WIFI_CHANNEL };
   if (!Transport::init(cfg, onRx)) {
@@ -384,11 +399,11 @@ void loop() {
     }
   }
 
-  // Audio keep-alive loop/rewind
-  if (playing && decoder) {
-    if (!decoder->loop()) {          // EOF
-      stopAudio();
-      if (tagPresent) startAudio();  // loop while card present
-    }
+  // Audio keep-alive (only while a hold is accepted)
+  if (gameActive && holdActive) {
+    handleAudio();
+  } else if (playing) {
+    stopAudio();
   }
+
 }
