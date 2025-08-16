@@ -36,7 +36,7 @@ constexpr uint32_t SPRITE_BAUD = 9600;
 // Clip map (change to match your SD layout)
 constexpr uint8_t CLIP_NOT_LOOKING = 0;   // GREEN loop
 constexpr uint8_t CLIP_LOOKING     = 1;   // RED loop
-constexpr uint8_t CLIP_GAME_OVER   = 3;   // one-shot
+constexpr uint8_t CLIP_GAME_OVER   = 2;   // one-shot
 
 /* ── Team & station config ────────────────────────────────── */
 constexpr uint8_t  MAX_PLAYERS   = 24;

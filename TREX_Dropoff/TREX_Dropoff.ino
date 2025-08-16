@@ -10,7 +10,7 @@
 
 // ======= AUDIO BACKEND SELECTOR =======
 // 1 = PROGMEM (embed .wav in code)   |  0 = LittleFS (+ buffer)
-#define TREX_AUDIO_PROGMEM 1
+#define TREX_AUDIO_PROGMEM 0
 // =====================================
 
 #include <Arduino.h>
@@ -22,12 +22,12 @@
 
 #if TREX_AUDIO_PROGMEM
   #include <AudioFileSourcePROGMEM.h>
-  #include "replenish.h"  // const … PROGMEM array + length
+  #include "LootDrop.h"  // const … PROGMEM array + length
 #else
   #include <LittleFS.h>
   #include <AudioFileSourceLittleFS.h>
   #include <AudioFileSourceBuffer.h>
-  constexpr char CLIP_PATH[] = "/replenish.wav";
+  constexpr char CLIP_PATH[] = "/LootDrop.wav";
 #endif
 
 #include <TrexProtocol.h>
@@ -103,8 +103,8 @@ uint32_t absentMs[4]   = {0};
 /* game/broadcast state */
 volatile bool gameActive = true;    // onRx flips this
 bool          wasPaused  = false;
-LightState    g_lightState = LightState::GREEN;
-uint32_t      teamScore  = 0;
+volatile LightState    g_lightState = LightState::GREEN;
+volatile uint32_t      teamScore  = 0;
 
 /* misc */
 uint16_t g_seq = 1;
@@ -116,7 +116,7 @@ static bool openChain() {
 
 #if TREX_AUDIO_PROGMEM
   if (wavSrc) { delete wavSrc; wavSrc = nullptr; }
-  wavSrc = new AudioFileSourcePROGMEM(replenish_wav, replenish_wav_len);
+  wavSrc = new AudioFileSourcePROGMEM(LootDrop_wav, LootDrop_wav_len);
 #else
   if (wavBuf)  { delete wavBuf;  wavBuf = nullptr; }
   if (wavFile) { delete wavFile; wavFile = nullptr; }
@@ -233,10 +233,6 @@ void onRx(const uint8_t* data, uint16_t len) {
       auto* p = (const DropResultPayload*)(data + sizeof(MsgHeader));
       teamScore = p->teamScore;
       drawTeamGauges(teamScore);
-      // quick celebrate blink on all rings
-      for (int i=0;i<4;i++) fillRing(i, WHITE);
-      delay(40);
-      for (int i=0;i<4;i++) fillRing(i, tagPresent[i] ? GREEN : RED);
       break;
     }
 
@@ -289,6 +285,7 @@ void setup() {
   // I2S audio (no forced SetRate; WAV header sets it)
   i2sOut = new AudioOutputI2S(0, AudioOutputI2S::EXTERNAL_I2S);
   i2sOut->SetPinout(PIN_I2S_BCLK, PIN_I2S_LRCLK, PIN_I2S_DOUT);
+  i2sOut->SetRate(48000);
   i2sOut->SetGain(1.0f);
 
 #if !TREX_AUDIO_PROGMEM
@@ -296,7 +293,7 @@ void setup() {
   LittleFS.begin();
   // Optional: sanity check the clip exists
   File f = LittleFS.open(CLIP_PATH, "r");
-  if (!f) Serial.println("[DROP] Missing /replenish.wav on LittleFS");
+  if (!f) Serial.println("[DROP] Missing file on LittleFS");
   else { Serial.printf("[DROP] WAV size: %u bytes\n", (unsigned)f.size()); f.close(); }
 #endif
 
