@@ -1,6 +1,7 @@
 /*
   TREX – Drop-off Station (Feather S3 + 4×RC522 + 4×Rings + 2×Gauges + MAX98357)
-  -------------------------------------------------------------------------------
+  Tap-to-drop; play clip once ONLY when team score increases on DROP_RESULT.
+
   • RC522 (x4)   CS: {5,14,18,17}  RST: 11   SPI: SCK=36 MISO=37 MOSI=35
   • 14-px rings  GPIO: {33, 38, 1, 3}
   • 85-px gauges GPIO: {7, 10}
@@ -19,10 +20,12 @@
 #include <Adafruit_NeoPixel.h>
 #include <AudioGeneratorWAV.h>
 #include <AudioOutputI2S.h>
+#include <cstring>
 
 #if TREX_AUDIO_PROGMEM
+  #include <pgmspace.h>
   #include <AudioFileSourcePROGMEM.h>
-  #include "LootDrop.h"  // const … PROGMEM array + length
+  #include "LootDrop.h"  // const unsigned char LootDrop_wav[] PROGMEM; const unsigned int LootDrop_wav_len;
 #else
   #include <LittleFS.h>
   #include <AudioFileSourceLittleFS.h>
@@ -34,10 +37,10 @@
 #include <TrexTransport.h>
 #include "TrexMaintenance.h"
 
+// ---------- Wi-Fi for maintenance ----------
 #define WIFI_SSID   "GUD"
 #define WIFI_PASS   "EscapE66"
-// Use a unique host per device:
-#define HOSTNAME    "Drop-off"   // on Drop-off use "trex-drop-6"
+#define HOSTNAME    "Drop-off"    // unique per device
 
 /* ── IDs & radio ───────────────────────────────────────────── */
 constexpr uint8_t  STATION_ID    = 6;    // drop-off station id
@@ -86,64 +89,119 @@ Adafruit_NeoPixel gauge[2] = {
 #endif
 AudioGeneratorWAV *decoder = nullptr;
 AudioOutputI2S    *i2sOut  = nullptr;
-bool               playing = false;
+bool               playing = false;          // one-shot playback state
+bool               audioExclusive = false;   // freeze LEDs/RFID during playback
 
 /* colours */
 static inline uint32_t C(uint8_t r,uint8_t g,uint8_t b){ return Adafruit_NeoPixel::Color(r,g,b); }
 const uint32_t RED   = C(255,0,0);
 const uint32_t GREEN = C(0,255,0);
 const uint32_t WHITE = C(255,255,255);
+const uint32_t GOLD  = C(255, 190, 30);  // warm gold;
 const uint32_t OFF   = 0;
 
-/* tag tracking */
+/* tag tracking — edge-trigger (tap) */
 constexpr uint32_t ABSENCE_MS  = 150;
 bool     tagPresent[4] = {0};
 uint32_t absentMs[4]   = {0};
 
 /* game/broadcast state */
-volatile bool gameActive = true;    // onRx flips this
-bool          wasPaused  = false;
-volatile LightState    g_lightState = LightState::GREEN;
-volatile uint32_t      teamScore  = 0;
+volatile bool       gameActive   = true;    // onRx flips this
+bool                wasPaused    = false;
+volatile LightState g_lightState = LightState::GREEN;
+volatile uint32_t   teamScore    = 0;
 
 /* misc */
 uint16_t g_seq = 1;
 uint32_t lastHelloMs = 0;
+
+/* ── WAV header helpers ───────────────────────────────────── */
+static inline uint16_t rd16(const uint8_t* p){ return (uint16_t)p[0] | ((uint16_t)p[1]<<8); }
+static inline uint32_t rd32(const uint8_t* p){ return (uint32_t)p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24); }
+static bool parseWavHeader(const uint8_t* buf, size_t n, uint32_t& rate, uint16_t& bits, uint16_t& ch, uint16_t& fmt) {
+  if (n < 44) return false;
+  if (memcmp(buf+0, "RIFF",4)!=0 || memcmp(buf+8, "WAVE",4)!=0) return false;
+  size_t i=12;
+  while (i+8<=n) {
+    const uint8_t* ck = buf+i; uint32_t cksz=rd32(ck+4);
+    if (memcmp(ck,"fmt ",4)==0) {
+      if (i+8+16>n) return false;
+      const uint8_t* f = ck+8;
+      fmt=rd16(f+0); ch=rd16(f+2); rate=rd32(f+4); bits=rd16(f+14);
+      return true;
+    }
+    i += 8 + cksz;
+  }
+  return false;
+}
+#if TREX_AUDIO_PROGMEM
+static bool detectProgmemWav(uint32_t& rate, uint16_t& bits, uint16_t& ch, uint16_t& fmt,
+                             const uint8_t* p, size_t len) {
+  uint8_t tmp[128]; size_t n = (len<sizeof(tmp))?len:sizeof(tmp); memcpy_P(tmp,p,n);
+  return parseWavHeader(tmp,n,rate,bits,ch,fmt);
+}
+#else
+static bool detectFsWav(uint32_t& rate, uint16_t& bits, uint16_t& ch, uint16_t& fmt,
+                        const char* path) {
+  File f=LittleFS.open(path,"r"); if(!f) return false;
+  uint8_t tmp[128]; size_t n=f.read(tmp,sizeof(tmp)); f.close();
+  return parseWavHeader(tmp,n,rate,bits,ch,fmt);
+}
+#endif
 
 /* ── audio helpers ────────────────────────────────────────── */
 static bool openChain() {
   if (decoder && decoder->isRunning()) decoder->stop();
 
 #if TREX_AUDIO_PROGMEM
-  if (wavSrc) { delete wavSrc; wavSrc = nullptr; }
+  if (wavSrc) { delete wavSrc; wavSrc=nullptr; }
   wavSrc = new AudioFileSourcePROGMEM(LootDrop_wav, LootDrop_wav_len);
 #else
-  if (wavBuf)  { delete wavBuf;  wavBuf = nullptr; }
-  if (wavFile) { delete wavFile; wavFile = nullptr; }
+  if (wavBuf)  { delete wavBuf;  wavBuf=nullptr; }
+  if (wavFile) { delete wavFile; wavFile=nullptr; }
   wavFile = new AudioFileSourceLittleFS(CLIP_PATH);
   if (!wavFile) { Serial.println("[DROP] wavFile alloc fail"); return false; }
-  // 4 KB buffer to smooth over LED .show() stalls
-  wavBuf = new AudioFileSourceBuffer(wavFile, 4096);
+  wavBuf = new AudioFileSourceBuffer(wavFile, 8192);  // 8 KB headroom
   if (!wavBuf) { Serial.println("[DROP] wavBuf alloc fail"); return false; }
 #endif
 
   if (!decoder) decoder = new AudioGeneratorWAV();
+  bool ok =
+  #if TREX_AUDIO_PROGMEM
+    decoder->begin(wavSrc, i2sOut);
+  #else
+    decoder->begin(wavBuf, i2sOut);
+  #endif
+  if (!ok) { Serial.println("[DROP] decoder.begin() failed"); return false; }
+
+  // force I²S rate to the WAV header every time
+  uint32_t rate=0; uint16_t bits=0, ch=0, fmt=0;
 #if TREX_AUDIO_PROGMEM
-  bool ok = decoder->begin(wavSrc, i2sOut);
+  if (detectProgmemWav(rate,bits,ch,fmt, LootDrop_wav, LootDrop_wav_len) && rate) {
+    i2sOut->SetRate(rate);
+    Serial.printf("[DROP] WAV fmt=%u ch=%u bits=%u rate=%u\n", fmt, ch, bits, rate);
+  }
 #else
-  bool ok = decoder->begin(wavBuf, i2sOut);
+  if (detectFsWav(rate,bits,ch,fmt, CLIP_PATH) && rate) {
+    i2sOut->SetRate(rate);
+    Serial.printf("[DROP] WAV fmt=%u ch=%u bits=%u rate=%u\n", fmt, ch, bits, rate);
+  }
 #endif
-  if (!ok) Serial.println("[DROP] decoder.begin() failed");
-  return ok;
+  return true;
 }
 
 inline void pumpAudio() { if (playing && decoder) decoder->loop(); }
 
-bool startAudio() { if (playing) return true; playing = openChain(); return playing; }
-void stopAudio()  { if (!playing) return; decoder->stop(); playing = false; }
-inline void handleAudio() {
-  if (!playing || !decoder) return;
-  if (!decoder->loop()) { decoder->stop(); playing = openChain(); if (!playing) Serial.println("[DROP] audio re-begin failed"); }
+// one-shot playback (no auto-restart)
+static void startAudioExclusive() {
+  // enter exclusive window: no LED .show(), no RFID/SPI work until done
+  audioExclusive = true;
+  if (playing) { decoder->stop(); playing=false; }
+  playing = openChain();
+}
+static void stopAudioExclusive() {
+  if (playing) { decoder->stop(); playing=false; }
+  audioExclusive = false;
 }
 
 /* ── helpers ─────────────────────────────────────────────── */
@@ -170,10 +228,9 @@ void packHeader(uint8_t type, uint16_t payLen, uint8_t* buf) {
 void fillRing(uint8_t idx, uint32_t c) {
   for (uint16_t p = 0; p < ring[idx].numPixels(); ++p) {
     ring[idx].setPixelColor(p, c);
-    if ((p & 3) == 0) pumpAudio();      // feed every ~4 pixels
+    if ((p & 7) == 0) pumpAudio();
   }
-  pumpAudio();
-  ring[idx].show();
+  if (!audioExclusive) ring[idx].show();  // suppress .show() while exclusive
   pumpAudio();
 }
 
@@ -185,11 +242,10 @@ void drawTeamGauges(uint32_t score) {
   }
   for (auto &g : gauge) {
     for (uint16_t i = 0; i < GAUGE_LEN; ++i) {
-      g.setPixelColor(i, (i < lit) ? WHITE : OFF);
-      if ((i & 7) == 0) pumpAudio();    // feed every ~8 pixels
+      g.setPixelColor(i, (i < lit) ? GOLD : OFF);
+      if ((i & 15) == 0) pumpAudio();
     }
-    pumpAudio();
-    g.show();
+    if (!audioExclusive) g.show();  // suppress .show() while exclusive
     pumpAudio();
   }
 }
@@ -201,7 +257,7 @@ void sendHello() {
   auto* p = (HelloPayload*)(buf + sizeof(MsgHeader));
   p->stationType = (uint8_t)StationType::DROP;
   p->stationId   = STATION_ID;
-  p->fwMajor = 0; p->fwMinor = 1;
+  p->fwMajor = 0; p->fwMinor = 3;
   p->wifiChannel = WIFI_CHANNEL;
   memset(p->mac, 0, 6);
   Transport::sendToServer(buf, sizeof(buf));
@@ -231,8 +287,14 @@ void onRx(const uint8_t* data, uint16_t len) {
     case MsgType::DROP_RESULT: {
       if (h->payloadLen != sizeof(DropResultPayload)) break;
       auto* p = (const DropResultPayload*)(data + sizeof(MsgHeader));
+      uint32_t prev = teamScore;
       teamScore = p->teamScore;
       drawTeamGauges(teamScore);
+
+      if (teamScore > prev) {
+        // successful bank → short exclusive audio
+        startAudioExclusive();
+      }
       break;
     }
 
@@ -253,9 +315,8 @@ void onRx(const uint8_t* data, uint16_t len) {
     case MsgType::GAME_OVER: {
       gameActive = false;
       Serial.println("[DROP] GAME_OVER");
-      // force visuals/audio to idle; loop() will keep it paused
       for (int i=0;i<4;i++) { tagPresent[i]=false; absentMs[i]=0; fillRing(i, RED); }
-      stopAudio();
+      stopAudioExclusive();
       break;
     }
 
@@ -269,33 +330,28 @@ void setup() {
   delay(50);
   Serial.println("\n[DROP] Boot");
 
-  // ---------- Minimal hardware bring-up (LEDs either way; readers only if active) ----------
-  // SPI is harmless to init either way; if you prefer, you can guard reader init with (!inMaint)
-  SPI.begin(PIN_SCK, PIN_MISO, PIN_MOSI);
-
-  // NeoPixels (rings + gauges)
-  for (uint8_t i=0; i<4; ++i) { ring[i].begin(); ring[i].setBrightness(RING_BRIGHTNESS); }
-  for (auto &g : gauge)       { g.begin(); g.setBrightness(GAUGE_BRIGHTNESS); g.show(); }
-  drawTeamGauges(teamScore);  // start at 0
-
-  // ---------- Normal (game) bring-up ----------
-  // RC522 readers
-  for (auto &r : rfid) r.PCD_Init();
-
-  // I2S audio (no forced SetRate; WAV header sets it)
-  i2sOut = new AudioOutputI2S(0, AudioOutputI2S::EXTERNAL_I2S);
-  i2sOut->SetPinout(PIN_I2S_BCLK, PIN_I2S_LRCLK, PIN_I2S_DOUT);
-  i2sOut->SetRate(48000);
-  i2sOut->SetGain(1.0f);
-
 #if !TREX_AUDIO_PROGMEM
-  // LittleFS is only needed if you're using the FS audio backend
   LittleFS.begin();
-  // Optional: sanity check the clip exists
   File f = LittleFS.open(CLIP_PATH, "r");
   if (!f) Serial.println("[DROP] Missing file on LittleFS");
   else { Serial.printf("[DROP] WAV size: %u bytes\n", (unsigned)f.size()); f.close(); }
 #endif
+
+  // I2S audio (minimal config like your working test)
+  i2sOut = new AudioOutputI2S(0, AudioOutputI2S::EXTERNAL_I2S);
+  i2sOut->SetPinout(PIN_I2S_BCLK, PIN_I2S_LRCLK, PIN_I2S_DOUT);
+  i2sOut->SetGain(1.0f);
+  i2sOut->SetRate(48000);   // prime; openChain() will override from header
+
+  // SPI + readers
+  SPI.begin(PIN_SCK, PIN_MISO, PIN_MOSI);
+  for (auto &r : rfid) r.PCD_Init();
+
+  // LEDs
+  for (uint8_t i=0; i<4; ++i) { ring[i].begin(); ring[i].setBrightness(RING_BRIGHTNESS); }
+  for (auto &g : gauge)       { g.begin(); g.setBrightness(GAUGE_BRIGHTNESS); g.show(); }
+  drawTeamGauges(teamScore);
+  for (uint8_t i=0; i<4; ++i) fillRing(i, RED);
 
   // ESP-NOW transport (must match channel with T-Rex)
   TransportConfig cfg{ /*maintenanceMode=*/false, /*wifiChannel=*/WIFI_CHANNEL };
@@ -303,11 +359,7 @@ void setup() {
     Serial.println("[DROP] Transport init FAILED");
     while (1) delay(1000);
   }
-
   Serial.printf("Trex proto ver: %d\n", TREX_PROTO_VERSION);
-
-  // Initial LED state: rings RED until a tag arrives; gauges already drawn
-  for (uint8_t i=0; i<4; ++i) fillRing(i, RED);
 }
 
 /* ── loop ────────────────────────────────────────────────── */
@@ -316,73 +368,64 @@ void loop() {
   static Maint::Config mcfg{WIFI_SSID, WIFI_PASS, HOSTNAME,
                             /*apFallback=*/true, /*apChannel=*/WIFI_CHANNEL,
                             /*apPass=*/"trexsetup", /*buttonPin=*/0, /*holdMs=*/1500};
-  mcfg.stationType = StationType::DROP;
-  mcfg.stationId   = STATION_ID;
+  mcfg.stationType  = StationType::DROP;
+  mcfg.stationId    = STATION_ID;
   mcfg.enableBeacon = true;
 
-  // If user long-presses BOOT, jump into maintenance and pause game
   if (Maint::checkRuntimeEntry(mcfg)) {
-    // visual cue while in maintenance
     const uint32_t BLUE = Adafruit_NeoPixel::Color(0,0,255);
     for (uint8_t i=0;i<4;i++) fillRing(i, BLUE);
-    // Run OTA/Telnet/Beacon loop and skip game logic
     Maint::loop();
     return;
   }
-
-  // If already in maintenance (e.g., after OTA), keep servicing it
   if (Maint::active) { Maint::loop(); return; }
 
   Transport::loop();
+
+  // If we’re in an exclusive audio window, ONLY feed audio + transport
+  if (audioExclusive) {
+    if (playing && decoder) {
+      if (!decoder->loop()) stopAudioExclusive();  // done → resume normal loop
+    }
+    return;
+  }
 
   // ---- PAUSED / GAME OVER: only listen for messages ----
   if (!gameActive) {
     if (!wasPaused) {
       wasPaused = true;
-      // clear latches; rings red; audio off
       for (int i=0;i<4;i++) { tagPresent[i]=false; absentMs[i]=0; fillRing(i, RED); }
-      if (playing) stopAudio();
+      stopAudioExclusive();
     }
     static uint32_t pausedHelloMs = 0;
     uint32_t now = millis();
     if (now - pausedHelloMs > 1000) { sendHello(); pausedHelloMs = now; }
-    return;  // skip reader scan & audio engine
+    return;
   } else if (wasPaused) {
     wasPaused = false;
   }
 
   // ---- ACTIVE ----
   const uint32_t now = millis();
-
-  // HELLO ping (light)
   if (now - lastHelloMs > 2000) { sendHello(); lastHelloMs = now; }
 
-  bool anyActive = false;
-
-  // Scan 4 readers
+  // Scan 4 readers — edge-trigger tap
   for (uint8_t i=0;i<4;i++) {
-    pumpAudio();
     MFRC522 &rd = rfid[i];
-    bool present = cardPresent(rd);
-    if (present) anyActive = true;
+    const bool present = cardPresent(rd);
 
-    // ARRIVAL
+    // ARRIVAL (tap): send one DROP_REQUEST per arrival
     if (present && !tagPresent[i]) {
       TrexUid uid{};
       if (readUid(rd, uid)) {
         sendDropRequest(uid, i);
-        fillRing(i, GREEN);
-        tagPresent[i] = true;
+        fillRing(i, GREEN);        // visual: tag seen
+        tagPresent[i] = true;      // arm removal to re-arm tap
       }
       absentMs[i] = 0;
     }
 
-    // MAINTAINED
-    if (present && tagPresent[i]) {
-      absentMs[i] = 0;
-    }
-
-    // REMOVAL (debounced)
+    // REMOVAL → re-arm
     if (!present && tagPresent[i]) {
       if (absentMs[i] == 0) absentMs[i] = now;
       else if (now - absentMs[i] > ABSENCE_MS) {
@@ -391,18 +434,8 @@ void loop() {
         absentMs[i] = 0;
       }
     }
-    pumpAudio();
   }
 
-  // Audio: loop while any reader has a tag; stop shortly after last leaves
-  static uint32_t lastActiveMs = 0;
-  constexpr uint32_t AUDIO_GRACE_MS = 150;
-  if (anyActive) lastActiveMs = now;
-
-  if (gameActive && anyActive) {
-    if (!playing) startAudio();
-    handleAudio();
-  } else {
-    if (playing && (now - lastActiveMs > AUDIO_GRACE_MS)) stopAudio();
-  }
+  // keep gauges fresh (cheap)
+  drawTeamGauges(teamScore);
 }
