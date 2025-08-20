@@ -86,12 +86,21 @@ static inline uint32_t C_RGB(uint8_t r,uint8_t g,uint8_t b){ return Adafruit_Neo
 const uint32_t RED     = C_RGB(255,0,0);
 const uint32_t GREEN   = C_RGB(0,255,0);
 const uint32_t BLUE    = C_RGB(0,0,255);
+const uint32_t GOLD    = C_RGB(255,180,0);
+
 const uint32_t OFF     = 0;
 
 /* ── RFID presence debounce ───────────────────────────────── */
 constexpr uint32_t ABSENCE_MS = 150;   // debounce removal
 bool          tagPresent      = false;
 uint32_t      absentStartMs   = 0;
+
+// ── "Full bracelet" ring blink ──────────────────────────────
+constexpr uint16_t FULL_BLINK_PERIOD_MS = 320;  // ~3 Hz
+bool     fullBlinkActive = false;
+bool     fullBlinkOn     = false;
+uint32_t fullBlinkLastMs = 0;
+uint32_t blinkHoldId     = 0;       // which hold this blink belongs to
 
 /* ── Game/hold state (server-auth) ────────────────────────── */
 volatile bool gameActive = true;     // flipped by GAME_OVER/START in onRx()
@@ -195,6 +204,7 @@ inline uint32_t gaugeColor() {
 }
 
 void drawRingCarried(uint8_t cur, uint8_t maxC) {
+  if (fullBlinkActive) return;  // blinking owns the ring
   pumpAudio();
   const uint16_t n = ring.numPixels();
   uint16_t lit = 0;
@@ -244,6 +254,30 @@ void fillGauge(uint32_t c) {
   gauge.show();
 }
 
+inline void startFullBlinkImmediate() {
+  fullBlinkActive = true;
+  fullBlinkOn     = true;                 // first frame ON for instant feedback
+  fullBlinkLastMs = millis();
+  blinkHoldId     = holdId;               // bind blink to current hold
+  fillRing(GOLD);
+}
+
+inline void stopFullBlink() {
+  fullBlinkActive = false;
+  fullBlinkOn     = false;
+  // do not redraw here; caller decides what the ring should show next
+}
+
+inline void tickFullBlink() {
+  if (!fullBlinkActive) return;
+  uint32_t now = millis();
+  if ((now - fullBlinkLastMs) >= FULL_BLINK_PERIOD_MS) {
+    fullBlinkLastMs = now;
+    fullBlinkOn = !fullBlinkOn;
+    fillRing(fullBlinkOn ? GOLD : OFF);
+  }
+}
+
 /* ── NET: messages ────────────────────────────────────────── */
 void sendHello() {
   uint8_t buf[sizeof(MsgHeader)+sizeof(HelloPayload)];
@@ -290,7 +324,9 @@ void onRx(const uint8_t* data, uint16_t len) {
       if (h->payloadLen != sizeof(StateTickPayload)) break;
       auto* p = (const StateTickPayload*)(data + sizeof(MsgHeader));
       g_lightState = (p->state == (uint8_t)LightState::GREEN) ? LightState::GREEN : LightState::RED;
-      if (g_lightState == LightState::RED && !holdActive) fillRing(RED);
+      if (g_lightState == LightState::RED && !holdActive && !tagPresent && !fullBlinkActive) {
+        fillRing(RED);
+      }
       // Repaint gauge in new color (keeps current inventory level)
       drawGaugeInventory(inv, cap);
       break;
@@ -308,10 +344,29 @@ void onRx(const uint8_t* data, uint16_t len) {
       if (p->accepted) {
         holdActive = true;
         startAudio();
-        drawRingCarried(carried, maxCarry);
-        drawGaugeInventory(inv, cap);   // now tinted by GREEN/RED
+
+        // set server-provided values first
+        maxCarry = p->maxCarry;
+        carried  = p->carried;
+        inv      = p->inventory;
+        cap      = p->capacity;
+
+        if (carried >= maxCarry) {
+          startFullBlinkImmediate();            // bind blink to *this* holdId
+        } else {
+          stopFullBlink();
+          drawRingCarried(carried, maxCarry);
+        }
+        drawGaugeInventory(inv, cap);
       } else {
-        fillRing(RED);
+        // Not accepted — if it's already full, still show the FULL indication
+        if (carried >= maxCarry) {
+          startFullBlinkImmediate();        // start blink bound to this holdId
+          drawGaugeInventory(inv, cap);     // keep gauge current
+        } else {
+          stopFullBlink();
+          fillRing(RED);
+        }
       }
       break;
     }
@@ -320,9 +375,20 @@ void onRx(const uint8_t* data, uint16_t len) {
       if (h->payloadLen != sizeof(LootTickPayload)) break;
       auto* p = (const LootTickPayload*)(data + sizeof(MsgHeader));
       if (!holdActive || p->holdId != holdId) break;
+
       carried = p->carried;
       inv     = p->inventory;
-      drawRingCarried(carried, maxCarry);
+
+      // If full: (re)start blink when holdId changes or if not already blinking
+      if (carried >= maxCarry) {
+        if (!fullBlinkActive || blinkHoldId != holdId) {
+          startFullBlinkImmediate();
+        }
+      } else {
+        if (fullBlinkActive) stopFullBlink();
+        drawRingCarried(carried, maxCarry);
+      }
+
       drawGaugeInventory(inv, cap);
       break;
     }
@@ -331,9 +397,18 @@ void onRx(const uint8_t* data, uint16_t len) {
       if (h->payloadLen != sizeof(HoldEndPayload)) break;
       auto* p = (const HoldEndPayload*)(data + sizeof(MsgHeader));
       if (p->holdId != holdId) break;
-      holdActive = false; holdId = 0;
+
+      holdActive = false;
+      holdId     = 0;
       stopAudio();
-      fillRing(RED);
+
+      // If the tag is still on the reader and is FULL, keep blinking until removal.
+      if (tagPresent && carried >= maxCarry) {
+        if (!fullBlinkActive) startFullBlinkImmediate();   // ensure blink continues
+      } else {
+        stopFullBlink();
+        fillRing(RED);
+      }
       break;
     }
 
@@ -356,6 +431,7 @@ void onRx(const uint8_t* data, uint16_t len) {
     case MsgType::GAME_OVER: {
       gameActive = false;
       holdActive = false; holdId = 0;
+      fullBlinkActive = false;
       carried = 0;
       tagPresent = false; absentStartMs = 0;
       fillRing(RED);
@@ -460,8 +536,9 @@ void loop() {
       tagPresent    = true;
       absentStartMs = 0;
       carried       = 0;
+      stopFullBlink();                      // reset any previous blink
       sendHoldStart(currentUid);
-      fillRing(GREEN);   // optimistic cue while waiting for ACK
+      fillRing(GREEN);                      // optimistic until ACK
     }
   }
 
@@ -476,8 +553,9 @@ void loop() {
     else if (now - absentStartMs > ABSENCE_MS) {
       tagPresent = false;
       sendHoldStop();
-      fillRing(RED);
       stopAudio();
+      stopFullBlink();
+      fillRing(RED);
       absentStartMs = 0;
     }
   }
@@ -488,4 +566,8 @@ void loop() {
   } else if (playing) {
     stopAudio();
   }
+
+  //Blink rfid if full
+  tickFullBlink();
+
 }
