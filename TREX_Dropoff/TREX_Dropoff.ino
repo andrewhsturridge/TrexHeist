@@ -97,7 +97,7 @@ static inline uint32_t C(uint8_t r,uint8_t g,uint8_t b){ return Adafruit_NeoPixe
 const uint32_t RED   = C(255,0,0);
 const uint32_t GREEN = C(0,255,0);
 const uint32_t WHITE = C(255,255,255);
-const uint32_t GOLD  = C(255, 190, 30);  // warm gold;
+const uint32_t GOLD  = C(255, 180, 0);
 const uint32_t OFF   = 0;
 
 /* tag tracking — edge-trigger (tap) */

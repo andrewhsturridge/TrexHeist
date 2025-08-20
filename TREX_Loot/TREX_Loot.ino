@@ -20,6 +20,7 @@
 #include <Adafruit_NeoPixel.h>
 #include <AudioGeneratorWAV.h>
 #include <AudioOutputI2S.h>
+#include <cstring>
 
 #if TREX_AUDIO_PROGMEM
   #include <AudioFileSourcePROGMEM.h>
@@ -33,6 +34,12 @@
 
 #include <TrexProtocol.h>
 #include <TrexTransport.h>
+#include "TrexMaintenance.h"   // ← maintenance mode (OTA, Telnet, mDNS, HTTP FS)
+
+/* ---------- Wi-Fi (Maintenance) ---------- */
+#define WIFI_SSID   "GUD"
+#define WIFI_PASS   "EscapE66"
+#define HOSTNAME    "Loot-1"
 
 /* ── IDs & radio ───────────────────────────────────────────── */
 constexpr uint8_t  STATION_ID    = 1;    // ← set unique 1..5 for each loot station
@@ -78,7 +85,7 @@ bool               playing = false;
 static inline uint32_t C_RGB(uint8_t r,uint8_t g,uint8_t b){ return Adafruit_NeoPixel::Color(r,g,b); }
 const uint32_t RED     = C_RGB(255,0,0);
 const uint32_t GREEN   = C_RGB(0,255,0);
-const uint32_t WHITE   = C_RGB(255,255,255);
+const uint32_t BLUE    = C_RGB(0,0,255);
 const uint32_t OFF     = 0;
 
 /* ── RFID presence debounce ───────────────────────────────── */
@@ -99,6 +106,10 @@ uint16_t  cap          = GAUGE_LEN;
 TrexUid   currentUid{};
 
 LightState g_lightState = LightState::GREEN;
+
+// Gauge paint cache (prevents unnecessary .show() calls)
+uint16_t lastInvPainted = 0, lastCapPainted = 0;
+LightState lastGaugeColor = LightState::GREEN;
 
 /* ── misc ─────────────────────────────────────────────────── */
 uint16_t g_seq = 1;            // outgoing message seq
@@ -179,6 +190,10 @@ void packHeader(uint8_t type, uint16_t payLen, uint8_t* buf) {
 /* ── LED drawing ──────────────────────────────────────────── */
 inline void pumpAudio() { handleAudio(); }  // feed while we block on LED shows
 
+inline uint32_t gaugeColor() {
+  return (g_lightState == LightState::GREEN) ? GREEN : RED;
+}
+
 void drawRingCarried(uint8_t cur, uint8_t maxC) {
   pumpAudio();
   const uint16_t n = ring.numPixels();
@@ -189,17 +204,44 @@ void drawRingCarried(uint8_t cur, uint8_t maxC) {
 }
 
 void drawGaugeInventory(uint16_t inventory, uint16_t capacity) {
-  pumpAudio();
+  const LightState colorState = g_lightState;
+
+  // If nothing changed, skip heavy LED work
+  if (inventory == lastInvPainted &&
+      capacity  == lastCapPainted &&
+      colorState == lastGaugeColor) {
+    return;
+  }
+
+  pumpAudio();  // keep decoder fed while we prep pixels
+
   uint16_t lit = 0;
-  if (capacity > 0) lit = (uint16_t)((uint32_t)inventory * GAUGE_LEN + (capacity-1)) / capacity; // ceil
-  for (uint16_t i=0;i<GAUGE_LEN;i++) gauge.setPixelColor(i, (i<lit) ? WHITE : OFF);
+  if (capacity > 0) {
+    lit = (uint16_t)((uint32_t)inventory * GAUGE_LEN + (capacity - 1)) / capacity; // ceil
+  }
+  const uint32_t col = (colorState == LightState::GREEN) ? GREEN : RED;
+
+  for (uint16_t i = 0; i < GAUGE_LEN; ++i) {
+    gauge.setPixelColor(i, (i < lit) ? col : OFF);
+  }
   gauge.show();
+
+  // update cache
+  lastInvPainted = inventory;
+  lastCapPainted = capacity;
+  lastGaugeColor = colorState;
 }
 
 void fillRing(uint32_t c) {
   pumpAudio();
   for (uint16_t i=0;i<ring.numPixels();++i) ring.setPixelColor(i,c);
   ring.show();
+}
+
+void fillGauge(uint32_t c) {
+  pumpAudio();
+  for (uint16_t i=0;i<GAUGE_LEN;++i) gauge.setPixelColor(i,c);
+  gauge.show();
 }
 
 /* ── NET: messages ────────────────────────────────────────── */
@@ -209,7 +251,7 @@ void sendHello() {
   auto* p = (HelloPayload*)(buf + sizeof(MsgHeader));
   p->stationType = (uint8_t)StationType::LOOT;
   p->stationId   = STATION_ID;
-  p->fwMajor = 0; p->fwMinor = 1;
+  p->fwMajor = 0; p->fwMinor = 2;
   p->wifiChannel = WIFI_CHANNEL;
   memset(p->mac, 0, 6);
   Transport::sendToServer(buf, sizeof(buf));
@@ -220,7 +262,9 @@ void sendHoldStart(const TrexUid& uid) {
   holdId = (uint32_t)esp_random();
   packHeader((uint8_t)MsgType::LOOT_HOLD_START, sizeof(LootHoldStartPayload), buf);
   auto* p = (LootHoldStartPayload*)(buf + sizeof(MsgHeader));
-  p->holdId = holdId; p->uid = uid; p->stationId = STATION_ID;
+  p->holdId    = holdId;
+  p->uid       = uid;
+  p->stationId = STATION_ID;
   Transport::sendToServer(buf, sizeof(buf));
 }
 
@@ -228,9 +272,11 @@ void sendHoldStop() {
   if (!holdId) return;
   uint8_t buf[sizeof(MsgHeader)+sizeof(LootHoldStopPayload)];
   packHeader((uint8_t)MsgType::LOOT_HOLD_STOP, sizeof(LootHoldStopPayload), buf);
-  ((LootHoldStopPayload*)(buf + sizeof(MsgHeader)))->holdId = holdId;
+  auto* p = (LootHoldStopPayload*)(buf + sizeof(MsgHeader));
+  p->holdId = holdId;
   Transport::sendToServer(buf, sizeof(buf));
-  holdActive = false; holdId = 0;
+  holdActive = false;
+  holdId = 0;
 }
 
 /* ── RX handler ───────────────────────────────────────────── */
@@ -245,6 +291,8 @@ void onRx(const uint8_t* data, uint16_t len) {
       auto* p = (const StateTickPayload*)(data + sizeof(MsgHeader));
       g_lightState = (p->state == (uint8_t)LightState::GREEN) ? LightState::GREEN : LightState::RED;
       if (g_lightState == LightState::RED && !holdActive) fillRing(RED);
+      // Repaint gauge in new color (keeps current inventory level)
+      drawGaugeInventory(inv, cap);
       break;
     }
 
@@ -261,7 +309,7 @@ void onRx(const uint8_t* data, uint16_t len) {
         holdActive = true;
         startAudio();
         drawRingCarried(carried, maxCarry);
-        drawGaugeInventory(inv, cap);
+        drawGaugeInventory(inv, cap);   // now tinted by GREEN/RED
       } else {
         fillRing(RED);
       }
@@ -360,6 +408,23 @@ void setup() {
 
 /* ── loop ─────────────────────────────────────────────────── */
 void loop() {
+  // ---- Runtime Maintenance Mode (long-press BOOT ~1.5 s) ----
+  static Maint::Config mcfg{WIFI_SSID, WIFI_PASS, HOSTNAME,
+                            /*apFallback=*/true, /*apChannel=*/WIFI_CHANNEL,
+                            /*apPass=*/"trexsetup", /*buttonPin=*/0, /*holdMs=*/1500};
+  mcfg.stationType  = StationType::LOOT;
+  mcfg.stationId    = STATION_ID;
+  mcfg.enableBeacon = true;
+
+  if (Maint::checkRuntimeEntry(mcfg)) {
+    // Visual: blue while in maintenance
+    fillRing(BLUE);
+    fillGauge(BLUE);
+    Maint::loop();
+    return;
+  }
+  if (Maint::active) { Maint::loop(); return; }
+
   Transport::loop();
 
   // ---- PAUSED / GAME OVER: only listen for messages ----
