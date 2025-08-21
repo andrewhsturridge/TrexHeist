@@ -15,6 +15,13 @@
 #include "Media.h"
 #include "MaintCommands.h"
 #include "TrexMaintenance.h"   // updated version with custom command hook
+#include "OtaCampaign.h"
+
+
+// --- OTA defaults (edit these per release) ---
+#define DEFAULT_OTA_URL          "http://192.168.2.231:8000/TREX_Loot.ino.bin"
+#define DEFAULT_OTA_EXPECT_MAJOR 0
+#define DEFAULT_OTA_EXPECT_MINOR 3
 
 Game g;
 
@@ -27,6 +34,8 @@ void setup() {
   digitalWrite(BOARD_BLUE_LED, LOW);  // off by default
 
   Serial.println("\n[TREX] Server boot");
+
+  OtaCampaign::begin();
 
   // PIR pins
   for (int i=0;i<4;i++) {
@@ -84,6 +93,8 @@ void loop() {
     maintLEDOn = false;
   }
 
+  OtaCampaign::loop();
+
   Transport::loop();
 
   uint32_t now = millis();
@@ -96,6 +107,27 @@ void loop() {
     if (c=='g' || c=='G') enterGreen(g);
     if (c=='r' || c=='R') enterRed(g);
     if (c=='x' || c=='X') bcastGameOver(g, /*MANUAL*/2);
+    // Update all Loot stations (press 'U')
+    if (c == 'u' || c == 'U') {
+      // Ensure game is idle so Loots will accept OTA
+      bcastGameOver(g, /*MANUAL*/2);
+      Serial.println("[OTA] GAME_OVER sent; broadcasting in 3s…");
+
+      // Simple grace period; keeps loops active while waiting
+      uint32_t t0 = millis();
+      while (millis() - t0 < 3000) {
+        OtaCampaign::loop();
+        Transport::loop();
+        delay(10);
+      }
+
+      // Fire the OTA broadcast
+      OtaCampaign::sendLootOtaToAll(
+          DEFAULT_OTA_URL,
+          DEFAULT_OTA_EXPECT_MAJOR,
+          DEFAULT_OTA_EXPECT_MINOR
+      );
+    }
   }
 
   // Drip broadcast on new game start

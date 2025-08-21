@@ -2,6 +2,16 @@
 #include "Media.h"
 #include <TrexTransport.h>
 #include <esp_random.h>
+#include "OtaCampaign.h"
+
+// Generic raw broadcast used by OTA
+void netBroadcastRaw(const uint8_t* data, uint16_t len) {
+  // Use the same Transport call you already use in your bcast* helpers:
+  Transport::broadcast(data, len);        // ← keep this if you have 'broadcast(...)'
+  // Transport::sendToAll(data, len);     // ← OR keep this if your Transport uses 'sendToAll(...)'
+  // Transport::sendAll(data, len);       // ← OR whatever your project calls it
+}
+
 
 static void packHeader(Game& g, uint8_t type, uint16_t payLen, uint8_t* buf, uint16_t seqOverride=0) {
   auto* h=(MsgHeader*)buf;
@@ -94,6 +104,9 @@ void onRx(const uint8_t* data, uint16_t len) {
   if (h->version != TREX_PROTO_VERSION) return;
 
   switch ((MsgType)h->type) {
+
+    if (OtaCampaign::handle(data, len)) return;  // let OTA add-on eat OTA_STATUS
+
     case MsgType::HELLO: {
       Serial.printf("[TREX] HELLO from station %u\n", h->srcStationId);
       break;
