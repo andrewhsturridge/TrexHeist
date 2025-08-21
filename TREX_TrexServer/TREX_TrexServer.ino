@@ -16,12 +16,12 @@
 #include "MaintCommands.h"
 #include "TrexMaintenance.h"   // updated version with custom command hook
 #include "OtaCampaign.h"
-
+#include <TrexVersion.h>
 
 // --- OTA defaults (edit these per release) ---
 #define DEFAULT_OTA_URL          "http://192.168.2.231:8000/TREX_Loot.ino.bin"
-#define DEFAULT_OTA_EXPECT_MAJOR 0
-#define DEFAULT_OTA_EXPECT_MINOR 3
+#define DEFAULT_OTA_EXPECT_MAJOR TREX_FW_MAJOR
+#define DEFAULT_OTA_EXPECT_MINOR TREX_FW_MINOR
 
 Game g;
 

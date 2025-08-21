@@ -51,6 +51,7 @@
 #include <TrexProtocol.h>
 #include <TrexTransport.h>
 #include "TrexMaintenance.h"      // ← maintenance mode (OTA, Telnet, mDNS, HTTP FS)
+#include <TrexVersion.h>
 
 /* ---------- Wi-Fi (Maintenance / OTA HTTP) ---------- */
 #define WIFI_SSID   "GUD"
@@ -425,7 +426,7 @@ void sendOtaStatus(OtaPhase phase, uint8_t errCode, uint32_t bytes, uint32_t tot
   p->campaignId  = otaCampaignId;
   p->phase       = (uint8_t)phase;
   p->error       = errCode;
-  p->fwMajor     = 0;  p->fwMinor = 3;   // ← bump when you release
+  p->fwMajor     = TREX_FW_MAJOR;  p->fwMinor = TREX_FW_MINOR;   // ← bump when you release
   p->bytes       = bytes;
   p->total       = total;
   Transport::sendToServer(buf, sizeof(buf));
@@ -622,7 +623,7 @@ void sendHello() {
   auto* p = (HelloPayload*)(buf + sizeof(MsgHeader));
   p->stationType = (uint8_t)StationType::LOOT;
   p->stationId   = STATION_ID;
-  p->fwMajor = 0; p->fwMinor = 3;      // ← bump when you release
+  p->fwMajor = TREX_FW_MAJOR; p->fwMinor = TREX_FW_MINOR;      // ← bump when you release
   p->wifiChannel = WIFI_CHANNEL;
   memset(p->mac, 0, 6);
   Transport::sendToServer(buf, sizeof(buf));

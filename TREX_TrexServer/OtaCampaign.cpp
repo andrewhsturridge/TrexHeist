@@ -1,6 +1,7 @@
 #include "OtaCampaign.h"
 #include <TrexProtocol.h>
 
+
 // Provided by Net.cpp (see shim above)
 extern void netBroadcastRaw(const uint8_t* data, uint16_t len);
 
@@ -22,7 +23,7 @@ void begin() {
 
 void summary(const char* why) {
   Serial.println();
-  Serial.printf("[OTA] Summary (%s) campaign=%lu\n", why, (unsigned long)g_campaignId);
+  Serial.printf("[OTA] Summary (%s) campaign=%lu  expect=%u.%u\n", why, (unsigned long)g_campaignId, g_expectMajor, g_expectMinor);
   for (int id=1; id<=5; ++id) {
     StationState &s = g_state[id];
     const char* ph = (s.phase==0)?"PENDING":
@@ -80,39 +81,81 @@ bool handle(const uint8_t* data, uint16_t len) {
   if (len < sizeof(MsgHeader)) return false;
   auto* h = (const MsgHeader*)data;
   if (h->version != TREX_PROTO_VERSION) return false;
-  if ((MsgType)h->type != MsgType::OTA_STATUS) return false;
-  if (h->payloadLen != sizeof(OtaStatusPayload)) return true; // ignore malformed
-  auto* p = (const OtaStatusPayload*)(data + sizeof(MsgHeader));
-  if (p->stationType != (uint8_t)StationType::LOOT) return true;
 
-  uint8_t id = p->stationId;
-  if (id < 1 || id > 5) return true;
+  // ---- Case 1: OTA_STATUS (keep existing behavior) ----
+  if ((MsgType)h->type == MsgType::OTA_STATUS) {
+    if (h->payloadLen != sizeof(OtaStatusPayload)) return true; // ignore malformed
+    auto* p = (const OtaStatusPayload*)(data + sizeof(MsgHeader));
+    if (p->stationType != (uint8_t)StationType::LOOT) return true;
 
-  StationState &s = g_state[id];
-  s.phase  = p->phase;
-  s.error  = p->error;
-  s.fwMajor= p->fwMajor;
-  s.fwMinor= p->fwMinor;
-  s.bytes  = p->bytes;
-  s.total  = p->total;
+    uint8_t id = p->stationId;
+    if (id < 1 || id > 5) return true;
 
-  const char* ph = (p->phase==(uint8_t)OtaPhase::ACK)?"ACK":
-                   (p->phase==(uint8_t)OtaPhase::STARTING)?"STARTING":
-                   (p->phase==(uint8_t)OtaPhase::FAIL)?"FAIL":
-                   (p->phase==(uint8_t)OtaPhase::SUCCESS)?"SUCCESS":"?";
-  Serial.printf("[OTA] Loot-%u %-8s err=%u v=%u.%u %lu/%lu\n",
-    id, ph, p->error, p->fwMajor, p->fwMinor,
-    (unsigned long)p->bytes, (unsigned long)p->total);
+    StationState &s = g_state[id];
+    s.phase  = p->phase;
+    s.error  = p->error;
+    s.fwMajor= p->fwMajor;
+    s.fwMinor= p->fwMinor;
+    s.bytes  = p->bytes;
+    s.total  = p->total;
 
-  // Early finish if everyone reported SUCCESS (or FAIL/TIMEOUT later)
-  if (p->phase == (uint8_t)OtaPhase::SUCCESS) {
-    bool allDone = true;
-    for (int i=1;i<=5;i++) {
-      if (g_state[i].phase != (uint8_t)OtaPhase::SUCCESS) { allDone = false; break; }
+    const char* ph = (p->phase==(uint8_t)OtaPhase::ACK)?"ACK":
+                     (p->phase==(uint8_t)OtaPhase::STARTING)?"STARTING":
+                     (p->phase==(uint8_t)OtaPhase::FAIL)?"FAIL":
+                     (p->phase==(uint8_t)OtaPhase::SUCCESS)?"SUCCESS":"?";
+    Serial.printf("[OTA] Loot-%u %-8s err=%u v=%u.%u %lu/%lu\n",
+      id, ph, p->error, p->fwMajor, p->fwMinor,
+      (unsigned long)p->bytes, (unsigned long)p->total);
+
+    // Early finish if everyone succeeded
+    if (p->phase == (uint8_t)OtaPhase::SUCCESS) {
+      bool allDone = true;
+      for (int i=1;i<=5;i++)
+        if (g_state[i].phase != (uint8_t)OtaPhase::SUCCESS) { allDone=false; break; }
+      if (allDone) { summary("complete"); g_active=false; }
     }
-    if (allDone) { summary("complete"); g_active=false; }
+    return true; // consumed
   }
-  return true;
+
+  // ---- Case 2: HELLO (count as SUCCESS if version matches) ----
+  if (!g_active) return false; // only track during an active campaign
+  if ((MsgType)h->type == MsgType::HELLO) {
+    if (h->payloadLen != sizeof(HelloPayload)) return false;
+    auto* p = (const HelloPayload*)(data + sizeof(MsgHeader));
+    if (p->stationType != (uint8_t)StationType::LOOT) return false;
+
+    uint8_t id = p->stationId;
+    if (id < 1 || id > 5) return false;
+
+    // Version match rule: 0 = wildcard (ignore that field)
+    bool majOK = (g_expectMajor == 0) || (p->fwMajor == g_expectMajor);
+    bool minOK = (g_expectMinor == 0) || (p->fwMinor == g_expectMinor);
+
+    // Record the latest fw we see
+    StationState &s = g_state[id];
+    s.fwMajor = p->fwMajor;
+    s.fwMinor = p->fwMinor;
+
+    if (majOK && minOK) {
+      if (s.phase != (uint8_t)OtaPhase::SUCCESS) {
+        s.phase = (uint8_t)OtaPhase::SUCCESS; s.error = 0; s.bytes = 0; s.total = 0;
+        Serial.printf("[OTA] Loot-%u SUCCESS via HELLO v=%u.%u\n", id, p->fwMajor, p->fwMinor);
+
+        bool allDone = true;
+        for (int i=1;i<=5;i++)
+          if (g_state[i].phase != (uint8_t)OtaPhase::SUCCESS) { allDone=false; break; }
+        if (allDone) { summary("complete"); g_active=false; }
+      }
+      // We still return false so the rest of your app can also use HELLO normally
+    } else {
+      // Version mismatch during campaign; leave state as-is (PENDING) and log once
+      Serial.printf("[OTA] Loot-%u HELLO v=%u.%u (expected %u.%u) – not counting as success\n",
+                    id, p->fwMajor, p->fwMinor, g_expectMajor, g_expectMinor);
+    }
+    return false; // let the rest of the server handle HELLO too
+  }
+
+  return false; // not an OTA-related message
 }
 
 } // namespace
