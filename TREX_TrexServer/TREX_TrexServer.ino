@@ -62,7 +62,6 @@ void setup() {
   // Game + Mode
   resetGame(g);
   modeClassicInit(g);   // Warmup enabled here
-  enterGreen(g);        // starts GREEN; cadence flips are suppressed during warmup
 
   // Register server-specific Telnet commands (used only in maintenance)
   maintRegisterServerCommands(g);
@@ -103,7 +102,7 @@ void loop() {
   while (Serial.available()) {
     int c = Serial.read();
     if (c=='m' || c=='M') { Maint::begin(mcfg); digitalWrite(BOARD_BLUE_LED, HIGH); return; }
-    if (c=='n' || c=='N') startNewGame(g);
+    if (c=='n' || c=='N') { startNewGame(g); }
     if (c=='g' || c=='G') enterGreen(g);
     if (c=='r' || c=='R') enterRed(g);
     if (c=='x' || c=='X') bcastGameOver(g, /*MANUAL*/2);
@@ -150,12 +149,7 @@ void loop() {
   // STATE_TICK @ tickHz
   const uint32_t tickMs = max<uint32_t>(10, 1000 / g.tickHz);
   if (now - g.lastTickSentMs >= tickMs) {
-    uint32_t msLeft = 0;
-    if (g.warmupActive) {
-      msLeft = (g.warmupEndAt > now) ? (g.warmupEndAt - now) : 0;
-    } else {
-      msLeft = (g.nextSwitch > now) ? (g.nextSwitch - now) : 0;
-    }
+    uint32_t msLeft = (g.roundEndAt > now) ? (g.roundEndAt - now) : 0;
     sendStateTick(g, msLeft);
     g.lastTickSentMs = now;
   }
@@ -163,58 +157,48 @@ void loop() {
   // Cadence flips (suppressed during warmup)
   tickCadence(g, now);
 
-  // PIR monitoring (RED only) with arm delay + optional enforcement
-  if (!g.warmupActive && g.phase == Phase::PLAYING && g.light == LightState::RED && g.pirEnforce) {
-    if (now >= g.pirArmAt) {
-      bool anyTrig = false;
-      for (int i=0;i<4;i++) if (g.pir[i].pin >= 0) {
-        bool raw = (digitalRead(g.pir[i].pin) == LOW);
-        if (raw != g.pir[i].last && (now - g.pir[i].lastChange) > PIR_DEBOUNCE_MS) {
-          g.pir[i].last = raw; g.pir[i].lastChange = now; g.pir[i].state = raw;
-          if (raw) { anyTrig = true; } // rising to TRIGGERED
-        }
-      }
-      if (anyTrig) {
-        bcastGameOver(g, /*RED_PIR*/0);
-        return;
-      }
-    }
-  }
-
-  // Active holds (server-driven tick @ lootRate while GREEN)
-  if (!g.warmupActive && g.phase == Phase::PLAYING && g.light == LightState::GREEN) {
-    for (int i=0;i<MAX_HOLDS;i++) if (g.holds[i].active) {
-      auto &h = g.holds[i];
-      auto &pl = g.players[h.playerIdx];
+  // Accrual while GREEN (tick every lootRateMs; grant lootPerTick each tick)
+  if (g.phase == Phase::PLAYING && g.light == LightState::GREEN) {
+    for (int i = 0; i < MAX_HOLDS; ++i) if (g.holds[i].active) {
+      auto &h  = g.holds[i];
       uint8_t sid = h.stationId;
+      if (sid < 1 || sid > 5) { h.active = false; continue; }   // safety
 
-      if (now >= h.nextTickAt) {
-        if (pl.carried >= g.maxCarry) {
-          h.active=false;
-          sendHoldEnd(g, h.holdId, /*FULL*/0);
+      auto &pl = g.players[h.playerIdx];
+
+      if ((int32_t)(now - h.nextTickAt) >= 0) {
+        const uint32_t period  = (g.lootRateMs ? g.lootRateMs : 1000U);
+        uint8_t  room  = (pl.carried >= g.maxCarry) ? 0 : (uint8_t)(g.maxCarry - pl.carried);
+        uint16_t avail = g.stationInventory[sid];
+
+        // Grant N items this tick, but never exceed carry cap or inventory
+        uint16_t grant = g.lootPerTick;
+        if (grant > room)  grant = room;
+        if (grant > avail) grant = avail;
+
+        if (grant == 0) {
+          // No room or no inventory → close the hold with a clear reason
+          h.active = false;
+          sendHoldEnd(g, h.holdId, (avail == 0) ? /*EMPTY*/1 : /*FULL*/0);
+          h.nextTickAt += period;   // keep schedule monotonic
           continue;
         }
-        if (g.stationInventory[sid] == 0) {
-          h.active=false;
-          sendHoldEnd(g, h.holdId, /*EMPTY*/1);
-          continue;
-        }
 
-        // Apply +1/-1 for this tick
-        pl.carried += 1;
-        g.stationInventory[sid] -= 1;
+        pl.carried              = (uint8_t)(pl.carried + grant);
+        g.stationInventory[sid] = (uint16_t)(g.stationInventory[sid] - grant);
 
-        // Tick + station update
+        // Notify player + everyone else (now at tick period cadence)
         sendLootTick(g, h.holdId, pl.carried, g.stationInventory[sid]);
         bcastStation(g, sid);
 
-        h.nextTickAt += g.lootRateMs;
+        h.nextTickAt += period;
+        // If you want catch-up on long stalls, change the 'if' to a 'while' loop.
       }
     }
   }
 
   // Linger holds into RED? After grace, it's a violation.
-  if (!g.warmupActive && g.phase == Phase::PLAYING && g.light == LightState::RED) {
+  if (g.phase == Phase::PLAYING && g.light == LightState::RED) {
     if (now >= g.redGraceUntil) {
       bool anyHold = false;
       for (auto &h : g.holds) if (h.active) { anyHold = true; break; }
@@ -225,8 +209,26 @@ void loop() {
     }
   }
 
+  // PIR violation during RED (after arming delay)
+  if (g.phase == Phase::PLAYING && g.light == LightState::RED && g.pirEnforce) {
+    if (now >= g.pirArmAt) {
+      for (int i = 0; i < 4; ++i) {
+        int pin = g.pir[i].pin;
+        if (pin >= 0) {
+          bool trig = (digitalRead(pin) == LOW);  // active-LOW
+          // optional: track state/time
+          g.pir[i].state = trig;
+          if (trig) {
+            bcastGameOver(g, /*RED_PIR*/3);
+            return;
+          }
+        }
+      }
+    }
+  }
+
   // Level progression (Classic mode)
-  if (!g.warmupActive && g.phase == Phase::PLAYING) {
+  if (g.phase == Phase::PLAYING) {
     modeClassicMaybeAdvance(g);
   }
 }

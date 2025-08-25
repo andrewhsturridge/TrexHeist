@@ -19,12 +19,10 @@ static bool parseInt(const String& s, int32_t& out) {
 }
 
 static void printStatus(WiFiClient& out, Game& g) {
-  out.printf("phase=%s light=%s msLeft=%u score=%u level=%u warmup=%u\n",
+  out.printf("phase=%s light=%s score=%u \n",
              (g.phase==Phase::PLAYING?"PLAYING":"END"),
              (g.light==LightState::GREEN?"GREEN":"RED"),
-             (unsigned)((g.warmupActive) ? max<int32_t>(0,(int32_t)(g.warmupEndAt - millis()))
-                                         : max<int32_t>(0,(int32_t)(g.nextSwitch - millis()))),
-             (unsigned)g.teamScore, (unsigned)(g.levelIndex+1), (unsigned)g.warmupActive);
+             (unsigned)g.teamScore);
   out.printf("G=%u R=%u loot=%u maxCarry=%u tickHz=%u pir=%u pirArm=%u\n",
              (unsigned)g.greenMs, (unsigned)g.redMs, (unsigned)g.lootRateMs,
              (unsigned)g.maxCarry, (unsigned)g.tickHz,

@@ -52,7 +52,7 @@ constexpr uint8_t  RING_BRIGHTNESS  = 64;
 constexpr uint8_t  GAUGE_BRIGHTNESS = 64;
 
 /* Map teamScore → LEDs; set TEAM_GOAL to “full bar” score */
-constexpr uint32_t TEAM_GOAL = GAUGE_LEN;  // 1:1 mapping by default
+constexpr uint32_t TEAM_GOAL = 100;  // 1:1 mapping by default
 
 /* ── pins ─────────────────────────────────────────────────── */
 constexpr uint8_t PIN_SCK   = 36, PIN_MISO = 37, PIN_MOSI = 35, PIN_RST = 11;
@@ -237,15 +237,35 @@ void fillRing(uint8_t idx, uint32_t c) {
 void drawTeamGauges(uint32_t score) {
   uint16_t lit = 0;
   if (TEAM_GOAL > 0) {
-    uint32_t scaled = (uint32_t)score * GAUGE_LEN + (TEAM_GOAL - 1);
+    // clamp to avoid >100%
+    uint32_t clamped = (score > TEAM_GOAL) ? TEAM_GOAL : score;
+    uint32_t scaled = clamped * GAUGE_LEN + (TEAM_GOAL - 1);
     lit = (uint16_t)min<uint32_t>(GAUGE_LEN, scaled / TEAM_GOAL);
   }
   for (auto &g : gauge) {
     for (uint16_t i = 0; i < GAUGE_LEN; ++i) {
-      g.setPixelColor(i, (i < lit) ? GOLD : OFF);
+      uint32_t c = OFF;
+      if (lit == GAUGE_LEN && i == GAUGE_LEN - 1) c = GREEN; // 100% marker
+      else if (i < lit) c = GOLD;                             // progress
+      g.setPixelColor(i, c);
       if ((i & 15) == 0) pumpAudio();
     }
-    if (!audioExclusive) g.show();  // suppress .show() while exclusive
+    if (!audioExclusive) g.show();
+    pumpAudio();
+  }
+}
+
+void drawFinalBars(uint32_t score) {
+  uint32_t clamped  = (score > TEAM_GOAL) ? TEAM_GOAL : score;
+  uint16_t greenLit = (uint16_t)((uint64_t)clamped * GAUGE_LEN / TEAM_GOAL);
+
+  for (auto &g : gauge) {
+    for (uint16_t i = 0; i < GAUGE_LEN; ++i) {
+      uint32_t c = (i < greenLit) ? GREEN : RED;
+      g.setPixelColor(i, c);
+      if ((i & 15) == 0) pumpAudio();   // keep audio fed while painting
+    }
+    g.show();
     pumpAudio();
   }
 }
@@ -280,7 +300,9 @@ void onRx(const uint8_t* data, uint16_t len) {
     case MsgType::STATE_TICK: {
       if (h->payloadLen != sizeof(StateTickPayload)) break;
       auto* p = (const StateTickPayload*)(data + sizeof(MsgHeader));
-      g_lightState = (p->state == (uint8_t)LightState::GREEN) ? LightState::GREEN : LightState::RED;
+      if      (p->state == (uint8_t)LightState::GREEN)  g_lightState = LightState::GREEN;
+      else if (p->state == (uint8_t)LightState::YELLOW) g_lightState = LightState::YELLOW;
+      else                                              g_lightState = LightState::RED;
       break;
     }
 
@@ -309,14 +331,24 @@ void onRx(const uint8_t* data, uint16_t len) {
     case MsgType::GAME_START: {
       gameActive = true;
       Serial.println("[DROP] GAME_START");
+      drawTeamGauges(teamScore);      // show current progress style immediately
+      for (int i=0;i<4;i++) fillRing(i, RED);
       break;
     }
 
     case MsgType::GAME_OVER: {
       gameActive = false;
-      Serial.println("[DROP] GAME_OVER");
+      Serial.printf("[DROP] GAME_OVER  final score=%lu / %lu\n",
+                    (unsigned long)teamScore, (unsigned long)TEAM_GOAL);
+
+      // Stop any one-shot playback and resume LED shows
+      stopAudioExclusive();                 // sets audioExclusive = false
+
+      // Set rings to red and clear tap state
       for (int i=0;i<4;i++) { tagPresent[i]=false; absentMs[i]=0; fillRing(i, RED); }
-      stopAudioExclusive();
+
+      // Freeze result: green collected, red remainder
+      drawFinalBars(teamScore);
       break;
     }
 

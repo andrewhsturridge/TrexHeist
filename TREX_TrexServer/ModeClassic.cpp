@@ -1,55 +1,72 @@
 #include "ModeClassic.h"
+#include "Cadence.h"
+#include "Net.h" 
 
-struct LevelCfg {
-  uint32_t green_ms, red_ms, loot_ms;
-  uint8_t  max_carry;
-  uint16_t score_to_advance; // 0 => terminal level
-};
+static void startRound(Game& g, uint8_t idx) {
+  const uint32_t now = millis();
+  g.roundIndex   = idx;
+  g.roundStartAt = now;
 
-static const LevelCfg kLevels[] = {
-  /* L1 */ { 10000, 8000, 1000, 8,  20 },
-  /* L2 */ { 5500, 4500,  900, 8,  50 },
-  /* L3 */ { 5000, 5000,  800, 7,  90 },
-  /* L4 */ { 4500, 5500,  700, 6,   0 }, // terminal for now
-};
+  if (idx == 1) {
+    g.noRedThisRound       = true;
+    g.allowYellowThisRound = false;
 
-static void applyLevel(Game& g, const LevelCfg& L) {
-  g.greenMs   = L.green_ms;
-  g.redMs     = L.red_ms;
-  g.lootRateMs= L.loot_ms;
-  g.maxCarry  = L.max_carry;
-  Serial.printf("[TREX] Apply Level %u  G=%u R=%u loot=%u maxCarry=%u\n",
-                (unsigned)(g.levelIndex+1), (unsigned)L.green_ms, (unsigned)L.red_ms,
-                (unsigned)L.loot_ms, (unsigned)L.max_carry);
+    g.gameStartAt = now;
+    g.gameEndAt   = now + 300000UL;  // 5:00 total
+    g.roundEndAt  = now + 120000UL;  // 2:00 Round 1
+
+    g.roundGoal   = 100;
+    g.lootPerTick  = 4;
+    g.lootRateMs  = 1000;
+
+    // initialize stations (no broadcast here; use drip)
+    for (uint8_t sid = 1; sid <= 5; ++sid) {
+      g.stationCapacity[sid]  = 56;
+      g.stationInventory[sid] = 20;
+    }
+
+    // prime drip
+    g.pending.needGameStart = true;
+    g.pending.nextStation   = 1;
+    g.pending.needScore     = true;
+
+    enterGreen(g);  // lock GREEN in Round 1
+  } else {
+    // Round 2: enable full cadence until game end
+    g.noRedThisRound       = false;
+    g.allowYellowThisRound = true;
+    g.lootRateMs  = 1000;
+    g.lootPerTick = 2;   
+
+
+    g.roundEndAt = (g.gameEndAt > now) ? g.gameEndAt : now;  // rest of game
+    enterGreen(g);
+  }
 }
 
 void modeClassicInit(Game& g) {
-  // Warmup: GREEN-only window; PIR ignored by server logic while warmupActive=true
-  g.warmupActive = true;
-  g.warmupMs     = 30000; // change via maint if desired
-  g.warmupEndAt  = millis() + g.warmupMs;
-  g.levelIndex   = 0;     // next real level is L1
+  const uint32_t now = millis();
+  // overall 5-minute game
+  g.gameStartAt = now;
+  g.gameEndAt   = now + 300000UL;           // 5 minutes
+
+  startRound(g, /*idx=*/1);                 // Round 1 starts immediately
 }
 
 void modeClassicMaybeAdvance(Game& g) {
-  if (g.levelIndex >= (sizeof(kLevels)/sizeof(kLevels[0]))) return;
+  const uint32_t now = millis();
 
-  const LevelCfg& cur = kLevels[g.levelIndex];
-
-  // When entering level (first time after warmup or after prior advancement),
-  // ensure tunables match the table.
-  static uint8_t lastAppliedLevel = 255;
-  if (lastAppliedLevel != g.levelIndex) {
-    applyLevel(g, cur);
-    lastAppliedLevel = g.levelIndex;
+  // Round timing
+  if (now >= g.gameEndAt) {
+    bcastGameOver(g, /*TIME_UP*/0);
+    return;
   }
-
-  // Advance once score threshold reached
-  if (cur.score_to_advance > 0 && g.teamScore >= cur.score_to_advance) {
-    g.levelIndex++;
-    if (g.levelIndex < (sizeof(kLevels)/sizeof(kLevels[0]))) {
-      const LevelCfg& nxt = kLevels[g.levelIndex];
-      applyLevel(g, nxt);
+  // Round 1 timeout
+  if (g.roundIndex == 1 && now >= g.roundEndAt) {
+    if (g.teamScore < g.roundGoal) {
+      bcastGameOver(g, /*GOAL_NOT_MET*/4);
+      return;
     }
+    startRound(g, /*idx=*/2);   // success -> play out remainder of game
   }
 }

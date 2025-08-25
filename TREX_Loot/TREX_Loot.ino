@@ -125,13 +125,16 @@ MFRC522 rfid(PIN_RFID_CS, PIN_RFID_RST);
 Adafruit_NeoPixel ring (14,         PIN_RING,  NEO_GRB + NEO_KHZ800);
 Adafruit_NeoPixel gauge(GAUGE_LEN,  PIN_GAUGE, NEO_GRB + NEO_KHZ800);
 
-/* audio (conditional) */
+// --- audio (conditional) ---
 #if TREX_AUDIO_PROGMEM
-  AudioFileSourcePROGMEM *wavSrc = nullptr;
+  // In-place storage + pointer (no heap allocations)
+  alignas(4) static uint8_t wavSrcStorage[sizeof(AudioFileSourcePROGMEM)];
+  static AudioFileSourcePROGMEM* wavSrc = nullptr;
 #else
   AudioFileSourceLittleFS *wavFile = nullptr;
   AudioFileSourceBuffer   *wavBuf  = nullptr;
 #endif
+
 AudioGeneratorWAV *decoder = nullptr;
 AudioOutputI2S    *i2sOut  = nullptr;
 bool               playing = false;
@@ -142,7 +145,7 @@ const uint32_t RED     = C_RGB(255,0,0);
 const uint32_t GREEN   = C_RGB(0,255,0);
 const uint32_t BLUE    = C_RGB(0,0,255);
 const uint32_t CYAN    = C_RGB(0,200,255);
-const uint32_t GOLD    = C_RGB(255,180,0);
+const uint32_t YELLOW    = C_RGB(255,180,0);
 const uint32_t OFF     = 0;
 
 /* ── RFID presence debounce ──────────────────────────── */
@@ -175,9 +178,15 @@ LightState g_lightState = LightState::GREEN;
 uint16_t   lastInvPainted = 0, lastCapPainted = 0;
 LightState lastGaugeColor = LightState::GREEN;
 
+static bool     fullAnnounced     = false;
+static uint32_t nextGaugeDrawAtMs = 0;
+
 /* ── misc ────────────────────────────────────────────── */
 uint16_t g_seq = 1;            // outgoing message seq
 uint32_t lastHelloMs = 0;
+
+// Set true once we’ve received the first STATION_UPDATE/ACK/TICK for this game
+static bool stationInited = false;
 
 /* ── OTA campaign state ──────────────────────────────── */
 bool      otaInProgress     = false;
@@ -241,9 +250,10 @@ static void processIdentitySerial() {
 /* ── audio helpers ────────────────────────────────────── */
 static bool openChain() {
   if (decoder && decoder->isRunning()) decoder->stop();
+
 #if TREX_AUDIO_PROGMEM
-  if (wavSrc) { delete wavSrc; wavSrc = nullptr; }
-  wavSrc = new AudioFileSourcePROGMEM(replenish_wav, replenish_wav_len);
+  // Re-initialize the PROGMEM source in-place so isOpen()==true
+  wavSrc = new (wavSrcStorage) AudioFileSourcePROGMEM(replenish_wav, replenish_wav_len);
 #else
   if (wavBuf)  { delete wavBuf;  wavBuf  = nullptr; }
   if (wavFile) { delete wavFile; wavFile = nullptr; }
@@ -252,7 +262,11 @@ static bool openChain() {
   wavBuf = new AudioFileSourceBuffer(wavFile, 4096);
   if (!wavBuf) { Serial.println("[LOOT] wavBuf alloc fail"); return false; }
 #endif
-  if (!decoder) decoder = new AudioGeneratorWAV();
+
+  // Fresh decoder each time avoids any stale internal state
+  if (decoder) { decoder->stop(); delete decoder; decoder = nullptr; }
+  decoder = new AudioGeneratorWAV();
+
 #if TREX_AUDIO_PROGMEM
   bool ok = decoder->begin(wavSrc, i2sOut);
 #else
@@ -319,23 +333,31 @@ void drawRingCarried(uint8_t cur, uint8_t maxC) {
 }
 
 void drawGaugeInventory(uint16_t inventory, uint16_t capacity) {
-  if (otaInProgress) return;  // OTA owns the gauge
+  if (otaInProgress) return;
   const LightState colorState = g_lightState;
   if (inventory == lastInvPainted &&
       capacity  == lastCapPainted &&
       colorState == lastGaugeColor) return;
 
   pumpAudio();
-  uint16_t lit = 0;
-  if (capacity > 0) {
-    lit = (uint16_t)((uint32_t)inventory * GAUGE_LEN + (capacity - 1)) / capacity; // ceil
-  }
-  const uint32_t col = (colorState == LightState::GREEN) ? GREEN : RED;
 
-  for (uint16_t i = 0; i < GAUGE_LEN; ++i)
+  // 1:1 mapping — each loot lights one LED on the gauge
+  uint16_t lit = (inventory > GAUGE_LEN) ? GAUGE_LEN : inventory;
+
+  uint32_t col = RED;
+  if      (colorState == LightState::GREEN)  col = GREEN;
+  else if (colorState == LightState::YELLOW) col = YELLOW;
+
+  for (uint16_t i = 0; i < GAUGE_LEN; ++i) {
     gauge.setPixelColor(i, (i < lit) ? col : OFF);
+    if ((i & 7) == 0) pumpAudio();       // NEW: gentle feed during long loops
+  }
   gauge.show();
-  lastInvPainted = inventory; lastCapPainted = capacity; lastGaugeColor = colorState;
+  pumpAudio();                            // NEW: one more after show
+
+  lastInvPainted = inventory;
+  lastCapPainted = capacity;              // tracked for cache only
+  lastGaugeColor = colorState;
 }
 
 void fillRing(uint32_t c) {
@@ -355,7 +377,7 @@ inline void startFullBlinkImmediate() {
   fullBlinkOn     = true;
   fullBlinkLastMs = millis();
   blinkHoldId     = holdId;
-  fillRing(GOLD);
+  fillRing(YELLOW);
 }
 inline void stopFullBlink() { fullBlinkActive = false; fullBlinkOn = false; }
 inline void tickFullBlink() {
@@ -364,8 +386,29 @@ inline void tickFullBlink() {
   if ((now - fullBlinkLastMs) >= FULL_BLINK_PERIOD_MS) {
     fullBlinkLastMs = now;
     fullBlinkOn = !fullBlinkOn;
-    fillRing(fullBlinkOn ? GOLD : OFF);
+    fillRing(fullBlinkOn ? YELLOW : OFF);
   }
+}
+
+void gameOverBlinkAndOff() {
+  // 3 quick red blinks on ring + gauge + MOSFET, then off
+  const int cycles = 3;
+  for (int k = 0; k < cycles; ++k) {
+    // ON
+    fillGauge(RED);
+    digitalWrite(PIN_MOSFET, HIGH);
+    uint32_t t = millis();
+    while (millis() - t < 140);
+
+    // OFF
+    fillGauge(OFF);
+    digitalWrite(PIN_MOSFET, LOW);
+    t = millis();
+    while (millis() - t < 100);
+  }
+  // Final state: fully off
+  fillGauge(OFF);
+  digitalWrite(PIN_MOSFET, LOW);
 }
 
 /* ── OTA visuals ─────────────────────────────────────── */
@@ -404,8 +447,8 @@ void otaVisualSuccess() {
   otaSpinnerActive = false;
   // green flash
   fillRing(GREEN);
-  // gold sweep
-  for (uint16_t i=0;i<GAUGE_LEN;++i) { gauge.setPixelColor(i, GOLD); gauge.show(); delay(3); }
+  // yellow sweep
+  for (uint16_t i=0;i<GAUGE_LEN;++i) { gauge.setPixelColor(i, YELLOW); gauge.show(); delay(3); }
 }
 
 void otaVisualFail() {
@@ -661,11 +704,16 @@ void onRx(const uint8_t* data, uint16_t len) {
     case MsgType::STATE_TICK: {
       if (h->payloadLen != sizeof(StateTickPayload)) break;
       auto* p = (const StateTickPayload*)(data + sizeof(MsgHeader));
-      g_lightState = (p->state == (uint8_t)LightState::GREEN) ? LightState::GREEN : LightState::RED;
+      if      (p->state == (uint8_t)LightState::GREEN)  g_lightState = LightState::GREEN;
+      else if (p->state == (uint8_t)LightState::YELLOW) g_lightState = LightState::YELLOW;
+      else                                              g_lightState = LightState::RED;
+
       if (g_lightState == LightState::RED && !holdActive && !tagPresent && !fullBlinkActive && !otaInProgress) {
         fillRing(RED);
       }
-      drawGaugeInventory(inv, cap);
+
+      // Don’t clear pipes to 0 until we know the inventory
+      if (stationInited) drawGaugeInventory(inv, cap);
       break;
     }
 
@@ -673,20 +721,59 @@ void onRx(const uint8_t* data, uint16_t len) {
       if (h->payloadLen != sizeof(LootHoldAckPayload)) break;
       auto* p = (const LootHoldAckPayload*)(data + sizeof(MsgHeader));
       if (p->holdId != holdId) break;
+
+      // Update state from ACK
       maxCarry = p->maxCarry;
-      carried  = p->carried;
+      carried  = (p->carried > maxCarry) ? maxCarry : p->carried;  // clamp
       inv      = p->inventory;
       cap      = p->capacity;
+      stationInited = true;
 
       if (p->accepted) {
         holdActive = true;
-        startAudio();
-        maxCarry = p->maxCarry; carried = p->carried; inv = p->inventory; cap = p->capacity;
-        if (carried >= maxCarry) startFullBlinkImmediate(); else { stopFullBlink(); drawRingCarried(carried, maxCarry); }
-        drawGaugeInventory(inv, cap);
+        startAudio();                 // begin hold audio
+        pumpAudio();
+
+        if (carried >= maxCarry) {
+          if (!fullAnnounced || blinkHoldId != p->holdId) {
+            startFullBlinkImmediate();   // one-shot full indicator
+            fullAnnounced = true;
+            blinkHoldId   = p->holdId;
+          }
+        } else {
+          if (fullBlinkActive) stopFullBlink();
+          fullAnnounced = false;
+          drawRingCarried(carried, maxCarry);
+        }
+
+        // Throttled gauge paint (inventory shown 1:1 in drawGaugeInventory)
+        uint32_t now = millis();
+        if ((int32_t)(now - nextGaugeDrawAtMs) >= 0) {
+          drawGaugeInventory(inv, cap);
+          nextGaugeDrawAtMs = now + 20;   // ~50 Hz cap
+        }
       } else {
-        if (carried >= maxCarry) { startFullBlinkImmediate(); drawGaugeInventory(inv, cap); }
-        else { stopFullBlink(); fillRing(RED); }
+        // Not accepted -> ensure visuals sane; don't spam audio
+        holdActive = false;
+        stopAudio();
+        pumpAudio();
+
+        if (carried >= maxCarry) {
+          if (!fullAnnounced || blinkHoldId != p->holdId) {
+            startFullBlinkImmediate();
+            fullAnnounced = true;
+            blinkHoldId   = p->holdId;
+          }
+          uint32_t now = millis();
+          if ((int32_t)(now - nextGaugeDrawAtMs) >= 0) {
+            drawGaugeInventory(inv, cap);
+            nextGaugeDrawAtMs = now + 20;
+          }
+        } else {
+          fullAnnounced = false;
+          stopFullBlink();
+          fillRing(RED);
+        }
       }
       break;
     }
@@ -695,14 +782,30 @@ void onRx(const uint8_t* data, uint16_t len) {
       if (h->payloadLen != sizeof(LootTickPayload)) break;
       auto* p = (const LootTickPayload*)(data + sizeof(MsgHeader));
       if (!holdActive || p->holdId != holdId) break;
-      carried = p->carried; inv = p->inventory;
+
+      carried = (p->carried > maxCarry) ? maxCarry : p->carried;  // clamp
+      inv     = p->inventory;
+      stationInited = true;
+
       if (carried >= maxCarry) {
-        if (!fullBlinkActive || blinkHoldId != holdId) startFullBlinkImmediate();
+        if (!fullAnnounced || blinkHoldId != p->holdId) {
+          startFullBlinkImmediate();      // one-shot on first time hitting full
+          fullAnnounced = true;
+          blinkHoldId   = p->holdId;
+        }
       } else {
         if (fullBlinkActive) stopFullBlink();
+        fullAnnounced = false;
         drawRingCarried(carried, maxCarry);
       }
-      drawGaugeInventory(inv, cap);
+
+      uint32_t now = millis();
+      if ((int32_t)(now - nextGaugeDrawAtMs) >= 0) {
+        drawGaugeInventory(inv, cap);     // paints inventory 1:1 with LEDs
+        nextGaugeDrawAtMs = now + 20;
+      }
+
+      pumpAudio();
       break;
     }
 
@@ -710,9 +813,21 @@ void onRx(const uint8_t* data, uint16_t len) {
       if (h->payloadLen != sizeof(HoldEndPayload)) break;
       auto* p = (const HoldEndPayload*)(data + sizeof(MsgHeader));
       if (p->holdId != holdId) break;
-      holdActive = false; holdId = 0; stopAudio();
-      if (tagPresent && carried >= maxCarry) { if (!fullBlinkActive) startFullBlinkImmediate(); }
-      else { stopFullBlink(); fillRing(RED); }
+
+      holdActive = false;
+      holdId     = 0;
+      stopAudio();
+      pumpAudio();
+
+      fullAnnounced = false;              // reset one-shot guard
+
+      if (tagPresent && carried >= maxCarry) {
+        if (!fullBlinkActive) startFullBlinkImmediate();
+      } else {
+        stopFullBlink();
+        fillRing(RED);
+      }
+      // Gauge already reflects latest inv from final TICK; no repaint needed here
       break;
     }
 
@@ -721,18 +836,37 @@ void onRx(const uint8_t* data, uint16_t len) {
       auto* p = (const StationUpdatePayload*)(data + sizeof(MsgHeader));
       if (p->stationId == STATION_ID) {
         inv = p->inventory; cap = p->capacity;
+        stationInited = true;                // <-- got our initial numbers
         if (!holdActive && !tagPresent) drawGaugeInventory(inv, cap);
       }
+      Serial.printf("[STATION_UPDATE] id=%u inv=%u cap=%u\n", p->stationId, inv, cap);
       break;
     }
 
-    case MsgType::GAME_START: { gameActive = true; Serial.println("[LOOT] GAME_START"); break; }
+    case MsgType::GAME_START: {
+      gameActive = true;
+      wasPaused = false;
+      fullBlinkActive = false;
+      fullAnnounced = false;
+
+      stationInited = false;                  // wait for fresh inventory before painting
+
+      digitalWrite(PIN_MOSFET, HIGH);         // lamp ON for live round
+      stopFullBlink();
+      fillRing(RED);                          // ring “awake” in RED
+
+      // IMPORTANT: do NOT call drawGaugeInventory() here,
+      // so we don’t blank to 0 before STATION_UPDATE arrives.
+      Serial.println("[LOOT] GAME_START");
+      break;
+    }
 
     case MsgType::GAME_OVER: {
       gameActive = false; holdActive = false; holdId = 0; fullBlinkActive = false;
       carried = 0; tagPresent = false; absentStartMs = 0;
-      if (!otaInProgress) fillRing(RED);
       stopAudio();
+      if (!otaInProgress) fillRing(RED);
+      gameOverBlinkAndOff();
       Serial.println("[LOOT] GAME_OVER");
       break;
     }
@@ -805,6 +939,11 @@ void setup() {
   i2sOut = new AudioOutputI2S(0, AudioOutputI2S::EXTERNAL_I2S);
   i2sOut->SetPinout(PIN_I2S_BCLK, PIN_I2S_LRCLK, PIN_I2S_DOUT);
   i2sOut->SetGain(1.0f);
+
+#if TREX_AUDIO_PROGMEM
+  // First construction (open state = true)
+  wavSrc = new (wavSrcStorage) AudioFileSourcePROGMEM(replenish_wav, replenish_wav_len);
+#endif
 
 #if !TREX_AUDIO_PROGMEM
   File f = LittleFS.open(CLIP_PATH, "r");

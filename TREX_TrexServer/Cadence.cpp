@@ -1,5 +1,6 @@
 #include "Cadence.h"
 #include "Media.h"
+#include "Net.h"
 
 void enterGreen(Game& g) {
   g.light = LightState::GREEN;
@@ -7,6 +8,14 @@ void enterGreen(Game& g) {
   g.lastFlipMs = millis();
   spritePlay(CLIP_NOT_LOOKING);
   Serial.println("[TREX] -> GREEN");
+}
+
+
+void enterYellow(Game& g) {
+  g.light = LightState::YELLOW;
+  g.nextSwitch = millis() + g.yellowMs;
+  g.lastFlipMs = millis();
+  Serial.println("[TREX] -> YELLOW");
 }
 
 void enterRed(Game& g) {
@@ -21,18 +30,28 @@ void enterRed(Game& g) {
 }
 
 void tickCadence(Game& g, uint32_t now) {
-  // Warmup suppresses flips; end warmup then apply first level values
-  if (g.warmupActive) {
-    if (now >= g.warmupEndAt) {
-      g.warmupActive = false;
-      // Keep current light; next flip uses current timers already set
-      Serial.println("[TREX] Warmup ended → classic Level 1");
+  if (g.phase != Phase::PLAYING) return;
+
+  // Round 1: GREEN only (no YELLOW, no RED)
+  if (g.noRedThisRound && !g.allowYellowThisRound) {
+    if (g.light != LightState::GREEN) {
+      enterGreen(g);                  // force GREEN once if not already
     }
-    return;
+    g.nextSwitch = now + 3600000UL;   // push next flip far out so we don't re-enter
+    return;                           // nothing else to do this tick
   }
 
-  if (g.phase != Phase::PLAYING) return;
   if (now < g.nextSwitch) return;
 
-  (g.light == LightState::GREEN) ? enterRed(g) : enterGreen(g);
+  if (g.noRedThisRound) {
+    // Round 1 previously GREEN<->YELLOW; now won't run because of guard above.
+    // If you ever use "noRedThisRound=true AND allowYellowThisRound=true",
+    // this branch will toggle GREEN <-> YELLOW:
+    (g.light == LightState::GREEN) ? enterYellow(g) : enterGreen(g);
+  } else {
+    // Full cadence: GREEN → YELLOW → RED → GREEN
+    if      (g.light == LightState::GREEN)  enterYellow(g);
+    else if (g.light == LightState::YELLOW) enterRed(g);
+    else                                    enterGreen(g);
+  }
 }

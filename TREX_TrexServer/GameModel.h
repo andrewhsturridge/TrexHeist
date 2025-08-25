@@ -4,6 +4,7 @@
 
 constexpr uint8_t MAX_PLAYERS = 24;
 constexpr uint8_t MAX_HOLDS   = 8;
+constexpr uint8_t MAX_STATIONS= 5;
 
 // Phases
 enum class Phase : uint8_t { PLAYING=1, END=2 };
@@ -47,9 +48,15 @@ struct Game {
   // Tunables (Telnet/maint will edit these)
   uint32_t greenMs = 10000;
   uint32_t redMs   = 8000;
+  uint32_t yellowMs = 1500;
   uint32_t lootRateMs = 1000;
+  uint16_t lootPerTick = 1;
   uint8_t  maxCarry = 8;
   uint8_t  tickHz   = 5;
+  bool     redEnabled = true;
+  bool allowYellowThisRound = true;
+
+  uint16_t roundGoal = 100;
 
   // Grace + PIR
   uint32_t edgeGraceMs     = 300;
@@ -57,15 +64,16 @@ struct Game {
   uint32_t lastFlipMs      = 0;
   uint32_t redGraceUntil   = 0;
 
+  uint8_t   roundIndex      = 1;
+  uint32_t  gameStartAt     = 0;
+  uint32_t  gameEndAt       = 0;
+  uint32_t  roundStartAt    = 0;
+  uint32_t  roundEndAt      = 0;
+  bool      noRedThisRound  = true;     // Round 1 = true
+
   bool     pirEnforce      = true;
   uint32_t pirArmDelayMs   = 6000;
   uint32_t pirArmAt        = 0;
-
-  // Warmup + classic levels
-  bool     warmupActive    = true;
-  uint32_t warmupMs        = 30000;
-  uint32_t warmupEndAt     = 0;
-  uint8_t  levelIndex      = 0;    // first level after warmup
 
   // Drip broadcast
   PendingStart pending{};
@@ -75,8 +83,8 @@ struct Game {
   PlayerRec players[MAX_PLAYERS];
   HoldRec   holds[MAX_HOLDS];
   PirRec    pir[4];
-  uint16_t  stationCapacity[7]  = {0, 56,100,100,100,100, 0}; // index 0,6 unused
-  uint16_t  stationInventory[7] = {0, 56,100,100,100,100, 0};
+  uint16_t  stationCapacity[7]  = {0, 56,56,56,56,56, 0}; // index 0,6 unused
+  uint16_t  stationInventory[7] = {0, 56,56,56,56,56, 0};
 };
 
 // Helpers

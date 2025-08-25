@@ -1,5 +1,8 @@
 #include "GameModel.h"
 #include <string.h>
+#include <TrexProtocol.h> 
+
+#include "ModeClassic.h"
 
 static inline bool uidEq(const TrexUid& a, const TrexUid& b) {
   if (a.len != b.len) return false;
@@ -7,25 +10,41 @@ static inline bool uidEq(const TrexUid& a, const TrexUid& b) {
   return true;
 }
 
+#include <TrexProtocol.h>  // for TrexUid helpers if used
+#include "GameModel.h"
+
 void resetGame(Game& g) {
-  g.phase = Phase::PLAYING;
+  g.phase = Phase::PLAYING;       // ensure we're in play mode
+  g.teamScore = 0;
+  g.roundIndex = 0;
+
+  g.gameStartAt  = 0;
+  g.gameEndAt    = 0;
+  g.roundStartAt = 0;
+  g.roundEndAt   = 0;
+
   g.light = LightState::GREEN;
   g.nextSwitch = 0;
-  g.seq = 1;
-  g.teamScore = 0;
+  g.lastFlipMs = 0;
+  g.redGraceUntil = 0;
 
-  for (int i=0;i<MAX_PLAYERS;i++) { g.players[i].used=false; g.players[i].carried=0; g.players[i].banked=0; }
-  for (int i=0;i<MAX_HOLDS;i++) g.holds[i].active=false;
+  g.noRedThisRound       = false;
+  g.allowYellowThisRound = true;
 
-  // inventory reset to capacity
-  for (uint8_t sid=1; sid<=5; ++sid) g.stationInventory[sid]=g.stationCapacity[sid];
+  g.lootPerTick = 1;
+  g.lootRateMs  = 1000;
 
-  g.pending.needGameStart = true;
-  g.pending.nextStation   = 1;
-  g.pending.needScore     = true;
 
-  g.warmupActive = true;
-  g.warmupEndAt  = millis() + g.warmupMs;
+  // Clear station state; Round 1 will set inventory=20 later
+  for (uint8_t sid = 1; sid < MAX_STATIONS; ++sid) {
+    g.stationCapacity[sid]  = 56;  // keep your physical gauge size
+    g.stationInventory[sid] = 0;   // start empty; filled in startRound()
+  }
+
+  // (Optional) clear any per-player holds/carry if you track them here
+  for (int i=0;i<MAX_PLAYERS;i++) {
+    g.players[i] = PlayerRec{}; // zero/clear
+  }
 }
 
 int findPlayer(const Game& g, const TrexUid& u) {
@@ -53,4 +72,5 @@ int allocHold(Game& g) {
 void startNewGame(Game& g) {
   Serial.println("[TREX] New game starting...");
   resetGame(g);
+  modeClassicInit(g);
 }
