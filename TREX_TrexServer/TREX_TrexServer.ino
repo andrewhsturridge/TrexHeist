@@ -103,7 +103,13 @@ void loop() {
     int c = Serial.read();
     if (c=='m' || c=='M') { Maint::begin(mcfg); digitalWrite(BOARD_BLUE_LED, HIGH); return; }
     if (c=='n' || c=='N') { startNewGame(g); }
-    if (c=='g' || c=='G') enterGreen(g);
+    if (c=='g' || c=='G') {
+      if (g.roundIndex == 0 || g.phase == Phase::END) {
+        startNewGame(g);          // full reset + Round 1 + drip
+      } else {
+        enterGreen(g);            // mid-game manual flip stays supported
+      }
+    }
     if (c=='r' || c=='R') enterRed(g);
     if (c=='x' || c=='X') bcastGameOver(g, /*MANUAL*/2);
     // Update all Loot stations (press 'U')
@@ -149,7 +155,7 @@ void loop() {
   // STATE_TICK @ tickHz
   const uint32_t tickMs = max<uint32_t>(10, 1000 / g.tickHz);
   if (now - g.lastTickSentMs >= tickMs) {
-    uint32_t msLeft = (g.roundEndAt > now) ? (g.roundEndAt - now) : 0;
+    uint32_t msLeft = (g.roundIndex==1) ? ((g.roundEndAt>now)?(g.roundEndAt-now):0) : ((g.gameEndAt>now)?(g.gameEndAt-now):0);
     sendStateTick(g, msLeft);
     g.lastTickSentMs = now;
   }

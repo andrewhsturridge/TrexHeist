@@ -177,13 +177,13 @@ LightState g_lightState = LightState::GREEN;
 // Gauge paint cache (prevents unnecessary .show() calls)
 uint16_t   lastInvPainted = 0, lastCapPainted = 0;
 LightState lastGaugeColor = LightState::GREEN;
+static bool gaugeCacheValid = false;
 
 static bool     fullAnnounced     = false;
 static uint32_t nextGaugeDrawAtMs = 0;
 
 /* ── misc ────────────────────────────────────────────── */
 uint16_t g_seq = 1;            // outgoing message seq
-uint32_t lastHelloMs = 0;
 
 // Set true once we’ve received the first STATION_UPDATE/ACK/TICK for this game
 static bool stationInited = false;
@@ -335,7 +335,10 @@ void drawRingCarried(uint8_t cur, uint8_t maxC) {
 void drawGaugeInventory(uint16_t inventory, uint16_t capacity) {
   if (otaInProgress) return;
   const LightState colorState = g_lightState;
-  if (inventory == lastInvPainted &&
+
+  // Only skip when the cache is valid
+  if (gaugeCacheValid &&
+      inventory == lastInvPainted &&
       capacity  == lastCapPainted &&
       colorState == lastGaugeColor) return;
 
@@ -355,9 +358,14 @@ void drawGaugeInventory(uint16_t inventory, uint16_t capacity) {
   gauge.show();
   pumpAudio();                            // NEW: one more after show
 
+  // MOSFET lamp follows inventory: off when out of loot
+  if (inventory == 0) digitalWrite(PIN_MOSFET, LOW);
+  else                digitalWrite(PIN_MOSFET, HIGH);
+
   lastInvPainted = inventory;
   lastCapPainted = capacity;              // tracked for cache only
   lastGaugeColor = colorState;
+  gaugeCacheValid = true;
 }
 
 void fillRing(uint32_t c) {
@@ -370,6 +378,7 @@ void fillGauge(uint32_t c) {
   pumpAudio();
   for (uint16_t i=0;i<GAUGE_LEN;++i) gauge.setPixelColor(i,c);
   gauge.show();
+  gaugeCacheValid = false;
 }
 
 inline void startFullBlinkImmediate() {
@@ -377,6 +386,7 @@ inline void startFullBlinkImmediate() {
   fullBlinkOn     = true;
   fullBlinkLastMs = millis();
   blinkHoldId     = holdId;
+  pumpAudio();
   fillRing(YELLOW);
 }
 inline void stopFullBlink() { fullBlinkActive = false; fullBlinkOn = false; }
@@ -387,6 +397,7 @@ inline void tickFullBlink() {
     fullBlinkLastMs = now;
     fullBlinkOn = !fullBlinkOn;
     fillRing(fullBlinkOn ? YELLOW : OFF);
+    pumpAudio();
   }
 }
 
@@ -398,13 +409,13 @@ void gameOverBlinkAndOff() {
     fillGauge(RED);
     digitalWrite(PIN_MOSFET, HIGH);
     uint32_t t = millis();
-    while (millis() - t < 140);
+    while (millis() - t < 500);
 
     // OFF
     fillGauge(OFF);
     digitalWrite(PIN_MOSFET, LOW);
     t = millis();
-    while (millis() - t < 100);
+    while (millis() - t < 500);
   }
   // Final state: fully off
   fillGauge(OFF);
@@ -698,7 +709,11 @@ void sendHoldStop() {
 void onRx(const uint8_t* data, uint16_t len) {
   if (len < sizeof(MsgHeader)) return;
   auto* h = (const MsgHeader*)data;
-  if (h->version != TREX_PROTO_VERSION) return;
+  if (h->version != TREX_PROTO_VERSION) {
+    Serial.printf("[WARN] Proto mismatch on RX: got=%u exp=%u (type=%u)\n",
+                  h->version, (unsigned)TREX_PROTO_VERSION, h->type);
+    return;
+  }
 
   switch ((MsgType)h->type) {
     case MsgType::STATE_TICK: {
@@ -713,7 +728,7 @@ void onRx(const uint8_t* data, uint16_t len) {
       }
 
       // Don’t clear pipes to 0 until we know the inventory
-      if (stationInited) drawGaugeInventory(inv, cap);
+      if (stationInited && gameActive) drawGaugeInventory(inv, cap);
       break;
     }
 
@@ -837,7 +852,7 @@ void onRx(const uint8_t* data, uint16_t len) {
       if (p->stationId == STATION_ID) {
         inv = p->inventory; cap = p->capacity;
         stationInited = true;                // <-- got our initial numbers
-        if (!holdActive && !tagPresent) drawGaugeInventory(inv, cap);
+        if (gameActive && !holdActive && !tagPresent) drawGaugeInventory(inv, cap);
       }
       Serial.printf("[STATION_UPDATE] id=%u inv=%u cap=%u\n", p->stationId, inv, cap);
       break;
@@ -850,6 +865,7 @@ void onRx(const uint8_t* data, uint16_t len) {
       fullAnnounced = false;
 
       stationInited = false;                  // wait for fresh inventory before painting
+      gaugeCacheValid = false;
 
       digitalWrite(PIN_MOSFET, HIGH);         // lamp ON for live round
       stopFullBlink();
@@ -1019,10 +1035,9 @@ void loop() {
       tagPresent = false; absentStartMs = 0;
       if (playing) stopAudio();
       fillRing(RED);
+      fillGauge(OFF);
+      digitalWrite(PIN_MOSFET, LOW);
     }
-    static uint32_t pausedHelloMs = 0;
-    uint32_t now = millis();
-    if (now - pausedHelloMs > 1000) { sendHello(); pausedHelloMs = now; }
     return;
   } else if (wasPaused) {
     wasPaused = false;
@@ -1030,8 +1045,6 @@ void loop() {
 
   // ---- NORMAL ACTIVE LOOP ----
   const uint32_t now = millis();
-
-  if (!holdActive && (now - lastHelloMs > 2000)) { sendHello(); lastHelloMs = now; }
 
   const bool present = isAnyCardPresent(rfid);
 

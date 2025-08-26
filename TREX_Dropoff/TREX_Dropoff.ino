@@ -4,7 +4,7 @@
 
   • RC522 (x4)   CS: {5,14,18,17}  RST: 11   SPI: SCK=36 MISO=37 MOSI=35
   • 14-px rings  GPIO: {33, 38, 1, 3}
-  • 85-px gauges GPIO: {7, 10}
+  • 62-px gauges GPIO: {7, 10}
   • I²S audio    BCLK 43 | LRCLK 44 | DOUT 12
   • Transport    ESP-NOW via TrexTransport (channel must match T-Rex)
 */
@@ -47,12 +47,24 @@ constexpr uint8_t  STATION_ID    = 6;    // drop-off station id
 constexpr uint8_t  WIFI_CHANNEL  = 6;    // must match T-Rex
 
 /* ── LEDs / gauges ────────────────────────────────────────── */
-constexpr uint16_t GAUGE_LEN        = 85;
+constexpr uint16_t GAUGE_LEN        = 61;
 constexpr uint8_t  RING_BRIGHTNESS  = 64;
-constexpr uint8_t  GAUGE_BRIGHTNESS = 64;
+constexpr uint8_t  GAUGE_BRIGHTNESS = 255;
 
 /* Map teamScore → LEDs; set TEAM_GOAL to “full bar” score */
 constexpr uint32_t TEAM_GOAL = 100;  // 1:1 mapping by default
+
+// --- One-at-a-time scan lock (unlocks on DROP_RESULT or timeout) ---
+static bool     scanLocked = false;
+static uint32_t scanUnlockAt = 0;
+constexpr uint32_t SCAN_LOCK_TIMEOUT_MS = 1000;  // safety if result is delayed
+
+// --- Short exclusive audio window (force-stop after 500ms) ---
+constexpr uint32_t AUDIO_EXCLUSIVE_MS = 750;
+static uint32_t    audioEndAt = 0;
+
+// (Keep your round-robin index if you have it; it helps fairness)
+static uint8_t rrStart = 0;
 
 /* ── pins ─────────────────────────────────────────────────── */
 constexpr uint8_t PIN_SCK   = 36, PIN_MISO = 37, PIN_MOSI = 35, PIN_RST = 11;
@@ -96,7 +108,6 @@ bool               audioExclusive = false;   // freeze LEDs/RFID during playback
 static inline uint32_t C(uint8_t r,uint8_t g,uint8_t b){ return Adafruit_NeoPixel::Color(r,g,b); }
 const uint32_t RED   = C(255,0,0);
 const uint32_t GREEN = C(0,255,0);
-const uint32_t WHITE = C(255,255,255);
 const uint32_t GOLD  = C(255, 180, 0);
 const uint32_t OFF   = 0;
 
@@ -110,10 +121,30 @@ volatile bool       gameActive   = true;    // onRx flips this
 bool                wasPaused    = false;
 volatile LightState g_lightState = LightState::GREEN;
 volatile uint32_t   teamScore    = 0;
+static bool     gaugeDirty = false;         // a repaint is waiting
+static uint32_t pendingTeamScore = 0;       // latest score to render
+
+// --- Ring "hold-green" for 1s after a successful DROP_RESULT ---
+static uint32_t ringHoldUntil[4] = {0,0,0,0};
+static bool     ringHoldActive[4] = {false,false,false,false};
+static bool ringPendingShow[4] = {false,false,false,false};
+
+// If you don’t have it yet and want a safe mapping from results to readers:
+static int8_t   reqQueue[4];  // small FIFO of pending reader indexes
+static uint8_t  reqHead = 0, reqTail = 0;
+
+inline bool reqEnqueue(int8_t idx) { uint8_t n=(reqTail+1)&3; if(n==reqHead) return false; reqQueue[reqTail]=idx; reqTail=n; return true; }
+inline int8_t reqDequeue(){ if(reqHead==reqTail) return -1; int8_t v=reqQueue[reqHead]; reqHead=(reqHead+1)&3; return v; }
+
+// --- Post-game final bars blink (red blinks, green solid) ---
+static bool     finalBlinkActive  = false;
+static bool     finalBlinkOn      = false;
+static uint32_t finalBlinkLastMs  = 0;
+constexpr uint32_t FINAL_BLINK_PERIOD_MS = 500;
+static uint32_t finalScoreSnapshot = 0;   // score to display during the blink
 
 /* misc */
 uint16_t g_seq = 1;
-uint32_t lastHelloMs = 0;
 
 /* ── WAV header helpers ───────────────────────────────────── */
 static inline uint16_t rd16(const uint8_t* p){ return (uint16_t)p[0] | ((uint16_t)p[1]<<8); }
@@ -193,15 +224,35 @@ static bool openChain() {
 inline void pumpAudio() { if (playing && decoder) decoder->loop(); }
 
 // one-shot playback (no auto-restart)
-static void startAudioExclusive() {
-  // enter exclusive window: no LED .show(), no RFID/SPI work until done
+static void startAudioExclusiveShort() {
   audioExclusive = true;
+  audioEndAt = millis() + AUDIO_EXCLUSIVE_MS;
   if (playing) { decoder->stop(); playing=false; }
   playing = openChain();
 }
+
 static void stopAudioExclusive() {
   if (playing) { decoder->stop(); playing=false; }
   audioExclusive = false;
+
+  // Flush any ring shows that were suppressed during audio
+  for (uint8_t i=0; i<4; ++i) {
+    if (ringPendingShow[i]) {
+      ring[i].show();
+      ringPendingShow[i] = false;
+    }
+  }
+  if (gaugeDirty) { drawTeamGauges(pendingTeamScore); gaugeDirty = false; }
+}
+
+void maintainRingHolds() {
+  const uint32_t now = millis();
+  for (uint8_t i=0; i<4; ++i) {
+    if (ringHoldActive[i] && (int32_t)(now - ringHoldUntil[i]) >= 0) {
+      ringHoldActive[i] = false;
+      fillRing(i, RED);    // back to ready
+    }
+  }
 }
 
 /* ── helpers ─────────────────────────────────────────────── */
@@ -230,23 +281,64 @@ void fillRing(uint8_t idx, uint32_t c) {
     ring[idx].setPixelColor(p, c);
     if ((p & 7) == 0) pumpAudio();
   }
-  if (!audioExclusive) ring[idx].show();  // suppress .show() while exclusive
+  if (!audioExclusive) {
+    ring[idx].show();
+  } else {
+    ringPendingShow[idx] = true;        // <-- will flush after audio ends
+  }
   pumpAudio();
 }
 
 void drawTeamGauges(uint32_t score) {
+  // Map % to the full pipe, then cap gold so we don't overwrite the top green marker.
   uint16_t lit = 0;
   if (TEAM_GOAL > 0) {
-    // clamp to avoid >100%
     uint32_t clamped = (score > TEAM_GOAL) ? TEAM_GOAL : score;
-    uint32_t scaled = clamped * GAUGE_LEN + (TEAM_GOAL - 1);
+    lit = (uint16_t)((clamped * (uint32_t)GAUGE_LEN) / TEAM_GOAL);
+  }
+
+  const bool goalReached = (TEAM_GOAL > 0 && score >= TEAM_GOAL);
+  const uint16_t top = (GAUGE_LEN > 0) ? (GAUGE_LEN - 1) : 0;
+  const uint16_t goldCount = (GAUGE_LEN > 0) ? (uint16_t)min<uint16_t>(lit, top) : 0;
+
+  for (auto &g : gauge) {
+    // In-game paint: GOLD progress, remainder OFF
+    // (If goal reached, we paint all GREEN below)
+    for (uint16_t i = 0; i < GAUGE_LEN; ++i) {
+      uint32_t c;
+      if (goalReached) {
+        c = GREEN;                       // goal: whole bar GREEN
+      } else {
+        c = (i < goldCount) ? GOLD : OFF;
+      }
+      g.setPixelColor(i, c);
+      if ((i & 15) == 0) pumpAudio();
+    }
+
+    // Deterministic top marker: always green during the game
+    if (!goalReached && GAUGE_LEN > 0) {
+      g.setPixelColor(top, GREEN);
+    }
+
+    if (!audioExclusive) g.show();
+    pumpAudio();
+  }
+}
+
+void drawFinalBarsFrame(uint32_t score, bool redOn) {
+  // Map score to the full gauge length (no reserved marker in post-game)
+  uint16_t lit = 0;
+  if (TEAM_GOAL > 0) {
+    const uint32_t clamped = (score > TEAM_GOAL) ? TEAM_GOAL : score;
+    // ceil-ish mapping to feel generous at edges
+    const uint32_t scaled  = clamped * GAUGE_LEN + (TEAM_GOAL - 1);
     lit = (uint16_t)min<uint32_t>(GAUGE_LEN, scaled / TEAM_GOAL);
   }
+
   for (auto &g : gauge) {
-    for (uint16_t i = 0; i < GAUGE_LEN; ++i) {
-      uint32_t c = OFF;
-      if (lit == GAUGE_LEN && i == GAUGE_LEN - 1) c = GREEN; // 100% marker
-      else if (i < lit) c = GOLD;                             // progress
+    for (uint16_t i=0; i<GAUGE_LEN; ++i) {
+      const bool inGreen = (i < lit);
+      const uint32_t c = inGreen ? GREEN : (redOn ? RED : OFF);
       g.setPixelColor(i, c);
       if ((i & 15) == 0) pumpAudio();
     }
@@ -255,18 +347,25 @@ void drawTeamGauges(uint32_t score) {
   }
 }
 
-void drawFinalBars(uint32_t score) {
-  uint32_t clamped  = (score > TEAM_GOAL) ? TEAM_GOAL : score;
-  uint16_t greenLit = (uint16_t)((uint64_t)clamped * GAUGE_LEN / TEAM_GOAL);
+void startFinalBlink(uint32_t score) {
+  finalScoreSnapshot = score;  // display this constant score during blink
+  finalBlinkActive   = true;
+  finalBlinkOn       = true;
+  finalBlinkLastMs   = millis();
+  drawFinalBarsFrame(finalScoreSnapshot, finalBlinkOn);
+}
 
-  for (auto &g : gauge) {
-    for (uint16_t i = 0; i < GAUGE_LEN; ++i) {
-      uint32_t c = (i < greenLit) ? GREEN : RED;
-      g.setPixelColor(i, c);
-      if ((i & 15) == 0) pumpAudio();   // keep audio fed while painting
-    }
-    g.show();
-    pumpAudio();
+void stopFinalBlink() {
+  finalBlinkActive = false;
+}
+
+void tickFinalBlink() {
+  if (!finalBlinkActive) return;
+  const uint32_t now = millis();
+  if ((now - finalBlinkLastMs) >= FINAL_BLINK_PERIOD_MS) {
+    finalBlinkLastMs = now;
+    finalBlinkOn = !finalBlinkOn;
+    drawFinalBarsFrame(finalScoreSnapshot, finalBlinkOn);
   }
 }
 
@@ -294,7 +393,11 @@ void sendDropRequest(const TrexUid& uid, uint8_t readerIndex) {
 void onRx(const uint8_t* data, uint16_t len) {
   if (len < sizeof(MsgHeader)) return;
   auto* h = (const MsgHeader*)data;
-  if (h->version != TREX_PROTO_VERSION) return;
+  if (h->version != TREX_PROTO_VERSION) {
+    Serial.printf("[WARN] Proto mismatch on RX: got=%u exp=%u (type=%u)\n",
+                  h->version, (unsigned)TREX_PROTO_VERSION, h->type);
+    return;
+  }
 
   switch ((MsgType)h->type) {
     case MsgType::STATE_TICK: {
@@ -305,17 +408,39 @@ void onRx(const uint8_t* data, uint16_t len) {
       else                                              g_lightState = LightState::RED;
       break;
     }
-
+    
     case MsgType::DROP_RESULT: {
       if (h->payloadLen != sizeof(DropResultPayload)) break;
       auto* p = (const DropResultPayload*)(data + sizeof(MsgHeader));
+
       uint32_t prev = teamScore;
       teamScore = p->teamScore;
-      drawTeamGauges(teamScore);
 
+      // Paint gauges now if safe, or defer while audio is exclusive
+      if (!audioExclusive) {
+        drawTeamGauges(teamScore);
+      } else {
+        pendingTeamScore = teamScore;
+        gaugeDirty = true;
+      }
+
+      scanLocked = false;
+
+      // Successful bank => keep that reader GREEN for 1s
       if (teamScore > prev) {
-        // successful bank → short exclusive audio
-        startAudioExclusive();
+        // Prefer payload's reader index if your DropResultPayload carries it; otherwise fall back to FIFO
+        int8_t idx = -1;
+        // idx = p->readerIndex; // <-- uncomment if your payload includes this field
+        if (idx < 0 || idx >= 4) idx = reqDequeue();
+
+        if (idx >= 0 && idx < 4) {
+          ringHoldActive[idx] = true;
+          ringHoldUntil[idx]  = millis() + 1000;  // hold 1s
+          fillRing((uint8_t)idx, GREEN);          // .show() already gated if audioExclusive
+        }
+
+        // Start short exclusive audio
+        startAudioExclusiveShort();
       }
       break;
     }
@@ -324,15 +449,33 @@ void onRx(const uint8_t* data, uint16_t len) {
       if (h->payloadLen != sizeof(ScoreUpdatePayload)) break;
       auto* p = (const ScoreUpdatePayload*)(data + sizeof(MsgHeader));
       teamScore = p->teamScore;
-      drawTeamGauges(teamScore);
+      if (gameActive) {
+        if (!audioExclusive) drawTeamGauges(teamScore);
+        else { pendingTeamScore = teamScore; gaugeDirty = true; }
+      } else {
+        finalScoreSnapshot = teamScore; // update snapshot used by the blink
+      }
       break;
     }
 
     case MsgType::GAME_START: {
       gameActive = true;
       Serial.println("[DROP] GAME_START");
-      drawTeamGauges(teamScore);      // show current progress style immediately
-      for (int i=0;i<4;i++) fillRing(i, RED);
+      stopFinalBlink();
+      scanLocked = false;                 // <— add this
+      stopAudioExclusive();
+
+      // Reset per-game transient state
+      for (int i=0;i<4;i++) {
+        ringHoldActive[i] = false;
+        ringPendingShow[i] = false;
+        tagPresent[i] = false;
+        absentMs[i]   = 0;
+        fillRing(i, RED);
+      }
+      reqHead = reqTail = 0;    // clear the request→result mapping FIFO
+
+      drawTeamGauges(teamScore); // show in-game style immediately
       break;
     }
 
@@ -348,7 +491,7 @@ void onRx(const uint8_t* data, uint16_t len) {
       for (int i=0;i<4;i++) { tagPresent[i]=false; absentMs[i]=0; fillRing(i, RED); }
 
       // Freeze result: green collected, red remainder
-      drawFinalBars(teamScore);
+      startFinalBlink(teamScore);
       break;
     }
 
@@ -414,12 +557,13 @@ void loop() {
 
   Transport::loop();
 
-  // If we’re in an exclusive audio window, ONLY feed audio + transport
+  // This guarantees "one RFID at a time".
   if (audioExclusive) {
     if (playing && decoder) {
-      if (!decoder->loop()) stopAudioExclusive();  // done → resume normal loop
+      if (!decoder->loop()) { stopAudioExclusive(); return; }  // clip ended early
     }
-    return;
+    if ((int32_t)(millis() - audioEndAt) >= 0) { stopAudioExclusive(); return; } // force-stop at 500ms
+    return;   // block RFID work while audio window is active
   }
 
   // ---- PAUSED / GAME OVER: only listen for messages ----
@@ -429,45 +573,74 @@ void loop() {
       for (int i=0;i<4;i++) { tagPresent[i]=false; absentMs[i]=0; fillRing(i, RED); }
       stopAudioExclusive();
     }
-    static uint32_t pausedHelloMs = 0;
-    uint32_t now = millis();
-    if (now - pausedHelloMs > 1000) { sendHello(); pausedHelloMs = now; }
+    // Keep the post-game blink alive:
+    tickFinalBlink();                    // <-- add this
+    maintainRingHolds();                 // (no-op if nothing active)
     return;
-  } else if (wasPaused) {
-    wasPaused = false;
   }
 
   // ---- ACTIVE ----
   const uint32_t now = millis();
-  if (now - lastHelloMs > 2000) { sendHello(); lastHelloMs = now; }
 
-  // Scan 4 readers — edge-trigger tap
-  for (uint8_t i=0;i<4;i++) {
-    MFRC522 &rd = rfid[i];
-    const bool present = cardPresent(rd);
+  // One RFID at a time: clear lock by timeout, skip scan while locked
+  if (scanLocked && (int32_t)(now - scanUnlockAt) >= 0) scanLocked = false;
 
-    // ARRIVAL (tap): send one DROP_REQUEST per arrival
-    if (present && !tagPresent[i]) {
-      TrexUid uid{};
+  if (!scanLocked) {
+    // Round-robin improves fairness
+    for (uint8_t step = 0; step < 4; ++step) {
+      const uint8_t i = (rrStart + step) & 3;
+      MFRC522 &rd = rfid[i];
+
+      // Quick probe
+      bool present = cardPresent(rd);
+
+      // If latched, watch for absence to re-arm
+      if (tagPresent[i]) {
+        if (!present) {
+          if (absentMs[i] == 0) absentMs[i] = now;
+          else if (now - absentMs[i] >= ABSENCE_MS) {
+            tagPresent[i] = false; absentMs[i] = 0;
+            if (!ringHoldActive[i]) fillRing(i, RED);
+          }
+        } else {
+          absentMs[i] = 0;
+        }
+        continue;
+      }
+
+      if (!present) continue;
+
+      TrexUid uid;
       if (readUid(rd, uid)) {
         sendDropRequest(uid, i);
-        fillRing(i, GREEN);        // visual: tag seen
-        tagPresent[i] = true;      // arm removal to re-arm tap
+        fillRing(i, GREEN);
+        tagPresent[i] = true;
+        reqEnqueue(i);
+
+        // Lock further reads until we get DROP_RESULT (or timeout)
+        scanLocked = true;
+        scanUnlockAt = now + SCAN_LOCK_TIMEOUT_MS;
+        break;  // <-- only one per pass
       }
-      absentMs[i] = 0;
+
+      pumpAudio();
     }
 
-    // REMOVAL → re-arm
-    if (!present && tagPresent[i]) {
-      if (absentMs[i] == 0) absentMs[i] = now;
-      else if (now - absentMs[i] > ABSENCE_MS) {
-        fillRing(i, RED);
-        tagPresent[i] = false;
-        absentMs[i] = 0;
-      }
-    }
+    rrStart = (rrStart + 1) & 3;
   }
 
-  // keep gauges fresh (cheap)
-  drawTeamGauges(teamScore);
+  // During game we keep gauges fresh; defer if audio is exclusive.
+  // After game, blink final bars (red 500ms on/off; green solid).
+  if (gameActive) {
+    if (audioExclusive) {
+      pendingTeamScore = teamScore;
+      gaugeDirty = true;
+    } else {
+      drawTeamGauges(teamScore);
+    }
+  } else {
+    tickFinalBlink();
+  }
+
+  maintainRingHolds();
 }

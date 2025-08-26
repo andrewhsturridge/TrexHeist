@@ -105,7 +105,11 @@ void sendLootTick(Game& g, uint32_t holdId, uint8_t carried, uint16_t stationInv
 void onRx(const uint8_t* data, uint16_t len) {
   if (len < sizeof(MsgHeader)) return;
   auto* h = (const MsgHeader*)data;
-  if (h->version != TREX_PROTO_VERSION) return;
+  if (h->version != TREX_PROTO_VERSION) {
+    Serial.printf("[WARN] Proto mismatch on RX: got=%u exp=%u (type=%u)\n",
+                  h->version, (unsigned)TREX_PROTO_VERSION, h->type);
+    return;
+  }
 
   if (OtaCampaign::handle(data, len)) return;
 
