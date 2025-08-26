@@ -160,6 +160,12 @@ bool     fullBlinkOn     = false;
 uint32_t fullBlinkLastMs = 0;
 uint32_t blinkHoldId     = 0;       // which hold this blink belongs to
 
+// ── Yellow gauge blink (500 ms) ───────────────────────
+constexpr uint16_t YELLOW_BLINK_PERIOD_MS = 500;
+bool     yellowBlinkActive = false;
+bool     yellowBlinkOn     = false;
+uint32_t yellowBlinkLastMs = 0;
+
 /* ── Game/hold state (server-auth) ───────────────────── */
 volatile bool gameActive = true;     // flipped by GAME_OVER/START in onRx()
 volatile bool holdActive = false;    // true only after accepted ACK
@@ -336,6 +342,12 @@ void drawGaugeInventory(uint16_t inventory, uint16_t capacity) {
   if (otaInProgress) return;
   const LightState colorState = g_lightState;
 
+  // If we're in YELLOW and currently in the blink OFF phase, keep the gauge dark.
+  if (colorState == LightState::YELLOW && yellowBlinkActive && !yellowBlinkOn) {
+    fillGauge(OFF);
+    return;
+  }
+
   // Only skip when the cache is valid
   if (gaugeCacheValid &&
       inventory == lastInvPainted &&
@@ -420,6 +432,35 @@ void gameOverBlinkAndOff() {
   // Final state: fully off
   fillGauge(OFF);
   digitalWrite(PIN_MOSFET, LOW);
+}
+
+inline void startYellowBlinkImmediate() {
+  yellowBlinkActive = true;
+  yellowBlinkOn = true;
+  yellowBlinkLastMs = millis();
+  // Paint immediately in current color (YELLOW) at current inv level
+  drawGaugeInventory(inv, cap);
+}
+
+inline void stopYellowBlink() {
+  yellowBlinkActive = false;
+  yellowBlinkOn = false;
+}
+
+inline void tickYellowBlink() {
+  if (!yellowBlinkActive) return;
+  uint32_t now = millis();
+  if ((now - yellowBlinkLastMs) >= YELLOW_BLINK_PERIOD_MS) {
+    yellowBlinkLastMs = now;
+    yellowBlinkOn = !yellowBlinkOn;
+    if (yellowBlinkOn) {
+      // ON phase: draw lit portion in YELLOW (via drawGaugeInventory)
+      drawGaugeInventory(inv, cap);
+    } else {
+      // OFF phase: darken the gauge (don’t affect MOSFET)
+      fillGauge(OFF);
+    }
+  }
 }
 
 /* ── OTA visuals ─────────────────────────────────────── */
@@ -723,12 +764,19 @@ void onRx(const uint8_t* data, uint16_t len) {
       else if (p->state == (uint8_t)LightState::YELLOW) g_lightState = LightState::YELLOW;
       else                                              g_lightState = LightState::RED;
 
+      // Manage YELLOW gauge blink lifecycle
+      if (g_lightState == LightState::YELLOW) {
+        if (!yellowBlinkActive) startYellowBlinkImmediate();
+      } else {
+        if (yellowBlinkActive)  stopYellowBlink();
+      }
+
       if (g_lightState == LightState::RED && !holdActive && !tagPresent && !fullBlinkActive && !otaInProgress) {
         fillRing(RED);
       }
 
-      // Don’t clear pipes to 0 until we know the inventory
-      if (stationInited && gameActive) drawGaugeInventory(inv, cap);
+      // Don’t clear pipes to 0 until we know the inventory and not blinking yellow
+      if (stationInited && gameActive && !yellowBlinkActive) drawGaugeInventory(inv, cap);
       break;
     }
 
@@ -879,6 +927,7 @@ void onRx(const uint8_t* data, uint16_t len) {
 
     case MsgType::GAME_OVER: {
       gameActive = false; holdActive = false; holdId = 0; fullBlinkActive = false;
+      stopYellowBlink();
       carried = 0; tagPresent = false; absentStartMs = 0;
       stopAudio();
       if (!otaInProgress) fillRing(RED);
@@ -1035,6 +1084,7 @@ void loop() {
       tagPresent = false; absentStartMs = 0;
       if (playing) stopAudio();
       fillRing(RED);
+      stopYellowBlink();
       fillGauge(OFF);
       digitalWrite(PIN_MOSFET, LOW);
     }
@@ -1081,4 +1131,5 @@ void loop() {
   else if (playing) stopAudio();
 
   tickFullBlink();
+  tickYellowBlink();
 }

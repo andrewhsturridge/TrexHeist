@@ -57,6 +57,7 @@ struct Game {
   bool allowYellowThisRound = true;
 
   uint16_t roundGoal = 100;
+  uint32_t roundStartScore = 0;
 
   // Grace + PIR
   uint32_t edgeGraceMs     = 300;

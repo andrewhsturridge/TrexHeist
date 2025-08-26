@@ -8,6 +8,14 @@ void enterGreen(Game& g) {
   g.lastFlipMs = millis();
   spritePlay(CLIP_NOT_LOOKING);
   Serial.println("[TREX] -> GREEN");
+  // Immediate state broadcast
+  uint32_t now = millis();
+  uint32_t msLeft = (g.nextSwitch > now) ? (g.nextSwitch - now) : 0;
+  uint32_t toRoundEnd = (g.roundEndAt > now) ? (g.roundEndAt - now) : 0xFFFFFFFFUL;
+  uint32_t toGameEnd  = (g.gameEndAt  > now) ? (g.gameEndAt  - now) : 0xFFFFFFFFUL;
+  if (toRoundEnd < msLeft) msLeft = toRoundEnd;
+  if (toGameEnd  < msLeft) msLeft = toGameEnd;
+  sendStateTick(g, msLeft);
 }
 
 
@@ -16,6 +24,13 @@ void enterYellow(Game& g) {
   g.nextSwitch = millis() + g.yellowMs;
   g.lastFlipMs = millis();
   Serial.println("[TREX] -> YELLOW");
+  uint32_t now = millis();
+  uint32_t msLeft = (g.nextSwitch > now) ? (g.nextSwitch - now) : 0;
+  uint32_t toRoundEnd = (g.roundEndAt > now) ? (g.roundEndAt - now) : 0xFFFFFFFFUL;
+  uint32_t toGameEnd  = (g.gameEndAt  > now) ? (g.gameEndAt  - now) : 0xFFFFFFFFUL;
+  if (toRoundEnd < msLeft) msLeft = toRoundEnd;
+  if (toGameEnd  < msLeft) msLeft = toGameEnd;
+  sendStateTick(g, msLeft);
 }
 
 void enterRed(Game& g) {
@@ -26,7 +41,13 @@ void enterRed(Game& g) {
   g.pirArmAt      = g.lastFlipMs + g.pirArmDelayMs;
   spritePlay(CLIP_LOOKING);
   Serial.println("[TREX] -> RED");
-  // NOTE: we do NOT end game here; the main loop checks after grace
+  uint32_t now = millis();
+  uint32_t msLeft = (g.nextSwitch > now) ? (g.nextSwitch - now) : 0;
+  uint32_t toRoundEnd = (g.roundEndAt > now) ? (g.roundEndAt - now) : 0xFFFFFFFFUL;
+  uint32_t toGameEnd  = (g.gameEndAt  > now) ? (g.gameEndAt  - now) : 0xFFFFFFFFUL;
+  if (toRoundEnd < msLeft) msLeft = toRoundEnd;
+  if (toGameEnd  < msLeft) msLeft = toGameEnd;
+  sendStateTick(g, msLeft);
 }
 
 void tickCadence(Game& g, uint32_t now) {

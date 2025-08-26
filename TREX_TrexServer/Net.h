@@ -9,6 +9,7 @@ void bcastGameOver(Game& g, uint8_t reason);
 void bcastScore(Game& g);
 void bcastStation(Game& g, uint8_t stationId);
 void sendDropResult(Game& g, uint16_t dropped);
+void bcastRoundStatus(Game& g);
 
 // Point messages
 void sendHoldEnd(Game& g, uint32_t holdId, uint8_t reason);

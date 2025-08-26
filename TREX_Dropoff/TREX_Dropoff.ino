@@ -124,6 +124,15 @@ volatile uint32_t   teamScore    = 0;
 static bool     gaugeDirty = false;         // a repaint is waiting
 static uint32_t pendingTeamScore = 0;       // latest score to render
 
+// Current round mapping info (from ROUND_STATUS)
+volatile uint8_t    roundIndex        = 1;
+volatile uint32_t   roundStartScore   = 0;
+volatile uint32_t   roundGoalAbs      = 100;
+inline uint32_t roundTargetCount() {
+  return (roundGoalAbs > roundStartScore) ? (roundGoalAbs - roundStartScore) : 100;
+}
+
+
 // --- Ring "hold-green" for 1s after a successful DROP_RESULT ---
 static uint32_t ringHoldUntil[4] = {0,0,0,0};
 static bool     ringHoldActive[4] = {false,false,false,false};
@@ -242,7 +251,7 @@ static void stopAudioExclusive() {
       ringPendingShow[i] = false;
     }
   }
-  if (gaugeDirty) { drawTeamGauges(pendingTeamScore); gaugeDirty = false; }
+  if (gaugeDirty) { drawTeamGaugesRound(teamScore, roundTargetCount()); gaugeDirty = false; }
 }
 
 void maintainRingHolds() {
@@ -289,17 +298,23 @@ void fillRing(uint8_t idx, uint32_t c) {
   pumpAudio();
 }
 
-void drawTeamGauges(uint32_t score) {
-  // Map % to the full pipe, then cap gold so we don't overwrite the top green marker.
-  uint16_t lit = 0;
-  if (TEAM_GOAL > 0) {
-    uint32_t clamped = (score > TEAM_GOAL) ? TEAM_GOAL : score;
-    lit = (uint16_t)((clamped * (uint32_t)GAUGE_LEN) / TEAM_GOAL);
-  }
+void drawTeamGaugesRound(uint32_t score, uint32_t target) {
+  // progress this round
+  uint32_t prog = (score > roundStartScore) ? (score - roundStartScore) : 0;
+  if (target == 0) target = 1; // avoid div0
 
-  const bool goalReached = (TEAM_GOAL > 0 && score >= TEAM_GOAL);
+  // Map % to the full pipe, reserve top green marker (in-game)
+  const bool goalReached = (prog >= target);
+  uint16_t lit = 0;
+  if (!goalReached) {
+    // generous ceil-ish mapping below the top marker
+    uint32_t scaled = prog * (uint32_t)GAUGE_LEN;
+    lit = (uint16_t)(scaled / target);
+  } else {
+    lit = GAUGE_LEN; // full bar
+  }
   const uint16_t top = (GAUGE_LEN > 0) ? (GAUGE_LEN - 1) : 0;
-  const uint16_t goldCount = (GAUGE_LEN > 0) ? (uint16_t)min<uint16_t>(lit, top) : 0;
+  const uint16_t goldCount = goalReached ? GAUGE_LEN : (uint16_t)min<uint16_t>(lit, top);
 
   for (auto &g : gauge) {
     // In-game paint: GOLD progress, remainder OFF
@@ -325,15 +340,13 @@ void drawTeamGauges(uint32_t score) {
   }
 }
 
-void drawFinalBarsFrame(uint32_t score, bool redOn) {
+void drawFinalBarsFrame(uint32_t score, uint32_t target, bool redOn) {
   // Map score to the full gauge length (no reserved marker in post-game)
   uint16_t lit = 0;
-  if (TEAM_GOAL > 0) {
-    const uint32_t clamped = (score > TEAM_GOAL) ? TEAM_GOAL : score;
-    // ceil-ish mapping to feel generous at edges
-    const uint32_t scaled  = clamped * GAUGE_LEN + (TEAM_GOAL - 1);
-    lit = (uint16_t)min<uint32_t>(GAUGE_LEN, scaled / TEAM_GOAL);
-  }
+  if (target == 0) target = 1;
+  const uint32_t clamped = (score > target) ? target : score;
+  const uint32_t scaled  = clamped * GAUGE_LEN + (target - 1);
+  lit = (uint16_t)min<uint32_t>(GAUGE_LEN, scaled / TEAM_GOAL);
 
   for (auto &g : gauge) {
     for (uint16_t i=0; i<GAUGE_LEN; ++i) {
@@ -347,12 +360,12 @@ void drawFinalBarsFrame(uint32_t score, bool redOn) {
   }
 }
 
-void startFinalBlink(uint32_t score) {
-  finalScoreSnapshot = score;  // display this constant score during blink
+void startFinalBlink(uint32_t score, uint32_t target) {
+  finalScoreSnapshot = score;
   finalBlinkActive   = true;
   finalBlinkOn       = true;
   finalBlinkLastMs   = millis();
-  drawFinalBarsFrame(finalScoreSnapshot, finalBlinkOn);
+  drawFinalBarsFrame(finalScoreSnapshot, target, finalBlinkOn);
 }
 
 void stopFinalBlink() {
@@ -365,7 +378,7 @@ void tickFinalBlink() {
   if ((now - finalBlinkLastMs) >= FINAL_BLINK_PERIOD_MS) {
     finalBlinkLastMs = now;
     finalBlinkOn = !finalBlinkOn;
-    drawFinalBarsFrame(finalScoreSnapshot, finalBlinkOn);
+    drawFinalBarsFrame(finalScoreSnapshot, roundTargetCount(), finalBlinkOn);
   }
 }
 
@@ -400,6 +413,21 @@ void onRx(const uint8_t* data, uint16_t len) {
   }
 
   switch ((MsgType)h->type) {
+    case MsgType::ROUND_STATUS: {
+      if (h->payloadLen != sizeof(RoundStatusPayload)) break;
+      auto* p = (const RoundStatusPayload*)(data + sizeof(MsgHeader));
+      roundIndex      = p->roundIndex;
+      roundStartScore = p->roundStartScore;
+      roundGoalAbs    = p->roundGoalAbs;
+      // Optional: you could use p->msLeftRound for UI later
+
+      // Repaint immediately (unless audioExclusive)
+      if (gameActive) {
+        if (!audioExclusive) drawTeamGaugesRound(teamScore, roundTargetCount());
+        else { pendingTeamScore = teamScore; gaugeDirty = true; }
+      }
+      break;
+    }
     case MsgType::STATE_TICK: {
       if (h->payloadLen != sizeof(StateTickPayload)) break;
       auto* p = (const StateTickPayload*)(data + sizeof(MsgHeader));
@@ -418,7 +446,7 @@ void onRx(const uint8_t* data, uint16_t len) {
 
       // Paint gauges now if safe, or defer while audio is exclusive
       if (!audioExclusive) {
-        drawTeamGauges(teamScore);
+        drawTeamGaugesRound(teamScore, roundTargetCount());
       } else {
         pendingTeamScore = teamScore;
         gaugeDirty = true;
@@ -450,7 +478,7 @@ void onRx(const uint8_t* data, uint16_t len) {
       auto* p = (const ScoreUpdatePayload*)(data + sizeof(MsgHeader));
       teamScore = p->teamScore;
       if (gameActive) {
-        if (!audioExclusive) drawTeamGauges(teamScore);
+        if (!audioExclusive) drawTeamGaugesRound(teamScore, roundTargetCount());
         else { pendingTeamScore = teamScore; gaugeDirty = true; }
       } else {
         finalScoreSnapshot = teamScore; // update snapshot used by the blink
@@ -475,7 +503,7 @@ void onRx(const uint8_t* data, uint16_t len) {
       }
       reqHead = reqTail = 0;    // clear the request→result mapping FIFO
 
-      drawTeamGauges(teamScore); // show in-game style immediately
+      drawTeamGaugesRound(teamScore, roundTargetCount()); // show in-game style immediately
       break;
     }
 
@@ -491,7 +519,7 @@ void onRx(const uint8_t* data, uint16_t len) {
       for (int i=0;i<4;i++) { tagPresent[i]=false; absentMs[i]=0; fillRing(i, RED); }
 
       // Freeze result: green collected, red remainder
-      startFinalBlink(teamScore);
+      startFinalBlink(teamScore - roundStartScore, roundTargetCount());
       break;
     }
 
@@ -525,7 +553,7 @@ void setup() {
   // LEDs
   for (uint8_t i=0; i<4; ++i) { ring[i].begin(); ring[i].setBrightness(RING_BRIGHTNESS); }
   for (auto &g : gauge)       { g.begin(); g.setBrightness(GAUGE_BRIGHTNESS); g.show(); }
-  drawTeamGauges(teamScore);
+  drawTeamGaugesRound(teamScore, roundTargetCount());
   for (uint8_t i=0; i<4; ++i) fillRing(i, RED);
 
   // ESP-NOW transport (must match channel with T-Rex)
@@ -636,7 +664,7 @@ void loop() {
       pendingTeamScore = teamScore;
       gaugeDirty = true;
     } else {
-      drawTeamGauges(teamScore);
+      drawTeamGaugesRound(teamScore, roundTargetCount());
     }
   } else {
     tickFinalBlink();

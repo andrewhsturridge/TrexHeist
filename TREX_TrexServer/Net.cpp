@@ -76,6 +76,20 @@ void bcastStation(Game& g, uint8_t stationId) {
                 g.stationCapacity[stationId]);
 }
 
+void bcastRoundStatus(Game& g) {
+  uint8_t buf[sizeof(MsgHeader)+sizeof(RoundStatusPayload)];
+  packHeader(g, (uint8_t)MsgType::ROUND_STATUS, sizeof(RoundStatusPayload), buf);
+  auto* p = (RoundStatusPayload*)(buf + sizeof(MsgHeader));
+  p->roundIndex     = g.roundIndex;
+  p->reserved       = 0;
+  p->_pad           = 0;
+  p->roundStartScore= g.roundStartScore;     // see ModeClassic patch below
+  p->roundGoalAbs   = g.roundGoal;          // absolute teamScore to hit
+  const uint32_t now = millis();
+  p->msLeftRound    = (g.roundEndAt > now) ? (g.roundEndAt - now) : 0;
+  Transport::broadcast(buf, sizeof(buf));
+}
+
 void sendDropResult(Game& g, uint16_t dropped) {
   uint8_t buf[sizeof(MsgHeader)+sizeof(DropResultPayload)];
   packHeader(g, (uint8_t)MsgType::DROP_RESULT, sizeof(DropResultPayload), buf);

@@ -22,6 +22,7 @@ void resetGame(Game& g) {
   g.gameEndAt    = 0;
   g.roundStartAt = 0;
   g.roundEndAt   = 0;
+  g.roundStartScore = 0;
 
   g.light = LightState::GREEN;
   g.nextSwitch = 0;
