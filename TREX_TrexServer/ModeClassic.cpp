@@ -25,6 +25,9 @@ static void startRound(Game& g, uint8_t idx) {
   g.roundIndex   = idx;
   g.roundStartAt = now;
 
+  gameAudioStop();
+  if (idx > 1) gameAudioPlayOnce(TRK_TREX_WIN);
+
   if (idx == 1) {
     g.maxCarry = 20;
     g.noRedThisRound       = true;
@@ -113,6 +116,31 @@ static void startRound(Game& g, uint8_t idx) {
   }
 }
 
+void modeClassicForceRound(Game& g, uint8_t idx, bool playWin) {
+  if (idx < 1) idx = 1;
+  if (idx > 4) idx = 4;
+
+  // Make sure we’re in active play
+  g.phase = Phase::PLAYING;
+
+  // Optional win sting when jumping forward (kept off for R1 by caller)
+  if (playWin) gameAudioPlayOnce(TRK_TREX_WIN);
+
+  // Enter the requested round (startRound already sets timers, inventory,
+  // roundStartScore/roundGoal, cadence, and broadcasts ROUND_STATUS)
+  startRound(g, idx);
+}
+
+void modeClassicNextRound(Game& g, bool playWin) {
+  uint8_t next = (g.roundIndex >= 4) ? 4 : (g.roundIndex + 1);
+  // For next from R0/END, treat as R1 without sting:
+  if (g.roundIndex == 0 || g.phase == Phase::END) {
+    modeClassicForceRound(g, 1, /*playWin=*/false);
+  } else {
+    modeClassicForceRound(g, next, playWin);
+  }
+}
+
 void modeClassicInit(Game& g) {
   const uint32_t now = millis();
   // overall 5-minute game
@@ -130,16 +158,18 @@ void modeClassicMaybeAdvance(Game& g) {
 
   // 1) Early advance on goal
   if (g.teamScore >= g.roundGoal) {
-    if      (g.roundIndex == 1) { gameAudioPlayOnce(TRK_TREX_WIN); startRound(g, 2); return; }
-    else if (g.roundIndex == 2) { gameAudioPlayOnce(TRK_TREX_WIN); startRound(g, 3); return; }
-    else if (g.roundIndex == 3) { gameAudioPlayOnce(TRK_TREX_WIN); startRound(g, 4); return; }
+    gameAudioStop();
+    if      (g.roundIndex == 1) { startRound(g, 2); return; }
+    else if (g.roundIndex == 2) { startRound(g, 3); return; }
+    else if (g.roundIndex == 3) { startRound(g, 4); return; }
   }
 
   // 2) Round timeout: must meet goal, else game over; on success, advance
   if (now >= g.roundEndAt) {
     if (g.teamScore < g.roundGoal) { bcastGameOver(g, /*GOAL_NOT_MET*/4); return; }
-    if      (g.roundIndex == 1) { gameAudioPlayOnce(TRK_TREX_WIN); startRound(g, 2); return; }
-    else if (g.roundIndex == 2) { gameAudioPlayOnce(TRK_TREX_WIN); startRound(g, 3); return; }
-    else if (g.roundIndex == 3) { gameAudioPlayOnce(TRK_TREX_WIN); startRound(g, 4); return; }
+    gameAudioStop();
+    if      (g.roundIndex == 1) { startRound(g, 2); return; }
+    else if (g.roundIndex == 2) { startRound(g, 3); return; }
+    else if (g.roundIndex == 3) { startRound(g, 4); return; }
   }
 }

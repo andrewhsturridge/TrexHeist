@@ -12,9 +12,5 @@ constexpr uint16_t TRK_GAME_MUSIC         = 6;  // 00006 (unused)
 // Init + controls
 void gameAudioInit(uint8_t rxPin = 9, uint8_t txPin = 8, uint32_t baud = 9600, uint8_t volume = 25);
 void gameAudioPlayOnce(uint16_t track);
-void gameAudioPlayLoop(uint16_t track);    // software loop helper (re-triggers periodically)
 void gameAudioStop();
-void gameAudioStopIfLooping();
-
-// Must be called regularly (e.g., from tickCadence)
-void gameAudioLoopTick();
+uint16_t gameAudioCurrentTrack();

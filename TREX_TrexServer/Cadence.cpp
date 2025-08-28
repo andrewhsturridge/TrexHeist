@@ -18,6 +18,9 @@ void enterGreen(Game& g) {
   g.lastFlipMs = millis();
   spritePlay(CLIP_NOT_LOOKING);
   Serial.println("[TREX] -> GREEN");
+  if (gameAudioCurrentTrack() != TRK_TREX_WIN) {
+    gameAudioStop();
+  }
   // Immediate state broadcast
   uint32_t now = millis();
   uint32_t msLeft = (g.nextSwitch > now) ? (g.nextSwitch - now) : 0;
@@ -26,15 +29,14 @@ void enterGreen(Game& g) {
   if (toRoundEnd < msLeft) msLeft = toRoundEnd;
   if (toGameEnd  < msLeft) msLeft = toGameEnd;
   sendStateTick(g, msLeft);
-  gameAudioStopIfLooping();
 }
-
 
 void enterYellow(Game& g) {
   g.light = LightState::YELLOW;
   g.nextSwitch = millis() + pickDur(g.yellowMs, g.yellowMsMin, g.yellowMsMax);
   g.lastFlipMs = millis();
   Serial.println("[TREX] -> YELLOW");
+  gameAudioPlayOnce(TRK_TICKS_LOOP);
   uint32_t now = millis();
   uint32_t msLeft = (g.nextSwitch > now) ? (g.nextSwitch - now) : 0;
   uint32_t toRoundEnd = (g.roundEndAt > now) ? (g.roundEndAt - now) : 0xFFFFFFFFUL;
@@ -42,7 +44,6 @@ void enterYellow(Game& g) {
   if (toRoundEnd < msLeft) msLeft = toRoundEnd;
   if (toGameEnd  < msLeft) msLeft = toGameEnd;
   sendStateTick(g, msLeft);
-  gameAudioPlayLoop(TRK_TICKS_LOOP);
 }
 
 void enterRed(Game& g) {
@@ -53,6 +54,7 @@ void enterRed(Game& g) {
   g.pirArmAt      = g.lastFlipMs + g.pirArmDelayMs;
   spritePlay(CLIP_LOOKING);
   Serial.println("[TREX] -> RED");
+  gameAudioPlayOnce(TRK_PLAYERS_STAY_STILL);
   uint32_t now = millis();
   uint32_t msLeft = (g.nextSwitch > now) ? (g.nextSwitch - now) : 0;
   uint32_t toRoundEnd = (g.roundEndAt > now) ? (g.roundEndAt - now) : 0xFFFFFFFFUL;
@@ -60,13 +62,10 @@ void enterRed(Game& g) {
   if (toRoundEnd < msLeft) msLeft = toRoundEnd;
   if (toGameEnd  < msLeft) msLeft = toGameEnd;
   sendStateTick(g, msLeft);
-  gameAudioPlayOnce(TRK_PLAYERS_STAY_STILL);
 }
 
 void tickCadence(Game& g, uint32_t now) {
   if (g.phase != Phase::PLAYING) return;
-
-  gameAudioLoopTick();
 
   // Round 1: GREEN only (no YELLOW, no RED)
   if (g.noRedThisRound && !g.allowYellowThisRound) {

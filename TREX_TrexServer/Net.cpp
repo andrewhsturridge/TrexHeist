@@ -52,8 +52,8 @@ void bcastGameOver(Game& g, uint8_t reason /*GameOverReason*/) {
   // stop all holds
   for (auto &h : g.holds) h.active = false;
 
-  spritePlay(CLIP_LOOKING);
   gameAudioPlayOnce(TRK_TREX_LOSE);
+  spritePlay(CLIP_LOOKING);
   Serial.println("[TREX] GAME OVER!");
 }
 

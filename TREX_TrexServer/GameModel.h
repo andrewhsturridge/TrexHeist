@@ -48,7 +48,7 @@ struct Game {
   // Tunables (Telnet/maint will edit these)
   uint32_t greenMs = 10000;
   uint32_t redMs   = 8000;
-  uint32_t yellowMs = 1500;
+  uint32_t yellowMs = 3000;
   uint32_t lootRateMs = 1000;
   uint16_t lootPerTick = 1;
   uint8_t  maxCarry = 8;

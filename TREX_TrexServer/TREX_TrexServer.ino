@@ -136,6 +136,15 @@ void loop() {
           DEFAULT_OTA_EXPECT_MINOR
       );
     }
+    if (c=='r' || c=='R') enterRed(g);
+    if (c=='x' || c=='X') bcastGameOver(g, /*MANUAL*/2);
+
+    // ---------- NEW: Round controls ----------
+    if (c=='1') { modeClassicForceRound(g, 1, /*playWin=*/false); } // jump to R1 silently
+    if (c=='2') { modeClassicForceRound(g, 2, /*playWin=*/true ); } // jump to R2 (play win sting)
+    if (c=='3') { modeClassicForceRound(g, 3, /*playWin=*/true ); } // jump to R3 (play win sting)
+    if (c=='4') { modeClassicForceRound(g, 4, /*playWin=*/true ); } // jump to R4 (play win sting)
+    if (c=='>' || c=='.') { modeClassicNextRound(g, /*playWin=*/true); }
   }
 
   // Drip broadcast on new game start
@@ -162,9 +171,6 @@ void loop() {
     sendStateTick(g, msLeft);
     g.lastTickSentMs = now;
   }
-
-  // Cadence flips (suppressed during warmup)
-  tickCadence(g, now);
 
   // Accrual while GREEN (tick every lootRateMs; grant lootPerTick each tick)
   if (g.phase == Phase::PLAYING && g.light == LightState::GREEN) {
@@ -240,4 +246,6 @@ void loop() {
   if (g.phase == Phase::PLAYING) {
     modeClassicMaybeAdvance(g);
   }
+
+  tickCadence(g, now);
 }
