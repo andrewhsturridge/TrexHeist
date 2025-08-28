@@ -1,10 +1,20 @@
+#include <esp_random.h>
 #include "Cadence.h"
 #include "Media.h"
 #include "Net.h"
+#include "GameAudio.h"
+
+static inline uint32_t pickDur(uint32_t base, uint32_t mn, uint32_t mx) {
+  if (mn && mx && mx >= mn) {
+    uint32_t span = mx - mn + 1;
+    return mn + (esp_random() % span);
+  }
+  return base;
+}
 
 void enterGreen(Game& g) {
   g.light = LightState::GREEN;
-  g.nextSwitch = millis() + g.greenMs;
+  g.nextSwitch = millis() + pickDur(g.greenMs, g.greenMsMin, g.greenMsMax);
   g.lastFlipMs = millis();
   spritePlay(CLIP_NOT_LOOKING);
   Serial.println("[TREX] -> GREEN");
@@ -16,12 +26,13 @@ void enterGreen(Game& g) {
   if (toRoundEnd < msLeft) msLeft = toRoundEnd;
   if (toGameEnd  < msLeft) msLeft = toGameEnd;
   sendStateTick(g, msLeft);
+  gameAudioStopIfLooping();
 }
 
 
 void enterYellow(Game& g) {
   g.light = LightState::YELLOW;
-  g.nextSwitch = millis() + g.yellowMs;
+  g.nextSwitch = millis() + pickDur(g.yellowMs, g.yellowMsMin, g.yellowMsMax);
   g.lastFlipMs = millis();
   Serial.println("[TREX] -> YELLOW");
   uint32_t now = millis();
@@ -31,11 +42,12 @@ void enterYellow(Game& g) {
   if (toRoundEnd < msLeft) msLeft = toRoundEnd;
   if (toGameEnd  < msLeft) msLeft = toGameEnd;
   sendStateTick(g, msLeft);
+  gameAudioPlayLoop(TRK_TICKS_LOOP);
 }
 
 void enterRed(Game& g) {
   g.light  = LightState::RED;
-  g.nextSwitch  = millis() + g.redMs;
+  g.nextSwitch  = millis() + pickDur(g.redMs, g.redMsMin, g.redMsMax);
   g.lastFlipMs  = millis();
   g.redGraceUntil = g.lastFlipMs + g.redHoldGraceMs;
   g.pirArmAt      = g.lastFlipMs + g.pirArmDelayMs;
@@ -48,10 +60,13 @@ void enterRed(Game& g) {
   if (toRoundEnd < msLeft) msLeft = toRoundEnd;
   if (toGameEnd  < msLeft) msLeft = toGameEnd;
   sendStateTick(g, msLeft);
+  gameAudioPlayOnce(TRK_PLAYERS_STAY_STILL);
 }
 
 void tickCadence(Game& g, uint32_t now) {
   if (g.phase != Phase::PLAYING) return;
+
+  gameAudioLoopTick();
 
   // Round 1: GREEN only (no YELLOW, no RED)
   if (g.noRedThisRound && !g.allowYellowThisRound) {

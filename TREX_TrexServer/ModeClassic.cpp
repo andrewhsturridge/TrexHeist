@@ -1,6 +1,24 @@
 #include "ModeClassic.h"
 #include "Cadence.h"
 #include "Net.h" 
+#include "GameAudio.h"
+
+// --- Random split of TOTAL across 5 stations, each <= 56 ---
+static void splitInventoryRandom(Game& g, uint16_t total /*=100*/) {
+  uint16_t remain = total;
+  for (uint8_t sid = 1; sid <= 5; ++sid) {
+    const uint8_t left = (uint8_t)(5 - sid + 1);
+    const uint16_t maxPer = 56;
+    const uint16_t minX = (remain > (left - 1)*maxPer) ? (uint16_t)(remain - (left - 1)*maxPer) : 0;
+    const uint16_t maxX = (remain < maxPer) ? remain : maxPer;
+    uint16_t x = (sid < 5)
+      ? (uint16_t)(minX + (esp_random() % (uint32_t)(maxX - minX + 1)))
+      : remain; // last takes the rest
+    g.stationCapacity[sid]  = maxPer;
+    g.stationInventory[sid] = x;
+    remain -= x;
+  }
+}
 
 static void startRound(Game& g, uint8_t idx) {
   const uint32_t now = millis();
@@ -59,16 +77,38 @@ static void startRound(Game& g, uint8_t idx) {
 
       enterGreen(g);
       bcastRoundStatus(g);
-    } else {
-      // Round 3: play out remainder of game (you can tune later)
-      g.maxCarry = 8;
+    } else if (idx == 3) {
+      // ---------- ROUND 3 ----------
+      g.maxCarry = 12;
       g.noRedThisRound       = false;
       g.allowYellowThisRound = true;
       g.lootRateMs  = 1000;
-      g.lootPerTick = 2;
+      g.lootPerTick = 4;
 
+      // New 2-minute round with +100 from this point
+      g.roundStartScore = g.teamScore;
+      g.roundGoal       = g.roundStartScore + 100;   // absolute threshold
+      g.roundEndAt      = now + 120000UL;            // 2:00
+
+      // Randomly re-split total loot across stations
+      splitInventoryRandom(g, /*total=*/100);
+      g.pending.nextStation = 1;   // drip stations again
+      g.pending.needScore   = true;
+
+      // Randomized cadence dwell ranges for GREEN/RED.
+      // (Adjust these ranges as you like; YELLOW kept fixed but range fields set equal for future proofing)
+      g.greenMsMin = 7000;  g.greenMsMax = 13000;     // ~7–13 s
+      g.redMsMin   = 6000;  g.redMsMax   = 11000;     // ~6–11 s
+      g.yellowMsMin= g.yellowMs; g.yellowMsMax = g.yellowMs;  // no randomization (yet)
+
+      enterGreen(g);
+      bcastRoundStatus(g);
+    } else { // idx >= 4
+      // ---------- ROUND 4 (placeholder) ----------
+      // Play out the remainder of the game with current settings.
       g.roundEndAt = (g.gameEndAt > now) ? g.gameEndAt : now;
       enterGreen(g);
+      // (If you want R4 to have its own goal/timer, say the word and we’ll wire it like R2/R3.)
     }
   }
 }
@@ -85,34 +125,21 @@ void modeClassicInit(Game& g) {
 void modeClassicMaybeAdvance(Game& g) {
   const uint32_t now = millis();
 
-  // Round timing
-  if (now >= g.gameEndAt) {
-    bcastGameOver(g, /*TIME_UP*/0);
-    return;
+  // 0) Global expiry wins over everything
+  if (now >= g.gameEndAt) { bcastGameOver(g, /*TIME_UP*/0); return; }
+
+  // 1) Early advance on goal
+  if (g.teamScore >= g.roundGoal) {
+    if      (g.roundIndex == 1) { gameAudioPlayOnce(TRK_TREX_WIN); startRound(g, 2); return; }
+    else if (g.roundIndex == 2) { gameAudioPlayOnce(TRK_TREX_WIN); startRound(g, 3); return; }
+    else if (g.roundIndex == 3) { gameAudioPlayOnce(TRK_TREX_WIN); startRound(g, 4); return; }
   }
-  if (g.roundIndex == 1) {
-    // Early advance: hit R1 goal -> Round 2
-    if (g.teamScore >= g.roundGoal) {
-      startRound(g, /*idx=*/2);
-      return;
-    }
-    // R1 timeout: must meet goal, else game over
-    if (now >= g.roundEndAt) {
-      if (g.teamScore < g.roundGoal) { bcastGameOver(g, /*GOAL_NOT_MET*/4); return; }
-      startRound(g, /*idx=*/2);
-      return;
-    }
-  } else if (g.roundIndex == 2) {
-    // R2 success -> Round 3
-    if (g.teamScore >= g.roundGoal) {
-      startRound(g, /*idx=*/3);
-      return;
-    }
-    // R2 timeout: must meet goal, else game over
-    if (now >= g.roundEndAt) {
-      if (g.teamScore < g.roundGoal) { bcastGameOver(g, /*GOAL_NOT_MET*/4); return; }
-      startRound(g, /*idx=*/3);
-      return;
-    }
+
+  // 2) Round timeout: must meet goal, else game over; on success, advance
+  if (now >= g.roundEndAt) {
+    if (g.teamScore < g.roundGoal) { bcastGameOver(g, /*GOAL_NOT_MET*/4); return; }
+    if      (g.roundIndex == 1) { gameAudioPlayOnce(TRK_TREX_WIN); startRound(g, 2); return; }
+    else if (g.roundIndex == 2) { gameAudioPlayOnce(TRK_TREX_WIN); startRound(g, 3); return; }
+    else if (g.roundIndex == 3) { gameAudioPlayOnce(TRK_TREX_WIN); startRound(g, 4); return; }
   }
 }

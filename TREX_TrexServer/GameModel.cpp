@@ -42,6 +42,10 @@ void resetGame(Game& g) {
     g.stationInventory[sid] = 0;   // start empty; filled in startRound()
   }
 
+  g.greenMsMin = g.greenMsMax = 0;
+  g.redMsMin   = g.redMsMax   = 0;
+  g.yellowMsMin= g.yellowMsMax= 0;
+
   // (Optional) clear any per-player holds/carry if you track them here
   for (int i=0;i<MAX_PLAYERS;i++) {
     g.players[i] = PlayerRec{}; // zero/clear

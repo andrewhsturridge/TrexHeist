@@ -56,6 +56,10 @@ struct Game {
   bool     redEnabled = true;
   bool allowYellowThisRound = true;
 
+  uint32_t greenMsMin = 0, greenMsMax = 0;
+  uint32_t redMsMin   = 0, redMsMax   = 0;
+  uint32_t yellowMsMin= 0, yellowMsMax= 0;
+
   uint16_t roundGoal = 100;
   uint32_t roundStartScore = 0;
 

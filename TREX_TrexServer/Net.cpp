@@ -1,8 +1,9 @@
-#include "Net.h"
-#include "Media.h"
 #include <TrexTransport.h>
 #include <esp_random.h>
+#include "Net.h"
+#include "Media.h"
 #include "OtaCampaign.h"
+#include "GameAudio.h"
 
 // Generic raw broadcast used by OTA
 void netBroadcastRaw(const uint8_t* data, uint16_t len) {
@@ -51,7 +52,8 @@ void bcastGameOver(Game& g, uint8_t reason /*GameOverReason*/) {
   // stop all holds
   for (auto &h : g.holds) h.active = false;
 
-  spritePlay(CLIP_GAME_OVER);
+  spritePlay(CLIP_LOOKING);
+  gameAudioPlayOnce(TRK_TREX_LOSE);
   Serial.println("[TREX] GAME OVER!");
 }
 

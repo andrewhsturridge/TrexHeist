@@ -6,6 +6,7 @@
 #include <Arduino.h>
 #include <TrexProtocol.h>
 #include <TrexTransport.h>
+#include <TrexVersion.h>
 
 #include "ServerConfig.h"
 #include "GameModel.h"
@@ -16,7 +17,7 @@
 #include "MaintCommands.h"
 #include "TrexMaintenance.h"   // updated version with custom command hook
 #include "OtaCampaign.h"
-#include <TrexVersion.h>
+#include "GameAudio.h"
 
 // --- OTA defaults (edit these per release) ---
 #define DEFAULT_OTA_URL          "http://192.168.2.231:8000/TREX_Loot.ino.bin"
@@ -50,6 +51,8 @@ void setup() {
   }
 
   mediaInit();  // Sprite serial etc.
+
+  gameAudioInit(/*rxPin=*/9, /*txPin=*/8, /*baud=*/9600, /*volume=*/25);
 
   // Transport
   TransportConfig cfg{ /*maintenanceMode=*/false, /*wifiChannel=*/WIFI_CHANNEL };
