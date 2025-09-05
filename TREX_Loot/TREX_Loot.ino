@@ -104,6 +104,14 @@ static void ensureIdentity() {
 constexpr uint16_t GAUGE_LEN        = 56;     // pipe gauge length (px)
 constexpr uint8_t  RING_BRIGHTNESS  = 64;
 constexpr uint8_t  GAUGE_BRIGHTNESS = 255;
+// Put this near your LED drawing helpers:
+constexpr uint8_t RING_ROTATE = 0; // adjust if index 0 isn’t your physical “LED 1”
+
+// Pair order: (1,2) → (14,3) → (13,4) → (12,5) → (11,6) → (10,7) → (9,8)
+// (0-based indexes for the library)
+static const uint8_t ORDER_SYM_14[14] PROGMEM = {
+  0, 1, 13, 2, 12, 3, 11, 4, 10, 5, 9, 6, 8, 7
+};
 
 /* ── pins ────────────────────────────────────────────── */
 constexpr uint8_t PIN_SCK      = 36;
@@ -328,14 +336,37 @@ inline uint32_t gaugeColor() {
   return (g_lightState == LightState::GREEN) ? GREEN : RED;
 }
 
+// Light the first nLit LEDs using the symmetric order, in strict pairs.
+static void drawRingSymmetricLit(uint8_t nLit, uint32_t color) {
+  if (nLit > 14) nLit = 14;
+  // Enforce “two sides at once”: round down to even so pairs light together
+  if (nLit & 1) nLit--;
+
+  // Clear, then paint in our custom order
+  for (uint8_t i = 0; i < 14; ++i) ring.setPixelColor(i, OFF);
+  for (uint8_t i = 0; i < nLit; ++i) {
+    uint8_t idx = pgm_read_byte(&ORDER_SYM_14[i]);
+    idx = (idx + RING_ROTATE) % 14;
+    ring.setPixelColor(idx, color);
+  }
+  ring.show();
+}
+
 void drawRingCarried(uint8_t cur, uint8_t maxC) {
   if (fullBlinkActive || otaInProgress) return;  // OTA owns the ring
   pumpAudio();
-  const uint16_t n = ring.numPixels();
+
+  const uint16_t n = ring.numPixels(); // 14
   uint16_t lit = 0;
-  if (maxC > 0) lit = (uint16_t)((uint32_t)cur * n + (maxC-1)) / maxC;  // ceil
-  for (uint16_t i=0;i<n;i++) ring.setPixelColor(i, (i<lit) ? GREEN : OFF);
-  ring.show();
+  if (maxC > 0) {
+    // Same ceiling mapping you used before, just reusing the math
+    lit = (uint16_t)((uint32_t)cur * n + (maxC - 1)) / maxC;
+  }
+
+  // Force pairwise advance so both arcs fill at the same time
+  if (lit & 1) lit--;
+
+  drawRingSymmetricLit((uint8_t)lit, GREEN);
 }
 
 void drawGaugeInventory(uint16_t inventory, uint16_t capacity) {
