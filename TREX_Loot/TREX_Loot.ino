@@ -349,13 +349,16 @@ static void drawRingSymmetricLit(uint8_t nLit, uint32_t color) {
     idx = (idx + RING_ROTATE) % 14;
     ring.setPixelColor(idx, color);
   }
+  pumpAudio();
   ring.show();
+  pumpAudio();
 }
 
 void drawRingCarried(uint8_t cur, uint8_t maxC) {
   if (fullBlinkActive || otaInProgress) return;  // OTA owns the ring
   pumpAudio();
 
+  static uint8_t lastLit = 255;
   const uint16_t n = ring.numPixels(); // 14
   uint16_t lit = 0;
   if (maxC > 0) {
@@ -365,6 +368,8 @@ void drawRingCarried(uint8_t cur, uint8_t maxC) {
 
   // Force pairwise advance so both arcs fill at the same time
   if (lit & 1) lit--;
+  if (lit == lastLit) return;
+  lastLit = lit;
 
   drawRingSymmetricLit((uint8_t)lit, GREEN);
 }
@@ -415,6 +420,7 @@ void fillRing(uint32_t c) {
   pumpAudio();
   for (uint16_t i=0;i<ring.numPixels();++i) ring.setPixelColor(i,c);
   ring.show();
+  pumpAudio();
 }
 
 void fillGauge(uint32_t c) {
