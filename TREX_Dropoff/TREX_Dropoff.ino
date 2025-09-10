@@ -109,6 +109,7 @@ static inline uint32_t C(uint8_t r,uint8_t g,uint8_t b){ return Adafruit_NeoPixe
 const uint32_t RED   = C(255,0,0);
 const uint32_t GREEN = C(0,255,0);
 const uint32_t GOLD  = C(255, 180, 0);
+const uint32_t WHITE = C(255,255,255);
 const uint32_t OFF   = 0;
 
 /* tag tracking — edge-trigger (tap) */
@@ -444,6 +445,12 @@ void onRx(const uint8_t* data, uint16_t len) {
       uint32_t prev = teamScore;
       teamScore = p->teamScore;
 
+      // Always consume the head of the request→result FIFO
+      int8_t idx = -1;
+      // If your payload includes readerIndex, prefer it:
+      // idx = p->readerIndex;
+      if (idx < 0 || idx >= 4) idx = reqDequeue();
+
       // Paint gauges now if safe, or defer while audio is exclusive
       if (!audioExclusive) {
         drawTeamGaugesRound(teamScore, roundTargetCount());
@@ -452,23 +459,36 @@ void onRx(const uint8_t* data, uint16_t len) {
         gaugeDirty = true;
       }
 
-      scanLocked = false;
-
       // Successful bank => keep that reader GREEN for 1s
       if (teamScore > prev) {
-        // Prefer payload's reader index if your DropResultPayload carries it; otherwise fall back to FIFO
-        int8_t idx = -1;
-        // idx = p->readerIndex; // <-- uncomment if your payload includes this field
-        if (idx < 0 || idx >= 4) idx = reqDequeue();
-
         if (idx >= 0 && idx < 4) {
-          ringHoldActive[idx] = true;
-          ringHoldUntil[idx]  = millis() + 1000;  // hold 1s
-          fillRing((uint8_t)idx, GREEN);          // .show() already gated if audioExclusive
-        }
+          // Only one GREEN at a time: clear any previous holds
+          for (uint8_t j = 0; j < 4; ++j) {
+            if (j != idx && ringHoldActive[j]) {
+              ringHoldActive[j] = false;
+              if (!tagPresent[j] && !audioExclusive) fillRing(j, RED);
+            }
+          }
 
-        // Start short exclusive audio
+          ringHoldActive[idx] = true;
+          ringHoldUntil[idx]  = millis() + 1000;  // 1s celebration
+          fillRing((uint8_t)idx, GREEN);
+
+          // Keep scans blocked until the celebration ends
+          scanLocked   = true;
+          scanUnlockAt = ringHoldUntil[idx];
+        }
+        // Short audio window
         startAudioExclusiveShort();
+
+      } else {
+        // Reject / no score change:
+        // We already dequeued the matching reader above, so mapping stays aligned.
+        // Ensure its ring isn't left green from arrival (we removed arrival green, but guard anyway).
+        if (idx >= 0 && idx < 4 && !ringHoldActive[idx] && !audioExclusive) {
+          if (!tagPresent[idx]) fillRing((uint8_t)idx, RED);
+        }
+        scanLocked = false;
       }
       break;
     }
@@ -611,7 +631,15 @@ void loop() {
   const uint32_t now = millis();
 
   // One RFID at a time: clear lock by timeout, skip scan while locked
-  if (scanLocked && (int32_t)(now - scanUnlockAt) >= 0) scanLocked = false;
+  if (scanLocked && (int32_t)(now - scanUnlockAt) >= 0) {
+    scanLocked = false;
+    // Flush the pending request to avoid mis-mapping on a late result
+    int8_t dropped = reqDequeue();
+    if (dropped >= 0 && !ringHoldActive[dropped] && !audioExclusive) {
+      // If we had painted arrival GREEN earlier (we don't anymore), ensure RED
+      if (!tagPresent[dropped]) fillRing((uint8_t)dropped, RED);
+    }
+  }
 
   if (!scanLocked) {
     // Round-robin improves fairness
@@ -641,14 +669,16 @@ void loop() {
       TrexUid uid;
       if (readUid(rd, uid)) {
         sendDropRequest(uid, i);
-        fillRing(i, GREEN);
+
+        // Pending visual ONLY: WHITE on arrival. GREEN happens on success.
+        fillRing(i, WHITE);
         tagPresent[i] = true;
         reqEnqueue(i);
 
         // Lock further reads until we get DROP_RESULT (or timeout)
-        scanLocked = true;
+        scanLocked   = true;
         scanUnlockAt = now + SCAN_LOCK_TIMEOUT_MS;
-        break;  // <-- only one per pass
+        break;  // only one per pass
       }
 
       pumpAudio();
