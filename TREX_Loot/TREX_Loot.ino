@@ -154,7 +154,10 @@ const uint32_t GREEN   = C_RGB(0,255,0);
 const uint32_t BLUE    = C_RGB(0,0,255);
 const uint32_t CYAN    = C_RGB(0,200,255);
 const uint32_t YELLOW    = C_RGB(255,180,0);
+const uint32_t WHITE   = C_RGB(255,255,255);
 const uint32_t OFF     = 0;
+
+static bool ringCarriedValid = false;
 
 /* ── RFID presence debounce ──────────────────────────── */
 constexpr uint32_t ABSENCE_MS = 150;   // debounce removal
@@ -173,6 +176,12 @@ constexpr uint16_t YELLOW_BLINK_PERIOD_MS = 500;
 bool     yellowBlinkActive = false;
 bool     yellowBlinkOn     = false;
 uint32_t yellowBlinkLastMs = 0;
+
+// ── Empty-station blink (first gauge LED white) ─────────────
+constexpr uint16_t EMPTY_BLINK_PERIOD_MS = 500;
+bool     emptyBlinkActive = false;
+bool     emptyBlinkOn     = false;
+uint32_t emptyBlinkLastMs = 0;
 
 /* ── Game/hold state (server-auth) ───────────────────── */
 volatile bool gameActive = true;     // flipped by GAME_OVER/START in onRx()
@@ -368,10 +377,11 @@ void drawRingCarried(uint8_t cur, uint8_t maxC) {
 
   // Force pairwise advance so both arcs fill at the same time
   if (lit & 1) lit--;
-  if (lit == lastLit) return;
+  if (ringCarriedValid && lit == lastLit) return;
   lastLit = lit;
 
   drawRingSymmetricLit((uint8_t)lit, GREEN);
+  ringCarriedValid = true;
 }
 
 void drawGaugeInventory(uint16_t inventory, uint16_t capacity) {
@@ -401,23 +411,33 @@ void drawGaugeInventory(uint16_t inventory, uint16_t capacity) {
 
   for (uint16_t i = 0; i < GAUGE_LEN; ++i) {
     gauge.setPixelColor(i, (i < lit) ? col : OFF);
-    if ((i & 7) == 0) pumpAudio();       // NEW: gentle feed during long loops
+    if ((i & 7) == 0) pumpAudio();
   }
+
+  // Inject the empty-station overlay (LED 0 white) into the same frame
+  if (emptyBlinkActive && tagPresent && inv == 0) {
+    // Optional: respect YELLOW off-phase; keep if you want the whole bar dark
+    if (!(g_lightState == LightState::YELLOW && yellowBlinkActive && !yellowBlinkOn)) {
+      gauge.setPixelColor(0, emptyBlinkOn ? WHITE : OFF);
+    }
+  }
+
   gauge.show();
-  pumpAudio();                            // NEW: one more after show
+  pumpAudio();
 
   // MOSFET lamp follows inventory: off when out of loot
   if (inventory == 0) digitalWrite(PIN_MOSFET, LOW);
   else                digitalWrite(PIN_MOSFET, HIGH);
 
   lastInvPainted = inventory;
-  lastCapPainted = capacity;              // tracked for cache only
+  lastCapPainted = capacity;
   lastGaugeColor = colorState;
   gaugeCacheValid = true;
 }
 
 void fillRing(uint32_t c) {
   pumpAudio();
+  ringCarriedValid = false;
   for (uint16_t i=0;i<ring.numPixels();++i) ring.setPixelColor(i,c);
   ring.show();
   pumpAudio();
@@ -426,6 +446,14 @@ void fillRing(uint32_t c) {
 void fillGauge(uint32_t c) {
   pumpAudio();
   for (uint16_t i=0;i<GAUGE_LEN;++i) gauge.setPixelColor(i,c);
+
+  // Inject overlay into this same frame (no second show)
+  if (emptyBlinkActive && tagPresent && inv == 0) {
+    if (!(g_lightState == LightState::YELLOW && yellowBlinkActive && !yellowBlinkOn)) {
+      gauge.setPixelColor(0, emptyBlinkOn ? WHITE : OFF);
+    }
+  }
+
   gauge.show();
   gaugeCacheValid = false;
 }
@@ -437,6 +465,7 @@ inline void startFullBlinkImmediate() {
   blinkHoldId     = holdId;
   pumpAudio();
   fillRing(YELLOW);
+  pumpAudio();
 }
 inline void stopFullBlink() { fullBlinkActive = false; fullBlinkOn = false; }
 inline void tickFullBlink() {
@@ -445,8 +474,11 @@ inline void tickFullBlink() {
   if ((now - fullBlinkLastMs) >= FULL_BLINK_PERIOD_MS) {
     fullBlinkLastMs = now;
     fullBlinkOn = !fullBlinkOn;
+    pumpAudio();
     fillRing(fullBlinkOn ? YELLOW : OFF);
     pumpAudio();
+  } else {
+    pumpAudio();                                   // NEW: drip-feed between flips
   }
 }
 
@@ -497,6 +529,48 @@ inline void tickYellowBlink() {
       // OFF phase: darken the gauge (don’t affect MOSFET)
       fillGauge(OFF);
     }
+  }
+}
+
+// ── Empty-station blink (first gauge LED white) ─────────────
+inline void forceGaugeRepaint() {
+  gaugeCacheValid = false;         // bust cache so we truly repaint
+  drawGaugeInventory(inv, cap);    // one frame, one show, overlay included
+}
+
+inline void applyEmptyOverlay() {
+  // Overlay only if actively scanning an empty station (and not OTA)
+  if (!emptyBlinkActive || otaInProgress || !tagPresent || inv != 0) return;
+  // Optional guard to respect YELLOW off-phase:
+  if (g_lightState == LightState::YELLOW && yellowBlinkActive && !yellowBlinkOn) return;
+  // Paint just LED 0: white when ON, off when OFF
+  gauge.setPixelColor(0, emptyBlinkOn ? WHITE : OFF);
+  gauge.show();
+  pumpAudio();
+}
+
+inline void startEmptyBlink() {
+  emptyBlinkActive = true;
+  emptyBlinkOn     = true;
+  emptyBlinkLastMs = millis();
+  forceGaugeRepaint();
+}
+
+inline void stopEmptyBlink() {
+  if (!emptyBlinkActive) return;
+  emptyBlinkActive = false;
+  forceGaugeRepaint();
+}
+
+inline void tickEmptyBlink() {
+  if (!emptyBlinkActive) return;
+  uint32_t now = millis();
+  if ((now - emptyBlinkLastMs) >= EMPTY_BLINK_PERIOD_MS) {
+    emptyBlinkLastMs = now;
+    emptyBlinkOn = !emptyBlinkOn;
+    forceGaugeRepaint();
+  } else {
+    pumpAudio(); // drip between flips
   }
 }
 
@@ -829,6 +903,10 @@ void onRx(const uint8_t* data, uint16_t len) {
       cap      = p->capacity;
       stationInited = true;
 
+      // Keep/clear empty indicator based on latest inventory
+      if (tagPresent && inv == 0) startEmptyBlink();
+      else                        stopEmptyBlink();
+
       if (p->accepted) {
         holdActive = true;
         startAudio();                 // begin hold audio
@@ -837,6 +915,7 @@ void onRx(const uint8_t* data, uint16_t len) {
         if (carried >= maxCarry) {
           if (!fullAnnounced || blinkHoldId != p->holdId) {
             startFullBlinkImmediate();   // one-shot full indicator
+            pumpAudio();
             fullAnnounced = true;
             blinkHoldId   = p->holdId;
           }
@@ -844,6 +923,7 @@ void onRx(const uint8_t* data, uint16_t len) {
           if (fullBlinkActive) stopFullBlink();
           fullAnnounced = false;
           drawRingCarried(carried, maxCarry);
+          pumpAudio();
         }
 
         // Throttled gauge paint (inventory shown 1:1 in drawGaugeInventory)
@@ -861,6 +941,7 @@ void onRx(const uint8_t* data, uint16_t len) {
         if (carried >= maxCarry) {
           if (!fullAnnounced || blinkHoldId != p->holdId) {
             startFullBlinkImmediate();
+            pumpAudio();
             fullAnnounced = true;
             blinkHoldId   = p->holdId;
           }
@@ -887,9 +968,14 @@ void onRx(const uint8_t* data, uint16_t len) {
       inv     = p->inventory;
       stationInited = true;
 
+      // Maintain empty indicator
+      if (tagPresent && inv == 0) startEmptyBlink();
+      else                        stopEmptyBlink();
+
       if (carried >= maxCarry) {
         if (!fullAnnounced || blinkHoldId != p->holdId) {
           startFullBlinkImmediate();      // one-shot on first time hitting full
+          pumpAudio();
           fullAnnounced = true;
           blinkHoldId   = p->holdId;
         }
@@ -897,6 +983,7 @@ void onRx(const uint8_t* data, uint16_t len) {
         if (fullBlinkActive) stopFullBlink();
         fullAnnounced = false;
         drawRingCarried(carried, maxCarry);
+        pumpAudio();
       }
 
       uint32_t now = millis();
@@ -913,6 +1000,8 @@ void onRx(const uint8_t* data, uint16_t len) {
       if (h->payloadLen != sizeof(HoldEndPayload)) break;
       auto* p = (const HoldEndPayload*)(data + sizeof(MsgHeader));
       if (p->holdId != holdId) break;
+
+      stopEmptyBlink();
 
       holdActive = false;
       holdId     = 0;
@@ -954,6 +1043,7 @@ void onRx(const uint8_t* data, uint16_t len) {
 
       digitalWrite(PIN_MOSFET, HIGH);         // lamp ON for live round
       stopFullBlink();
+      stopEmptyBlink();
       fillRing(RED);                          // ring “awake” in RED
 
       // IMPORTANT: do NOT call drawGaugeInventory() here,
@@ -965,6 +1055,7 @@ void onRx(const uint8_t* data, uint16_t len) {
     case MsgType::GAME_OVER: {
       gameActive = false; holdActive = false; holdId = 0; fullBlinkActive = false;
       stopYellowBlink();
+      stopEmptyBlink();
       carried = 0; tagPresent = false; absentStartMs = 0;
       stopAudio();
       if (!otaInProgress) fillRing(RED);
@@ -1143,7 +1234,9 @@ void loop() {
       carried       = 0;
       stopFullBlink();
       sendHoldStart(currentUid);
-      fillRing(GREEN);  // optimistic until ACK
+
+      if (inv == 0) startEmptyBlink();
+      else          stopEmptyBlink(); 
     }
   }
 
@@ -1155,11 +1248,12 @@ void loop() {
     if (absentStartMs == 0) absentStartMs = now;
     else if (now - absentStartMs > ABSENCE_MS) {
       tagPresent = false;
+      absentStartMs = 0;
       sendHoldStop();
       stopAudio();
       stopFullBlink();
+      stopEmptyBlink();       // ensure the empty indicator stops
       fillRing(RED);
-      absentStartMs = 0;
     }
   }
 
@@ -1169,4 +1263,5 @@ void loop() {
 
   tickFullBlink();
   tickYellowBlink();
+  tickEmptyBlink();
 }
