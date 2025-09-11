@@ -5,7 +5,7 @@
 // Broadcasts
 void sendStateTick(const Game& g, uint32_t msLeft);
 void bcastGameStart(Game& g);
-void bcastGameOver(Game& g, uint8_t reason);
+void bcastGameOver(Game& g, uint8_t reason, uint8_t blameSid = GAMEOVER_BLAME_ALL);
 void bcastScore(Game& g);
 void bcastStation(Game& g, uint8_t stationId);
 void sendDropResult(Game& g, uint16_t dropped);

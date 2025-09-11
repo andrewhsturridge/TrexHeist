@@ -114,11 +114,11 @@ void loop() {
       }
     }
     if (c=='r' || c=='R') enterRed(g);
-    if (c=='x' || c=='X') bcastGameOver(g, /*MANUAL*/2);
+    if (c=='x' || c=='X') bcastGameOver(g, /*MANUAL*/2, GAMEOVER_BLAME_ALL);
     // Update all Loot stations (press 'U')
     if (c == 'u' || c == 'U') {
       // Ensure game is idle so Loots will accept OTA
-      bcastGameOver(g, /*MANUAL*/2);
+      bcastGameOver(g, /*MANUAL*/2, GAMEOVER_BLAME_ALL);
       Serial.println("[OTA] GAME_OVER sent; broadcasting in 3s…");
 
       // Simple grace period; keeps loops active while waiting
@@ -218,7 +218,7 @@ void loop() {
       bool anyHold = false;
       for (auto &h : g.holds) if (h.active) { anyHold = true; break; }
       if (anyHold) {
-        bcastGameOver(g, /*RED_LOOT*/1);
+        bcastGameOver(g, /*RED_LOOT*/1, GAMEOVER_BLAME_ALL);
         return;
       }
     }
@@ -234,7 +234,7 @@ void loop() {
           // optional: track state/time
           g.pir[i].state = trig;
           if (trig) {
-            bcastGameOver(g, /*RED_PIR*/3);
+            bcastGameOver(g, /*RED_PIR*/3, GAMEOVER_BLAME_ALL);
             return;
           }
         }

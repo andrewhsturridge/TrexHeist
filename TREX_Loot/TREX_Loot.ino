@@ -1053,14 +1053,35 @@ void onRx(const uint8_t* data, uint16_t len) {
     }
 
     case MsgType::GAME_OVER: {
+      // Safety: need at least 1 byte of payload (reason)
+      if (len < sizeof(MsgHeader) + 1) break;
+
+      // Header was already parsed at top as `h`
+      const GameOverPayload* gp =
+          (const GameOverPayload*)(data + sizeof(MsgHeader));
+
+      const uint8_t reason   = (h->payloadLen >= 1) ? gp->reason : 0;
+      const uint8_t blameSid = (h->payloadLen >= sizeof(GameOverPayload))
+                              ? gp->blameSid : GAMEOVER_BLAME_ALL;
+
+      const bool redViolation = (reason == 1); // RED_LOOT
+      const bool offender     = redViolation &&
+                                (blameSid != GAMEOVER_BLAME_ALL) &&
+                                (blameSid == STATION_ID);
+      const bool shouldBlink  = !redViolation || offender;
+
+      // Existing end-of-game resets
       gameActive = false; holdActive = false; holdId = 0; fullBlinkActive = false;
       stopYellowBlink();
       stopEmptyBlink();
       carried = 0; tagPresent = false; absentStartMs = 0;
       stopAudio();
-      if (!otaInProgress) fillRing(RED);
-      gameOverBlinkAndOff();
-      Serial.println("[LOOT] GAME_OVER");
+
+      if (!otaInProgress) fillRing(RED);  // steady red for everyone
+      if (shouldBlink) gameOverBlinkAndOff();
+
+      Serial.printf("[LOOT] GAME_OVER reason=%u blame=%u me=%u blink=%d\n",
+                    reason, blameSid, STATION_ID, (int)shouldBlink);
       break;
     }
 

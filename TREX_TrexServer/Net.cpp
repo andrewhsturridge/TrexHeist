@@ -40,21 +40,23 @@ void bcastGameStart(Game& g) {
   Serial.printf("[TREX] GAME_START broadcast %s\n", ok ? "OK" : "FAILED");
 }
 
-void bcastGameOver(Game& g, uint8_t reason /*GameOverReason*/) {
+void bcastGameOver(Game& g, uint8_t reason, uint8_t blameSid /*=GAMEOVER_BLAME_ALL*/) {
   if (g.phase == Phase::END) return; // single-shot
   g.phase = Phase::END;
-
-  uint8_t buf[sizeof(MsgHeader)+sizeof(GameOverPayload)];
+  uint8_t buf[sizeof(MsgHeader) + sizeof(GameOverPayload)];
   packHeader(g, (uint8_t)MsgType::GAME_OVER, sizeof(GameOverPayload), buf);
-  ((GameOverPayload*)(buf+sizeof(MsgHeader)))->reason = reason;
+  auto *p = (GameOverPayload*)(buf + sizeof(MsgHeader));
+  p->reason   = reason;
+  p->blameSid = blameSid;
+
   Transport::broadcast(buf,sizeof(buf));
 
   // stop all holds
   for (auto &h : g.holds) h.active = false;
 
   gameAudioPlayOnce(TRK_TREX_LOSE);
-  spritePlay(CLIP_LOOKING);
-  Serial.println("[TREX] GAME OVER!");
+  spritePlay(CLIP_GAME_OVER);
+  Serial.printf("[TREX] GAME OVER! reason=%u blameSid=%u\n", reason, blameSid);
 }
 
 void bcastScore(Game& g) {
@@ -166,6 +168,13 @@ void onRx(const uint8_t* data, uint16_t len) {
       break;
     }
 
+    // Helper: validate station id (adjust range if you have >5)
+    auto validSid = [](uint8_t sid){ return sid >= 1 && sid <= 5; };
+    // Prefer payload stationId; fall back to header srcStationId; else ALL
+    uint8_t offenderSid =
+        validSid(p->stationId)     ? p->stationId :
+        (validSid(h->srcStationId) ? h->srcStationId : GAMEOVER_BLAME_ALL);
+
     // RED violation handling with edge grace
     if (G.light == LightState::RED) {
       if (now - G.lastFlipMs <= G.edgeGraceMs) {
@@ -175,14 +184,17 @@ void onRx(const uint8_t* data, uint16_t len) {
         auto* a=(LootHoldAckPayload*)(buf+sizeof(MsgHeader));
         a->holdId=p->holdId; a->accepted=0; a->rateHz=rateHz; a->maxCarry=G.maxCarry;
         a->carried=0;
-        a->inventory=G.stationInventory[p->stationId];
-        a->capacity =G.stationCapacity[p->stationId];
+        a->inventory= validSid(p->stationId) ? G.stationInventory[p->stationId] : 0;
+        a->capacity = validSid(p->stationId) ? G.stationCapacity[p->stationId]  : 0;
         a->denyReason=6; // EDGE_GRACE
         Transport::broadcast(buf,sizeof(buf));
         break;
       }
-      // outside grace: end game
-      bcastGameOver(G, /*RED_LOOT*/1);
+      // outside grace: end game - blame the offending station
+      uint8_t blame = validSid(offenderSid) ? offenderSid : GAMEOVER_BLAME_ALL;
+      Serial.printf("[RX] RED violation; ending game. blameSid=%u holdId=%lu\n",
+                    blame, (unsigned long)p->holdId);
+      bcastGameOver(G, /*RED_LOOT*/1, blame);
       break;
     }
 
