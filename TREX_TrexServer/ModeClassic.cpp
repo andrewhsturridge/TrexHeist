@@ -38,14 +38,14 @@ static void startRound(Game& g, uint8_t idx) {
     g.roundEndAt  = now + 120000UL;  // 2:00 Round 1
     g.roundStartScore = 0;
 
-    g.roundGoal   = 100;
+    g.roundGoal   = 40;
     g.lootPerTick  = 4;
     g.lootRateMs  = 1000;
 
     // initialize stations (no broadcast here; use drip)
     for (uint8_t sid = 1; sid <= 5; ++sid) {
       g.stationCapacity[sid]  = 56;
-      g.stationInventory[sid] = 20;
+      g.stationInventory[sid] = g.roundGoal/MAX_STATIONS;
     }
 
     // prime drip
@@ -66,13 +66,13 @@ static void startRound(Game& g, uint8_t idx) {
 
       // Two-minute round starting now
       g.roundStartScore = g.teamScore;
-      g.roundGoal       = g.roundStartScore + 100;   // +100 from this point
+      g.roundGoal       = g.roundStartScore + 40;   // +100 from this point
       g.roundEndAt      = now + 120000UL;            // 2:00
 
       // Evenly re-split station inventory (mirror R1 setup)
       for (uint8_t sid = 1; sid <= 5; ++sid) {
         g.stationCapacity[sid]  = 56;
-        g.stationInventory[sid] = 20;
+        g.stationInventory[sid] = g.roundGoal/MAX_STATIONS;
       }
       // Prime drip to rebroadcast stations/score
       g.pending.nextStation = 1;
@@ -82,7 +82,7 @@ static void startRound(Game& g, uint8_t idx) {
       bcastRoundStatus(g);
     } else if (idx == 3) {
       // ---------- ROUND 3 ----------
-      g.maxCarry = 12;
+      g.maxCarry = 10;
       g.noRedThisRound       = false;
       g.allowYellowThisRound = true;
       g.lootRateMs  = 1000;
@@ -90,28 +90,51 @@ static void startRound(Game& g, uint8_t idx) {
 
       // New 2-minute round with +100 from this point
       g.roundStartScore = g.teamScore;
-      g.roundGoal       = g.roundStartScore + 100;   // absolute threshold
+      g.roundGoal       = g.roundStartScore + 40;   // absolute threshold
       g.roundEndAt      = now + 120000UL;            // 2:00
 
       // Randomly re-split total loot across stations
-      splitInventoryRandom(g, /*total=*/100);
+      splitInventoryRandom(g, g.roundGoal);
       g.pending.nextStation = 1;   // drip stations again
       g.pending.needScore   = true;
 
       // Randomized cadence dwell ranges for GREEN/RED.
       // (Adjust these ranges as you like; YELLOW kept fixed but range fields set equal for future proofing)
-      g.greenMsMin = 7000;  g.greenMsMax = 13000;     // ~7–13 s
-      g.redMsMin   = 6000;  g.redMsMax   = 11000;     // ~6–11 s
+      g.greenMsMin = 14000;  g.greenMsMax = 18000;     // ~7–13 s
+      g.redMsMin   = 6500;  g.redMsMax   = 8000;     // ~6–11 s
       g.yellowMsMin= g.yellowMs; g.yellowMsMax = g.yellowMs;  // no randomization (yet)
 
       enterGreen(g);
       bcastRoundStatus(g);
     } else { // idx >= 4
-      // ---------- ROUND 4 (placeholder) ----------
-      // Play out the remainder of the game with current settings.
+      // ---------- ROUND 4: Option A + Yellow fake-outs ----------
+      g.maxCarry = 10;
+      g.noRedThisRound       = false;
+      g.allowYellowThisRound = true;
+      g.lootRateMs  = 1000;
+      g.lootPerTick = 4;
+
+      // New 2-minute round with +100 from this point
+      g.roundStartScore = g.teamScore;
+      g.roundGoal       = g.roundStartScore + 40;   // absolute threshold
+      g.roundEndAt      = now + 120000UL;            // 2:00
+
+      // Randomly re-split total loot across stations
+      splitInventoryRandom(g, g.roundGoal);
+      g.pending.nextStation = 1;   // drip stations again
+      g.pending.needScore   = true;
       g.roundEndAt = (g.gameEndAt > now) ? g.gameEndAt : now;
+      g.noRedThisRound       = false;
+      g.allowYellowThisRound = true;
+
+      const uint32_t redMin  = (g.pirArmDelayMs > 6000) ? g.pirArmDelayMs : 6000;
+      g.redMsMin   = redMin;                 g.redMsMax   = (7000 > redMin) ? 7000 : redMin;
+      g.greenMsMin = 10000;                  g.greenMsMax = 14000;
+ 
+      // Fake-out tease range via existing fields (0.5–0.9 s)
+      g.yellowMsMin = 3000; g.yellowMsMax = 3000;  // keep g.yellowMs at its global (3000 ms)
       enterGreen(g);
-      // (If you want R4 to have its own goal/timer, say the word and we’ll wire it like R2/R3.)
+      bcastRoundStatus(g);
     }
   }
 }

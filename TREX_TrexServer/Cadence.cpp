@@ -32,12 +32,31 @@ void enterGreen(Game& g) {
 }
 
 void enterYellow(Game& g) {
-  g.light = LightState::YELLOW;
-  g.nextSwitch = millis() + pickDur(g.yellowMs, g.yellowMsMin, g.yellowMsMax);
-  g.lastFlipMs = millis();
+  g.light      = LightState::YELLOW;
+  uint32_t now = millis();
+  g.lastFlipMs = now;
+
+  if (g.roundIndex == 4) {
+    const bool bounce = ((esp_random() % 100) < 50); // ~25% fake-out
+    const uint32_t yBase = g.yellowMs ? g.yellowMs : 3000; // RED path = exactly this
+    if (bounce) {
+      // Use your 1500–3000 window but clamp max to (yBase - 1) to avoid overlap
+      uint32_t yMin = g.yellowMsMin ? g.yellowMsMin : 1500;
+      uint32_t yMax = g.yellowMsMax ? g.yellowMsMax : 3000;
+      if (yMax >= yBase) yMax = (yBase > 0 ? yBase - 1 : 0); // ⇒ 1500..2999
+      if (yMin > yMax)   yMin = yMax;                        // safety clamp
+      g.nextSwitch = now + pickDur(/*base*/0, yMin, yMax);
+    } else {
+      // Non-bounce path: fixed yBase (e.g., 3000 ms) ⇒ will go to RED
+      g.nextSwitch = now + yBase;
+    }
+  } else {
+    g.nextSwitch = now + pickDur(g.yellowMs, g.yellowMsMin, g.yellowMsMax);
+  }
+
   Serial.println("[TREX] -> YELLOW");
   gameAudioPlayOnce(TRK_TICKS_LOOP);
-  uint32_t now = millis();
+
   uint32_t msLeft = (g.nextSwitch > now) ? (g.nextSwitch - now) : 0;
   uint32_t toRoundEnd = (g.roundEndAt > now) ? (g.roundEndAt - now) : 0xFFFFFFFFUL;
   uint32_t toGameEnd  = (g.gameEndAt  > now) ? (g.gameEndAt  - now) : 0xFFFFFFFFUL;
@@ -66,27 +85,33 @@ void enterRed(Game& g) {
 
 void tickCadence(Game& g, uint32_t now) {
   if (g.phase != Phase::PLAYING) return;
-
-  // Round 1: GREEN only (no YELLOW, no RED)
-  if (g.noRedThisRound && !g.allowYellowThisRound) {
-    if (g.light != LightState::GREEN) {
-      enterGreen(g);                  // force GREEN once if not already
-    }
-    g.nextSwitch = now + 3600000UL;   // push next flip far out so we don't re-enter
-    return;                           // nothing else to do this tick
-  }
-
   if (now < g.nextSwitch) return;
 
   if (g.noRedThisRound) {
-    // Round 1 previously GREEN<->YELLOW; now won't run because of guard above.
-    // If you ever use "noRedThisRound=true AND allowYellowThisRound=true",
-    // this branch will toggle GREEN <-> YELLOW:
-    (g.light == LightState::GREEN) ? enterYellow(g) : enterGreen(g);
-  } else {
-    // Full cadence: GREEN → YELLOW → RED → GREEN
-    if      (g.light == LightState::GREEN)  enterYellow(g);
-    else if (g.light == LightState::YELLOW) enterRed(g);
-    else                                    enterGreen(g);
+    if (g.allowYellowThisRound) {
+      (g.light == LightState::GREEN) ? enterYellow(g) : enterGreen(g);
+    } else {
+      enterGreen(g);
+    }
+    return;
   }
+
+  if (g.light == LightState::GREEN) {
+    enterYellow(g);
+    return;
+  }
+
+  if (g.light == LightState::YELLOW) {
+    if (g.roundIndex == 4) {
+      const uint32_t yBase = g.yellowMs ? g.yellowMs : 3000;           // RED path marker
+      const uint32_t dur   = g.nextSwitch - g.lastFlipMs;              // scheduled YELLOW
+      (dur < yBase) ? enterGreen(g) : enterRed(g);                     // < yBase ⇒ fake-out
+    } else {
+      enterRed(g);
+    }
+    return;
+  }
+
+  // RED -> GREEN
+  enterGreen(g);
 }
