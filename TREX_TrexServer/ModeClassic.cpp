@@ -21,6 +21,21 @@ static void splitInventoryRandom(Game& g, uint16_t total /*=100*/) {
   }
 }
 
+// End any active holds and zero ALL players' carried before a new round
+static void endAndClearHoldsAndCarried(Game& g) {
+  // End any live holds (clients will clean up visuals/audio on HOLD_END)
+  for (uint8_t i = 0; i < MAX_HOLDS; ++i) {
+    if (g.holds[i].active) {
+      sendHoldEnd(g, g.holds[i].holdId, /*EMPTY*/1);
+      g.holds[i].active = false;
+    }
+  }
+  // Zero every player's carried so nothing rolls into the next round
+  for (uint8_t pi = 0; pi < MAX_PLAYERS; ++pi) {
+    g.players[pi].carried = 0;
+  }
+}
+
 static void startRound(Game& g, uint8_t idx) {
   const uint32_t now = millis();
   g.roundIndex   = idx;
@@ -30,119 +45,137 @@ static void startRound(Game& g, uint8_t idx) {
   if (idx > 1) gameAudioPlayOnce(TRK_TREX_WIN);
 
   if (idx == 1) {
+    // ---------- ROUND 1 ----------
     g.maxCarry = 20;
     g.noRedThisRound       = true;
     g.allowYellowThisRound = false;
 
     g.gameStartAt = now;
     g.gameEndAt   = now + 300000UL;  // 5:00 total
-    g.roundEndAt  = now + 120000UL;  // 2:00 Round 1
+    g.roundEndAt  = now + 120000UL;  // 2:00
+
     g.roundStartScore = 0;
+    g.roundGoal       = 40;
+    g.lootPerTick     = 4;
+    g.lootRateMs      = 1000;
 
-    g.roundGoal   = 40;
-    g.lootPerTick  = 4;
-    g.lootRateMs  = 1000;
+    endAndClearHoldsAndCarried(g);
 
-    // initialize stations (no broadcast here; use drip)
+    // EVEN split of THIS ROUND'S total (goal - start)
+    const uint16_t roundTotal = (uint16_t)(g.roundGoal - g.roundStartScore); // =40
+    uint16_t base = roundTotal / 5, rem = roundTotal % 5;
     for (uint8_t sid = 1; sid <= 5; ++sid) {
+      uint16_t x = base + (rem ? 1 : 0); if (rem) rem--;
+      if (x > 56) x = 56;
       g.stationCapacity[sid]  = 56;
-      g.stationInventory[sid] = g.roundGoal/MAX_STATIONS;
+      g.stationInventory[sid] = x;
     }
 
-    // prime drip
     g.pending.needGameStart = true;
     g.pending.nextStation   = 1;
     g.pending.needScore     = true;
 
     bonusResetForRound(g, now);
-    enterGreen(g);  // lock GREEN in Round 1
+    enterGreen(g);
     bcastRoundStatus(g);
-  } else {
-    if (idx == 2) {
-      // Round 2 (new 2:00 goal round)
-      g.maxCarry = 20;
-      g.noRedThisRound       = false;   // full cadence enabled
-      g.allowYellowThisRound = true;
-      g.lootRateMs  = 1000;
-      g.lootPerTick = 4;
-
-      // Two-minute round starting now
-      g.roundStartScore = g.teamScore;
-      g.roundGoal       = g.roundStartScore + 40;   // +100 from this point
-      g.roundEndAt      = now + 120000UL;            // 2:00
-
-      // Evenly re-split station inventory (mirror R1 setup)
-      for (uint8_t sid = 1; sid <= 5; ++sid) {
-        g.stationCapacity[sid]  = 56;
-        g.stationInventory[sid] = g.roundGoal/MAX_STATIONS;
-      }
-      // Prime drip to rebroadcast stations/score
-      g.pending.nextStation = 1;
-      g.pending.needScore   = true;
-
-      bonusResetForRound(g, now);
-      enterGreen(g);
-      bcastRoundStatus(g);
-    } else if (idx == 3) {
-      // ---------- ROUND 3 ----------
-      g.maxCarry = 10;
-      g.noRedThisRound       = false;
-      g.allowYellowThisRound = true;
-      g.lootRateMs  = 1000;
-      g.lootPerTick = 4;
-
-      // New 2-minute round with +100 from this point
-      g.roundStartScore = g.teamScore;
-      g.roundGoal       = g.roundStartScore + 40;   // absolute threshold
-      g.roundEndAt      = now + 120000UL;            // 2:00
-
-      // Randomly re-split total loot across stations
-      splitInventoryRandom(g, g.roundGoal);
-      g.pending.nextStation = 1;   // drip stations again
-      g.pending.needScore   = true;
-
-      // Randomized cadence dwell ranges for GREEN/RED.
-      // (Adjust these ranges as you like; YELLOW kept fixed but range fields set equal for future proofing)
-      g.greenMsMin = 14000;  g.greenMsMax = 18000;     // ~7–13 s
-      g.redMsMin   = 6500;  g.redMsMax   = 8000;     // ~6–11 s
-      g.yellowMsMin= g.yellowMs; g.yellowMsMax = g.yellowMs;  // no randomization (yet)
-
-      bonusResetForRound(g, now);
-      enterGreen(g);
-      bcastRoundStatus(g);
-    } else { // idx >= 4
-      // ---------- ROUND 4: Option A + Yellow fake-outs ----------
-      g.maxCarry = 10;
-      g.noRedThisRound       = false;
-      g.allowYellowThisRound = true;
-      g.lootRateMs  = 1000;
-      g.lootPerTick = 4;
-
-      // New 2-minute round with +100 from this point
-      g.roundStartScore = g.teamScore;
-      g.roundGoal       = g.roundStartScore + 40;   // absolute threshold
-      g.roundEndAt      = now + 120000UL;            // 2:00
-
-      // Randomly re-split total loot across stations
-      splitInventoryRandom(g, g.roundGoal);
-      g.pending.nextStation = 1;   // drip stations again
-      g.pending.needScore   = true;
-      g.roundEndAt = (g.gameEndAt > now) ? g.gameEndAt : now;
-      g.noRedThisRound       = false;
-      g.allowYellowThisRound = true;
-
-      const uint32_t redMin  = (g.pirArmDelayMs > 6000) ? g.pirArmDelayMs : 6000;
-      g.redMsMin   = redMin;                 g.redMsMax   = (7000 > redMin) ? 7000 : redMin;
-      g.greenMsMin = 10000;                  g.greenMsMax = 14000;
- 
-      // Fake-out tease range via existing fields (0.5–0.9 s)
-      g.yellowMsMin = 3000; g.yellowMsMax = 3000;  // keep g.yellowMs at its global (3000 ms)
-
-      bonusResetForRound(g, now);
-      enterGreen(g);
-      bcastRoundStatus(g);
-    }
+    return;
   }
+
+  if (idx == 2) {
+    // ---------- ROUND 2 ----------
+    g.maxCarry = 20;
+    g.noRedThisRound       = false;
+    g.allowYellowThisRound = true;
+    g.lootRateMs  = 1000;
+    g.lootPerTick = 4;
+
+    g.roundStartScore = g.teamScore;
+    g.roundGoal       = g.roundStartScore + 40;
+    g.roundEndAt      = now + 120000UL;
+
+    endAndClearHoldsAndCarried(g);
+
+    // EVEN split of THIS ROUND'S total
+    const uint16_t roundTotal = (uint16_t)(g.roundGoal - g.roundStartScore);
+    uint16_t base = roundTotal / 5, rem = roundTotal % 5;
+    for (uint8_t sid = 1; sid <= 5; ++sid) {
+      uint16_t x = base + (rem ? 1 : 0); if (rem) rem--;
+      if (x > 56) x = 56;
+      g.stationCapacity[sid]  = 56;
+      g.stationInventory[sid] = x;
+    }
+
+    g.pending.nextStation = 1;
+    g.pending.needScore   = true;
+
+    bonusResetForRound(g, now);
+    enterGreen(g);
+    bcastRoundStatus(g);
+    return;
+  }
+
+  if (idx == 3) {
+    // ---------- ROUND 3 ----------
+    g.maxCarry = 10;
+    g.noRedThisRound       = false;
+    g.allowYellowThisRound = true;
+    g.lootRateMs  = 1000;
+    g.lootPerTick = 4;
+
+    g.roundStartScore = g.teamScore;
+    g.roundGoal       = g.roundStartScore + 40;
+    g.roundEndAt      = now + 120000UL;
+
+    endAndClearHoldsAndCarried(g);
+
+    // RANDOM split of THIS ROUND'S total
+    const uint16_t roundTotal = (uint16_t)(g.roundGoal - g.roundStartScore);
+    splitInventoryRandom(g, roundTotal);
+
+    // Your R3 cadence feel
+    g.greenMsMin = 14000;  g.greenMsMax = 18000;
+    g.redMsMin   = 6500;   g.redMsMax   = 8000;
+    g.yellowMsMin= g.yellowMs; g.yellowMsMax = g.yellowMs;
+
+    g.pending.nextStation = 1;
+    g.pending.needScore   = true;
+
+    bonusResetForRound(g, now);
+    enterGreen(g);
+    bcastRoundStatus(g);
+    return;
+  }
+
+  // ---------- ROUND 4 ----------
+  g.maxCarry = 10;
+  g.noRedThisRound       = false;
+  g.allowYellowThisRound = true;
+  g.lootRateMs  = 1000;
+  g.lootPerTick = 4;
+
+  g.roundStartScore = g.teamScore;
+  g.roundGoal       = g.roundStartScore + 40;
+  g.roundEndAt      = (g.gameEndAt > now) ? g.gameEndAt : now; // remainder
+
+  endAndClearHoldsAndCarried(g);
+
+  // RANDOM split of THIS ROUND'S total
+  {
+    const uint16_t roundTotal = (uint16_t)(g.roundGoal - g.roundStartScore);
+    splitInventoryRandom(g, roundTotal);
+  }
+
+  const uint32_t redMin  = (g.pirArmDelayMs > 6000) ? g.pirArmDelayMs : 6000;
+  g.redMsMin   = redMin;                 g.redMsMax   = (7000 > redMin) ? 7000 : redMin;
+  g.greenMsMin = 10000;                  g.greenMsMax = 14000;
+  g.yellowMsMin= 3000;                   g.yellowMsMax = 3000;
+
+  g.pending.nextStation = 1;
+  g.pending.needScore   = true;
+
+  bonusResetForRound(g, now);
+  enterGreen(g);
+  bcastRoundStatus(g);
 }
 
 void modeClassicForceRound(Game& g, uint8_t idx, bool playWin) {

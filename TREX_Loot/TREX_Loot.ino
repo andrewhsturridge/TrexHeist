@@ -405,14 +405,11 @@ static void drawRingSymmetricLit(uint8_t nLit, uint32_t color) {
     idx = (idx + RING_ROTATE) % 14;
     ring.setPixelColor(idx, color);
   }
-  pumpAudio();
   ring.show();
-  pumpAudio();
 }
 
 void drawRingCarried(uint8_t cur, uint8_t maxC) {
   if (fullBlinkActive || otaInProgress) return;  // OTA owns the ring
-  pumpAudio();
 
   static uint8_t lastLit = 255;
   const uint16_t n = ring.numPixels(); // 14
@@ -447,8 +444,6 @@ void drawGaugeInventory(uint16_t inventory, uint16_t capacity) {
       capacity  == lastCapPainted &&
       colorState == lastGaugeColor) return;
 
-  pumpAudio();
-
   // 1:1 mapping — each loot lights one LED on the gauge
   uint16_t lit = (inventory > GAUGE_LEN) ? GAUGE_LEN : inventory;
 
@@ -458,7 +453,6 @@ void drawGaugeInventory(uint16_t inventory, uint16_t capacity) {
 
   for (uint16_t i = 0; i < GAUGE_LEN; ++i) {
     gauge.setPixelColor(i, (i < lit) ? col : OFF);
-    if ((i & 7) == 0) pumpAudio();
   }
 
   // Inject the empty-station overlay (LED 0 white) into the same frame
@@ -470,7 +464,6 @@ void drawGaugeInventory(uint16_t inventory, uint16_t capacity) {
   }
 
   gauge.show();
-  pumpAudio();
 
   // MOSFET lamp follows inventory: off when out of loot
   if (inventory == 0) digitalWrite(PIN_MOSFET, LOW);
@@ -484,52 +477,34 @@ void drawGaugeInventory(uint16_t inventory, uint16_t capacity) {
 
 void drawGaugeInventoryRainbowAnimated(uint16_t inventory, uint16_t capacity, uint16_t phase) {
   if (otaInProgress) return;
-
-  // YELLOW/RED override rainbow entirely (shouldn't be called in those states via drawGaugeAuto),
-  // but guard anyway to be safe.
   if (g_lightState != LightState::GREEN) { drawGaugeInventory(inventory, capacity); return; }
-
-  // Respect YELLOW off-phase just in case someone calls us directly (keeps behavior consistent)
   if (g_lightState == LightState::YELLOW && yellowBlinkActive && !yellowBlinkOn) {
-    fillGauge(OFF);
-    return;
+    fillGauge(OFF); return;
   }
 
-  // We animate, so ignore the normal cache (always repaint).
-  pumpAudio();
-
-  // 1:1 inventory → LEDs mapping (same as normal). Clamp lit.
   uint16_t lit = (inventory > GAUGE_LEN) ? GAUGE_LEN : inventory;
 
-  // Animated HSV wheel across the lit portion; add a phase offset so it "moves."
-  // Use modest per-pixel hue spacing to get a smoother gradient; phase scrolls it.
+  // Dense rainbow: double the spatial frequency for extra pop
   for (uint16_t i = 0; i < GAUGE_LEN; ++i) {
     if (i < lit) {
-      // Spread hue across the bar, then offset by phase
-      uint32_t baseHue = (uint32_t)i * 65535UL / GAUGE_LEN;   // 0..65535
-      uint16_t hue     = (uint16_t)(baseHue + phase);         // wrap automatically
-      // Slightly lower saturation/value to reduce bloom
-      uint32_t c = gauge.ColorHSV(hue, 200 /*sat*/, 255 /*val*/);
+      uint32_t baseHue = ((uint32_t)i * 2u * 65535u) / GAUGE_LEN; // ×2 density
+      uint16_t hue     = (uint16_t)(baseHue + phase);
+      uint32_t c = gauge.ColorHSV(hue, /*sat*/255, /*val*/255);   // full saturation/brightness
       gauge.setPixelColor(i, c);
     } else {
       gauge.setPixelColor(i, 0);
     }
-    if ((i & 7) == 0) pumpAudio();
   }
 
-  // Keep your empty overlay (LED 0 white blink) in the same frame
-  if (emptyBlinkActive && tagPresent && inv == 0) {
+  // Keep empty overlay behavior
+  if (emptyBlinkActive && tagPresent && inventory == 0) {
     gauge.setPixelColor(0, emptyBlinkOn ? WHITE : OFF);
   }
 
   gauge.show();
-  pumpAudio();
 
-  // MOSFET follows inventory (same as normal)
   if (inventory == 0) digitalWrite(PIN_MOSFET, LOW);
   else                digitalWrite(PIN_MOSFET, HIGH);
-
-  // Do not touch the normal cache variables here; animated mode repaints each frame.
 }
 
 // Only show rainbow when BONUS is active, there is inventory, and we are GREEN.
@@ -558,15 +533,12 @@ inline void tickBonusRainbow() {
 }
 
 void fillRing(uint32_t c) {
-  pumpAudio();
   ringCarriedValid = false;
   for (uint16_t i=0;i<ring.numPixels();++i) ring.setPixelColor(i,c);
   ring.show();
-  pumpAudio();
 }
 
 void fillGauge(uint32_t c) {
-  pumpAudio();
   for (uint16_t i=0;i<GAUGE_LEN;++i) gauge.setPixelColor(i,c);
 
   // Inject overlay into this same frame (no second show)
@@ -585,9 +557,7 @@ inline void startFullBlinkImmediate() {
   fullBlinkOn     = true;
   fullBlinkLastMs = millis();
   blinkHoldId     = holdId;
-  pumpAudio();
   fillRing(YELLOW);
-  pumpAudio();
 }
 inline void stopFullBlink() { fullBlinkActive = false; fullBlinkOn = false; }
 inline void tickFullBlink() {
@@ -596,11 +566,8 @@ inline void tickFullBlink() {
   if ((now - fullBlinkLastMs) >= FULL_BLINK_PERIOD_MS) {
     fullBlinkLastMs = now;
     fullBlinkOn = !fullBlinkOn;
-    pumpAudio();
     fillRing(fullBlinkOn ? YELLOW : OFF);
-    pumpAudio();
-  } else {
-    pumpAudio();                                   // NEW: drip-feed between flips
+  } else {                                   // NEW: drip-feed between flips
   }
 }
 
@@ -668,7 +635,6 @@ inline void applyEmptyOverlay() {
   // Paint just LED 0: white when ON, off when OFF
   gauge.setPixelColor(0, emptyBlinkOn ? WHITE : OFF);
   gauge.show();
-  pumpAudio();
 }
 
 inline void startEmptyBlink() {
@@ -692,7 +658,6 @@ inline void tickEmptyBlink() {
     emptyBlinkOn = !emptyBlinkOn;
     forceGaugeRepaint();
   } else {
-    pumpAudio(); // drip between flips
   }
 }
 
@@ -962,9 +927,7 @@ void sendHoldStart(const TrexUid& uid) {
   holdId = (uint32_t)esp_random();
   packHeader((uint8_t)MsgType::LOOT_HOLD_START, sizeof(LootHoldStartPayload), buf);
   auto* p = (LootHoldStartPayload*)(buf + sizeof(MsgHeader));
-  p->holdId    = holdId;
-  p->uid       = uid;
-  p->stationId = STATION_ID;
+  p->holdId = holdId; p->uid = uid; p->stationId = STATION_ID;
   Transport::sendToServer(buf, sizeof(buf));
 }
 
@@ -1037,7 +1000,6 @@ void onRx(const uint8_t* data, uint16_t len) {
 
         // ***** HERE: start audio with bonus clip if this station is bonus *****
         startLootAudio(s_isBonusNow);
-        pumpAudio();
 
         if (carried >= maxCarry) {
           if (!fullAnnounced || blinkHoldId != p->holdId) {
@@ -1057,13 +1019,11 @@ void onRx(const uint8_t* data, uint16_t len) {
           drawGaugeAuto(inv, cap);
           nextGaugeDrawAtMs = now + 20;
         }
-        pumpAudio();
 
       } else {
         // Not accepted -> ensure visuals sane; don't spam audio
         holdActive = false;
         stopAudio();
-        pumpAudio();
 
         if (carried >= maxCarry) {
           if (!fullAnnounced || blinkHoldId != p->holdId) {
@@ -1102,7 +1062,6 @@ void onRx(const uint8_t* data, uint16_t len) {
       if (carried >= maxCarry) {
         if (!fullAnnounced || blinkHoldId != p->holdId) {
           startFullBlinkImmediate();
-          pumpAudio();
           fullAnnounced = true;
           blinkHoldId   = p->holdId;
         }
@@ -1110,7 +1069,6 @@ void onRx(const uint8_t* data, uint16_t len) {
         if (fullBlinkActive) stopFullBlink();
         fullAnnounced = false;
         drawRingCarried(carried, maxCarry);
-        pumpAudio();
       }
 
       // Throttled gauge render — GREEN shows rainbow automatically, YELLOW/RED override
@@ -1120,7 +1078,6 @@ void onRx(const uint8_t* data, uint16_t len) {
         nextGaugeDrawAtMs = now + 20;
       }
 
-      pumpAudio();
       break;
     }
 
@@ -1137,7 +1094,6 @@ void onRx(const uint8_t* data, uint16_t len) {
       // For bonus (one-shot), let audio finish; in normal mode we stop immediately
       if (!g_audioOneShot) {
         stopAudio();
-        pumpAudio();
       }
 
       fullAnnounced = false;
