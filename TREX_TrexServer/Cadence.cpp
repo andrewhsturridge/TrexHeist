@@ -87,12 +87,11 @@ void enterRed(Game& g) {
 void tickCadence(Game& g, uint32_t now) {
   if (g.phase != Phase::PLAYING) return;
 
-  // NEW: advance bonus scheduler/expiry each tick
+  // bonus scheduler/expiry
   tickBonusDirector(g, now);
 
   if (now < g.nextSwitch) return;
 
-  // NO-RED round (R1)
   if (g.noRedThisRound) {
     if (g.allowYellowThisRound) {
       (g.light == LightState::GREEN) ? enterYellow(g) : enterGreen(g);
@@ -102,20 +101,18 @@ void tickCadence(Game& g, uint32_t now) {
     return;
   }
 
-  // Full cadence (R2/3/4)
   if (g.light == LightState::GREEN) { enterYellow(g); return; }
 
   if (g.light == LightState::YELLOW) {
     if (g.roundIndex == 4) {
-      const uint32_t yBase = g.yellowMs ? g.yellowMs : 3000;     // 3s to RED
-      const uint32_t dur   = g.nextSwitch - g.lastFlipMs;        // scheduled YELLOW
-      (dur < yBase) ? enterGreen(g) : enterRed(g);               // short => fake-out
+      const uint32_t yBase = g.yellowMs ? g.yellowMs : 3000;
+      const uint32_t dur   = g.nextSwitch - g.lastFlipMs;
+      (dur < yBase) ? enterGreen(g) : enterRed(g);
     } else {
       enterRed(g);
     }
     return;
   }
 
-  // RED -> GREEN
   enterGreen(g);
 }

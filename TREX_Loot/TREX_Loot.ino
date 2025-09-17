@@ -193,6 +193,11 @@ bool     emptyBlinkActive = false;
 bool     emptyBlinkOn     = false;
 uint32_t emptyBlinkLastMs = 0;
 
+// Bonus rainbow animation state (client-side)
+static uint16_t g_rainbowPhase = 0;               // 0..65535 hue offset
+constexpr uint16_t RAINBOW_STEP    = 768;         // hue advance per frame (~fast smooth)
+constexpr uint16_t RAINBOW_FRAME_MS= 33;          // ~30 FPS
+
 /* ── Game/hold state (server-auth) ───────────────────── */
 volatile bool gameActive = true;     // flipped by GAME_OVER/START in onRx()
 volatile bool holdActive = false;    // true only after accepted ACK
@@ -222,6 +227,11 @@ uint16_t g_seq = 1;            // outgoing message seq
 static bool stationInited = false;
 
 static bool s_isBonusNow = false;
+
+// One-shot audio flag: true = do not auto-restart clip and don't stop on HOLD_END/tag removal
+static bool g_audioOneShot = false;
+
+static uint32_t g_bonusExclusiveUntilMs = 0;
 
 /* ── OTA campaign state ──────────────────────────────── */
 bool      otaInProgress     = false;
@@ -323,10 +333,16 @@ void stopAudio() {
 
 inline void handleAudio() {
   if (!playing || !decoder) return;
-  if (!decoder->loop()) {       // EOF or starvation
+  if (!decoder->loop()) {                 // EOF or starvation
     decoder->stop();
-    playing = openChain();      // reopen and continue
-    if (!playing) Serial.println("[LOOT] audio re-begin failed");
+    if (g_audioOneShot) {
+      // One-shot: do NOT auto-restart; end naturally
+      playing = false;
+    } else {
+      // Normal: re-open and continue looping
+      playing = openChain();
+      if (!playing) Serial.println("[LOOT] audio re-begin failed");
+    }
   }
 }
 
@@ -340,6 +356,9 @@ static inline void selectClip(bool bonus) {
 }
 
 static inline bool startLootAudio(bool bonus) {
+  g_audioOneShot = bonus;         // tap = one-shot
+  if (bonus) g_bonusExclusiveUntilMs = millis() + 350;   // first 350 ms: be gentle
+  else       g_bonusExclusiveUntilMs = 0;
   selectClip(bonus);
   return startAudio();
 }
@@ -463,20 +482,79 @@ void drawGaugeInventory(uint16_t inventory, uint16_t capacity) {
   gaugeCacheValid = true;
 }
 
-void drawGaugeInventoryRainbow(uint16_t inventory, uint16_t capacity) {
-  uint16_t lit = 0;
-  if (capacity > 0) {
-    lit = (uint16_t)((uint32_t)inventory * GAUGE_LEN + (capacity - 1)) / capacity; // ceil
+void drawGaugeInventoryRainbowAnimated(uint16_t inventory, uint16_t capacity, uint16_t phase) {
+  if (otaInProgress) return;
+
+  // YELLOW/RED override rainbow entirely (shouldn't be called in those states via drawGaugeAuto),
+  // but guard anyway to be safe.
+  if (g_lightState != LightState::GREEN) { drawGaugeInventory(inventory, capacity); return; }
+
+  // Respect YELLOW off-phase just in case someone calls us directly (keeps behavior consistent)
+  if (g_lightState == LightState::YELLOW && yellowBlinkActive && !yellowBlinkOn) {
+    fillGauge(OFF);
+    return;
   }
+
+  // We animate, so ignore the normal cache (always repaint).
+  pumpAudio();
+
+  // 1:1 inventory → LEDs mapping (same as normal). Clamp lit.
+  uint16_t lit = (inventory > GAUGE_LEN) ? GAUGE_LEN : inventory;
+
+  // Animated HSV wheel across the lit portion; add a phase offset so it "moves."
+  // Use modest per-pixel hue spacing to get a smoother gradient; phase scrolls it.
   for (uint16_t i = 0; i < GAUGE_LEN; ++i) {
     if (i < lit) {
-      uint16_t hue = (uint16_t)((i * 65535UL) / GAUGE_LEN);
-      gauge.setPixelColor(i, gauge.ColorHSV(hue));   // uses NeoPixel HSV helper
+      // Spread hue across the bar, then offset by phase
+      uint32_t baseHue = (uint32_t)i * 65535UL / GAUGE_LEN;   // 0..65535
+      uint16_t hue     = (uint16_t)(baseHue + phase);         // wrap automatically
+      // Slightly lower saturation/value to reduce bloom
+      uint32_t c = gauge.ColorHSV(hue, 200 /*sat*/, 255 /*val*/);
+      gauge.setPixelColor(i, c);
     } else {
       gauge.setPixelColor(i, 0);
     }
+    if ((i & 7) == 0) pumpAudio();
   }
+
+  // Keep your empty overlay (LED 0 white blink) in the same frame
+  if (emptyBlinkActive && tagPresent && inv == 0) {
+    gauge.setPixelColor(0, emptyBlinkOn ? WHITE : OFF);
+  }
+
   gauge.show();
+  pumpAudio();
+
+  // MOSFET follows inventory (same as normal)
+  if (inventory == 0) digitalWrite(PIN_MOSFET, LOW);
+  else                digitalWrite(PIN_MOSFET, HIGH);
+
+  // Do not touch the normal cache variables here; animated mode repaints each frame.
+}
+
+// Only show rainbow when BONUS is active, there is inventory, and we are GREEN.
+// Otherwise fall back to the normal draw (YELLOW and RED always override).
+inline void drawGaugeAuto(uint16_t inventory, uint16_t capacity) {
+  if (s_isBonusNow && inventory > 0 && g_lightState == LightState::GREEN) {
+    drawGaugeInventoryRainbowAnimated(inventory, capacity, g_rainbowPhase);
+  } else {
+    drawGaugeInventory(inventory, capacity);
+  }
+}
+
+inline void tickBonusRainbow() {
+  // Only animate when: game active, bonus on THIS station, we have inventory, and light is GREEN
+  if (!(gameActive && s_isBonusNow && inv > 0 && g_lightState == LightState::GREEN)) return;
+
+  uint32_t now = millis();
+  if ((int32_t)(now - nextGaugeDrawAtMs) < 0) return;  // reuse your 20ms throttle
+
+  g_rainbowPhase += RAINBOW_STEP;                      // scroll the hues
+  drawGaugeInventoryRainbowAnimated(inv, cap, g_rainbowPhase);
+
+  // Pick frame spacing: gentle during the exclusive window, then normal
+  const uint16_t frameMs = (millis() < g_bonusExclusiveUntilMs) ? 60 : RAINBOW_FRAME_MS;
+  nextGaugeDrawAtMs = now + frameMs;
 }
 
 void fillRing(uint32_t c) {
@@ -579,7 +657,7 @@ inline void tickYellowBlink() {
 // ── Empty-station blink (first gauge LED white) ─────────────
 inline void forceGaugeRepaint() {
   gaugeCacheValid = false;         // bust cache so we truly repaint
-  drawGaugeInventory(inv, cap);    // one frame, one show, overlay included
+  drawGaugeAuto(inv, cap);         // rainbow if bonus
 }
 
 inline void applyEmptyOverlay() {
@@ -930,79 +1008,82 @@ void onRx(const uint8_t* data, uint16_t len) {
         fillRing(RED);
       }
 
-      // Don’t clear pipes to 0 until we know the inventory and not blinking yellow
-      if (stationInited && gameActive && !yellowBlinkActive) drawGaugeInventory(inv, cap);
+      // IMPORTANT: honor bonus rainbow for idle repaints, unless YELLOW OFF phase
+      if (stationInited && gameActive && !yellowBlinkActive) {
+        drawGaugeAuto(inv, cap);
+      }
       break;
     }
 
-case MsgType::LOOT_HOLD_ACK: {
-  if (h->payloadLen != sizeof(LootHoldAckPayload)) break;
-  auto* p = (const LootHoldAckPayload*)(data + sizeof(MsgHeader));
-  if (p->holdId != holdId) break;
 
-  // Update state from ACK
-  maxCarry = p->maxCarry;
-  carried  = (p->carried > maxCarry) ? maxCarry : p->carried;  // clamp
-  inv      = p->inventory;
-  cap      = p->capacity;
-  stationInited = true;
+    case MsgType::LOOT_HOLD_ACK: {
+      if (h->payloadLen != sizeof(LootHoldAckPayload)) break;
+      auto* p = (const LootHoldAckPayload*)(data + sizeof(MsgHeader));
+      if (p->holdId != holdId) break;
 
-  // Keep/clear empty indicator based on latest inventory
-  if (tagPresent && inv == 0) startEmptyBlink();
-  else                        stopEmptyBlink();
+      // Update state from ACK
+      maxCarry = p->maxCarry;
+      carried  = (p->carried > maxCarry) ? maxCarry : p->carried;  // clamp
+      inv      = p->inventory;
+      cap      = p->capacity;
+      stationInited = true;
 
-  if (p->accepted) {
-    holdActive = true;
+      // Keep/clear empty indicator based on latest inventory
+      if (tagPresent && inv == 0) startEmptyBlink();
+      else                        stopEmptyBlink();
 
-    // ***** HERE: start audio with bonus clip if this station is bonus *****
-    startLootAudio(s_isBonusNow);
-    pumpAudio();
+      if (p->accepted) {
+        holdActive = true;
 
-    if (carried >= maxCarry) {
-      if (!fullAnnounced || blinkHoldId != p->holdId) {
-        startFullBlinkImmediate();   // one-shot full indicator
-        fullAnnounced = true;
-        blinkHoldId   = p->holdId;
+        // ***** HERE: start audio with bonus clip if this station is bonus *****
+        startLootAudio(s_isBonusNow);
+        pumpAudio();
+
+        if (carried >= maxCarry) {
+          if (!fullAnnounced || blinkHoldId != p->holdId) {
+            startFullBlinkImmediate();   // one-shot full indicator
+            fullAnnounced = true;
+            blinkHoldId   = p->holdId;
+          }
+        } else {
+          if (fullBlinkActive) stopFullBlink();
+          fullAnnounced = false;
+          drawRingCarried(carried, maxCarry);
+        }
+
+        uint32_t now = millis();
+        if ((int32_t)(now - nextGaugeDrawAtMs) >= 0) {
+          // Rainbow gauge is handled in LOOT_TICK/STATION_UPDATE when s_isBonusNow is true
+          drawGaugeAuto(inv, cap);
+          nextGaugeDrawAtMs = now + 20;
+        }
+        pumpAudio();
+
+      } else {
+        // Not accepted -> ensure visuals sane; don't spam audio
+        holdActive = false;
+        stopAudio();
+        pumpAudio();
+
+        if (carried >= maxCarry) {
+          if (!fullAnnounced || blinkHoldId != p->holdId) {
+            startFullBlinkImmediate();
+            fullAnnounced = true;
+            blinkHoldId   = p->holdId;
+          }
+          uint32_t now = millis();
+          if ((int32_t)(now - nextGaugeDrawAtMs) >= 0) {
+            drawGaugeInventory(inv, cap);
+            nextGaugeDrawAtMs = now + 20;
+          }
+        } else {
+          fullAnnounced = false;
+          stopFullBlink();
+          fillRing(RED);
+        }
       }
-    } else {
-      if (fullBlinkActive) stopFullBlink();
-      fullAnnounced = false;
-      drawRingCarried(carried, maxCarry);
+      break;
     }
-
-    uint32_t now = millis();
-    if ((int32_t)(now - nextGaugeDrawAtMs) >= 0) {
-      // Rainbow gauge is handled in LOOT_TICK/STATION_UPDATE when s_isBonusNow is true
-      drawGaugeInventory(inv, cap);
-      nextGaugeDrawAtMs = now + 20;
-    }
-    pumpAudio();
-
-  } else {
-    // Not accepted -> ensure visuals sane; don't spam audio
-    holdActive = false;
-    stopAudio();
-    pumpAudio();
-
-    if (carried >= maxCarry) {
-      if (!fullAnnounced || blinkHoldId != p->holdId) {
-        startFullBlinkImmediate();
-        fullAnnounced = true;
-        blinkHoldId   = p->holdId;
-      }
-      uint32_t now = millis();
-      if ((int32_t)(now - nextGaugeDrawAtMs) >= 0) {
-        drawGaugeInventory(inv, cap);
-        nextGaugeDrawAtMs = now + 20;
-      }
-    } else {
-      fullAnnounced = false;
-      stopFullBlink();
-      fillRing(RED);
-    }
-  }
-  break;
-}
 
     case MsgType::LOOT_TICK: {
       if (h->payloadLen != sizeof(LootTickPayload)) break;
@@ -1017,10 +1098,10 @@ case MsgType::LOOT_HOLD_ACK: {
       if (tagPresent && inv == 0) startEmptyBlink();
       else                        stopEmptyBlink();
 
-      // Full handling + ring update (unchanged)
+      // Full handling + ring update
       if (carried >= maxCarry) {
         if (!fullAnnounced || blinkHoldId != p->holdId) {
-          startFullBlinkImmediate();      // one-shot on first time hitting full
+          startFullBlinkImmediate();
           pumpAudio();
           fullAnnounced = true;
           blinkHoldId   = p->holdId;
@@ -1032,14 +1113,10 @@ case MsgType::LOOT_HOLD_ACK: {
         pumpAudio();
       }
 
-      // Throttled gauge render — swap to rainbow only when bonus && inv>0
+      // Throttled gauge render — GREEN shows rainbow automatically, YELLOW/RED override
       uint32_t now = millis();
       if ((int32_t)(now - nextGaugeDrawAtMs) >= 0) {
-        if (s_isBonusNow && inv > 0) {
-          drawGaugeInventoryRainbow(inv, cap);   // new helper below
-        } else {
-          drawGaugeInventory(inv, cap);
-        }
+        drawGaugeAuto(inv, cap);
         nextGaugeDrawAtMs = now + 20;
       }
 
@@ -1056,10 +1133,14 @@ case MsgType::LOOT_HOLD_ACK: {
 
       holdActive = false;
       holdId     = 0;
-      stopAudio();
-      pumpAudio();
 
-      fullAnnounced = false;              // reset one-shot guard
+      // For bonus (one-shot), let audio finish; in normal mode we stop immediately
+      if (!g_audioOneShot) {
+        stopAudio();
+        pumpAudio();
+      }
+
+      fullAnnounced = false;
 
       if (tagPresent && carried >= maxCarry) {
         if (!fullBlinkActive) startFullBlinkImmediate();
@@ -1067,7 +1148,6 @@ case MsgType::LOOT_HOLD_ACK: {
         stopFullBlink();
         fillRing(RED);
       }
-      // Gauge already reflects latest inv from final TICK; no repaint needed here
       break;
     }
 
@@ -1078,8 +1158,7 @@ case MsgType::LOOT_HOLD_ACK: {
         inv = p->inventory; cap = p->capacity;
         stationInited = true;
         if (gameActive && !holdActive && !tagPresent) {
-          if (s_isBonusNow && inv > 0) drawGaugeInventoryRainbow(inv, cap);
-          else                         drawGaugeInventory(inv, cap);
+          drawGaugeAuto(inv, cap);   // GREEN→rainbow, else state-color
         }
       }
       Serial.printf("[STATION_UPDATE] id=%u inv=%u cap=%u\n", p->stationId, inv, cap);
@@ -1168,6 +1247,12 @@ case MsgType::LOOT_HOLD_ACK: {
       if (h->payloadLen != sizeof(BonusUpdatePayload)) break;
       auto* p = (const BonusUpdatePayload*)(data + sizeof(MsgHeader));
       s_isBonusNow = ((p->mask >> STATION_ID) & 0x1) != 0;
+
+      // Immediate repaint so the gauge reflects bonus state right away
+      if (gameActive && stationInited && !otaInProgress) {
+        gaugeCacheValid = false;
+        drawGaugeAuto(inv, cap);
+      }
       break;
     }
 
@@ -1213,7 +1298,7 @@ void setup() {
 
   i2sOut = new AudioOutputI2S(0, AudioOutputI2S::EXTERNAL_I2S);
   i2sOut->SetPinout(PIN_I2S_BCLK, PIN_I2S_LRCLK, PIN_I2S_DOUT);
-  i2sOut->SetGain(1.0f);
+  i2sOut->SetGain(0.6f);
 
 #if TREX_AUDIO_PROGMEM
   // First construction (open state = true)
@@ -1332,18 +1417,26 @@ void loop() {
       tagPresent = false;
       absentStartMs = 0;
       sendHoldStop();
-      stopAudio();
+
+      // For bonus (one-shot), let audio finish after tap; otherwise stop now
+      if (!g_audioOneShot) stopAudio();
+
       stopFullBlink();
-      stopEmptyBlink();       // ensure the empty indicator stops
+      stopEmptyBlink();
       fillRing(RED);
     }
   }
 
-  // Audio keep-alive (only while a hold is accepted)
-  if (gameActive && holdActive) handleAudio();
-  else if (playing) stopAudio();
+  // Audio keep-alive
+  if (playing) handleAudio();
+
+  // In normal (looping) mode, stop audio if no active hold
+  if (!g_audioOneShot && !holdActive && playing) {
+    stopAudio();
+  }
 
   tickFullBlink();
   tickYellowBlink();
   tickEmptyBlink();
+  tickBonusRainbow();
 }

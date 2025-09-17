@@ -1,5 +1,5 @@
 #include "Bonus.h"
-#include "Net.h"          // bcastBonusUpdate, bcastStation, sendLootTick, sendHoldEnd
+#include "Net.h"
 #include <Arduino.h>
 
 static inline uint32_t jittered(uint32_t mean, uint32_t jitter) {
@@ -23,7 +23,7 @@ static inline BonusParams paramsForRound(uint8_t r) {
   if (r == 3) {
     p.kAll = true;  p.maxConcurrent = 5; p.maxSpawnsPerRound = 3;
     p.durationMs = 12000; p.intervalMeanMs = 45000; p.intervalJitterMs = 10000;
-  } else {
+  } else { // r == 4 (only rounds 3/4 spawn)
     p.kAll = false; p.maxConcurrent = 1; p.maxSpawnsPerRound = 3;
     p.durationMs = 10000; p.intervalMeanMs = 35000; p.intervalJitterMs =  8000;
   }
@@ -32,7 +32,7 @@ static inline BonusParams paramsForRound(uint8_t r) {
 
 void bonusResetForRound(Game& g, uint32_t now) {
   g.bonusActiveMask = 0;
-  for (int i=0; i<MAX_STATIONS; ++i) g.bonusEndsAt[i] = 0;
+  for (int i=1;i<=MAX_STATIONS;++i) g.bonusEndsAt[i] = 0;
   g.bonusSpawnsThisRound = 0;
   if (g.roundIndex == 3 || g.roundIndex == 4) {
     auto p = paramsForRound(g.roundIndex);
@@ -40,47 +40,25 @@ void bonusResetForRound(Game& g, uint32_t now) {
   } else {
     g.bonusNextSpawnAt = 0;
   }
-  bcastBonusUpdate(g); // clear UI state on clients
+  bcastBonusUpdate(g); // clear any stale UI
 }
 
-void tickBonusDirector(Game& g, uint32_t now) {
-  // 1) Expire ended or empty stations immediately
-  bool dirty = false;
-  for (uint8_t sid=1; sid<=MAX_STATIONS; ++sid) {
-    if (g.bonusActiveMask & (1u<<sid)) {
-      const bool ttlOver = (g.bonusEndsAt[sid] > 0) && (now >= g.bonusEndsAt[sid]);
-      const bool empty   = (g.stationInventory[sid] == 0);
-      if (ttlOver || empty) {
-        g.bonusActiveMask &= ~(1u<<sid);
-        g.bonusEndsAt[sid] = 0;
-        dirty = true;
-      }
-    }
+static void spawnNow(Game& g, uint32_t now, const BonusParams& p, bool obeyCap=true) {
+  // Respect concurrency cap
+  if (obeyCap) {
+    uint32_t m = g.bonusActiveMask; uint8_t active=0; while (m){ m&=(m-1); ++active; }
+    if (active >= p.maxConcurrent) return;
   }
 
-  if (dirty) bcastBonusUpdate(g);
-  if (g.phase != Phase::PLAYING) return;
-  if (!(g.roundIndex == 3 || g.roundIndex == 4)) return;
-
-  const BonusParams p = paramsForRound(g.roundIndex);
-
-  // 2) Respect concurrency / per-round caps
-  uint8_t active=0; { uint32_t m=g.bonusActiveMask; while (m) { m&=(m-1); ++active; } }
-  if (active >= p.maxConcurrent) return;
-  if (g.bonusSpawnsThisRound >= p.maxSpawnsPerRound) return;
-
-  if (g.bonusNextSpawnAt == 0 || now < g.bonusNextSpawnAt) return;
-
-  // 3) Build eligible set (skip empty and already-bonus)
+  // Eligible set (skip empty + already bonus)
   uint8_t elig[MAX_STATIONS]; uint8_t eCount=0;
   for (uint8_t sid=1; sid<=MAX_STATIONS; ++sid) {
     if ((g.bonusActiveMask & (1u<<sid)) == 0 && g.stationInventory[sid] > 0) {
       elig[eCount++] = sid;
     }
   }
-  if (eCount == 0) { g.bonusNextSpawnAt = now + 3000; return; }
+  if (eCount == 0) return;
 
-  // 4) Select stations (R3=all eligible, R4=1 random)
   if (p.kAll) {
     for (uint8_t i=0;i<eCount;++i) {
       const uint8_t sid = elig[i];
@@ -94,15 +72,55 @@ void tickBonusDirector(Game& g, uint32_t now) {
   }
 
   ++g.bonusSpawnsThisRound;
-  g.bonusNextSpawnAt = now + jittered(p.intervalMeanMs, p.intervalJitterMs);
   bcastBonusUpdate(g);
 }
 
-// === “Instant drain” at hold start (no overflow discard) ===================
+void tickBonusDirector(Game& g, uint32_t now) {
+  // Expire finished or empty immediately
+  bool dirty=false;
+  for (uint8_t sid=1; sid<=MAX_STATIONS; ++sid) {
+    if (g.bonusActiveMask & (1u<<sid)) {
+      const bool ttlOver = (g.bonusEndsAt[sid] > 0) && (now >= g.bonusEndsAt[sid]);
+      const bool empty   = (g.stationInventory[sid] == 0);
+      if (ttlOver || empty) {
+        g.bonusActiveMask &= ~(1u<<sid);
+        g.bonusEndsAt[sid] = 0;
+        dirty = true;
+      }
+    }
+  }
+  if (dirty) bcastBonusUpdate(g);
+
+  if (g.phase != Phase::PLAYING) return;
+  if (!(g.roundIndex == 3 || g.roundIndex == 4)) return;
+
+  BonusParams p = paramsForRound(g.roundIndex);
+  if (g.bonusSpawnsThisRound >= p.maxSpawnsPerRound) return;
+  if (g.bonusNextSpawnAt == 0 || now < g.bonusNextSpawnAt) return;
+
+  spawnNow(g, now, p, /*obeyCap=*/true);
+  g.bonusNextSpawnAt = now + jittered(p.intervalMeanMs, p.intervalJitterMs);
+}
+
+void bonusForceSpawn(Game& g, uint32_t now) {
+  if (!(g.roundIndex == 3 || g.roundIndex == 4)) { Serial.println("[BONUS] force ignored (not R3/R4)"); return; }
+  Serial.println("[BONUS] Starting");
+  BonusParams p = paramsForRound(g.roundIndex);
+  spawnNow(g, now, p, /*obeyCap=*/true);
+  // do not advance counters/timers here; manual trigger is ad-hoc
+}
+
+void bonusClearAll(Game& g) {
+  g.bonusActiveMask = 0;
+  for (int i=1;i<=MAX_STATIONS;++i) g.bonusEndsAt[i] = 0;
+  bcastBonusUpdate(g);
+}
+
+// Effect: instant-drain on hold start (no overflow discard)
 bool applyBonusOnHoldStart(Game& g, uint8_t playerIdx, uint8_t stationId, uint32_t holdId) {
-  if ((g.bonusActiveMask & (1u<<stationId)) == 0) return false;     // not bonus
+  if ((g.bonusActiveMask & (1u<<stationId)) == 0) return false;
   uint32_t inv = g.stationInventory[stationId];
-  if (inv == 0) return false;                                       // nothing to take
+  if (inv == 0) return false;
 
   auto &pl = g.players[playerIdx];
   if (pl.carried >= g.maxCarry) { sendHoldEnd(g, holdId, /*FULL*/0); return true; }
@@ -111,20 +129,17 @@ bool applyBonusOnHoldStart(Game& g, uint8_t playerIdx, uint8_t stationId, uint32
   uint32_t take  = (inv > space) ? space : inv;
 
   pl.carried += take;
-  g.stationInventory[stationId] = inv - take;   // remainder stays in station
+  g.stationInventory[stationId] = inv - take;
 
-  // Notify player + everyone else
   sendLootTick(g, holdId, pl.carried, g.stationInventory[stationId]);
   bcastStation(g, stationId);
 
-  // If station emptied by this drain, end its bonus immediately
   if (g.stationInventory[stationId] == 0) {
     g.bonusActiveMask &= ~(1u<<stationId);
     g.bonusEndsAt[stationId] = 0;
     bcastBonusUpdate(g);
   }
 
-  // Decide hold end: FULL if player filled; else EMPTY (station hit 0)
   if (pl.carried >= g.maxCarry) sendHoldEnd(g, holdId, /*FULL*/0);
   else                          sendHoldEnd(g, holdId, /*EMPTY*/1);
   return true;

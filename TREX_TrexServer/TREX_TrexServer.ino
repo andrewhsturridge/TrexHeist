@@ -18,6 +18,7 @@
 #include "TrexMaintenance.h"   // updated version with custom command hook
 #include "OtaCampaign.h"
 #include "GameAudio.h"
+#include "Bonus.h"
 
 // --- OTA defaults (edit these per release) ---
 #define DEFAULT_OTA_URL          "http://192.168.2.231:8000/TREX_Loot.ino.bin"
@@ -136,8 +137,9 @@ void loop() {
           DEFAULT_OTA_EXPECT_MINOR
       );
     }
-    if (c=='r' || c=='R') enterRed(g);
-    if (c=='x' || c=='X') bcastGameOver(g, /*MANUAL*/2);
+    if (c=='b' || c=='B') { bonusForceSpawn(g, millis()); }
+    if (c=='c' || c=='C') { bonusClearAll(g); }
+
 
     // ---------- NEW: Round controls ----------
     if (c=='1') { modeClassicForceRound(g, 1, /*playWin=*/false); } // jump to R1 silently
