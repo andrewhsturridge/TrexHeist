@@ -44,9 +44,10 @@
 #include "esp_ota_ops.h"
 
 #if TREX_AUDIO_PROGMEM
+  #include <AudioFileSourcePROGMEM.h>
   #include "replenish.h"
   #include "replenish_bonus.h"
-
+  #include "bonus_spawn.h"      // <— NEW: the chime that plays when station enters bonus
   // Selected clip pointers (normal by default)
   static const uint8_t* g_clipData = replenish_wav;
   static size_t         g_clipLen  = replenish_wav_len;
@@ -55,6 +56,7 @@
   #include <AudioFileSourceBuffer.h>
   constexpr char CLIP_PATH[]        = "/replenish.wav";
   constexpr char CLIP_PATH_BONUS[]  = "/replenish_bonus.wav";
+  constexpr char CLIP_PATH_SPAWN[]  = "/bonus_spawn.wav";  // <— NEW (FS path)
   static const char* g_clipPath = CLIP_PATH;
 #endif
 
@@ -227,11 +229,10 @@ uint16_t g_seq = 1;            // outgoing message seq
 static bool stationInited = false;
 
 static bool s_isBonusNow = false;
-
-// One-shot audio flag: true = do not auto-restart clip and don't stop on HOLD_END/tag removal
 static bool g_audioOneShot = false;
-
 static uint32_t g_bonusExclusiveUntilMs = 0;
+static bool     g_chimeActive = false;
+static bool     g_resumeLoopAfterChime = false;   // resume replenish loop after chime
 
 /* ── OTA campaign state ──────────────────────────────── */
 bool      otaInProgress     = false;
@@ -293,7 +294,6 @@ static void processIdentitySerial() {
 }
 
 /* ── audio helpers ────────────────────────────────────── */
-/* ── audio helpers ────────────────────────────────────── */
 static bool openChain() {
   if (decoder && decoder->isRunning()) decoder->stop();
 
@@ -335,11 +335,25 @@ inline void handleAudio() {
   if (!playing || !decoder) return;
   if (!decoder->loop()) {                 // EOF or starvation
     decoder->stop();
-    if (g_audioOneShot) {
-      // One-shot: do NOT auto-restart; end naturally
+    if (g_audioOneShot || g_chimeActive) {
+      // one-shot or chime finished
       playing = false;
+      // For spawn chime, don't resume replenish (we just ended the hold)
+      if (g_chimeActive) {
+        g_chimeActive = false;
+        g_audioOneShot = false;
+        g_resumeLoopAfterChime = false;
+      } else {
+        // regular one-shot (e.g., bonus loop one-shot if you ever use it)
+        g_audioOneShot = false;
+        if (g_resumeLoopAfterChime && holdActive) {
+          g_resumeLoopAfterChime = false;
+          selectClip(false);             // normal replenish loop
+          startAudio();
+        }
+      }
     } else {
-      // Normal: re-open and continue looping
+      // normal replenish loop: keep looping
       playing = openChain();
       if (!playing) Serial.println("[LOOT] audio re-begin failed");
     }
@@ -361,6 +375,33 @@ static inline bool startLootAudio(bool bonus) {
   else       g_bonusExclusiveUntilMs = 0;
   selectClip(bonus);
   return startAudio();
+}
+
+// Pre-empt replenish loop and play spawn chime fully, even if HOLD_END arrives.
+// Do NOT resume the loop afterwards (round just switched behavior).
+static void playBonusSpawnChime() {
+  if (g_chimeActive) return;             // already playing a chime
+  bool wasLooping = playing && !g_audioOneShot;
+
+  if (wasLooping) {
+    stopAudio();                         // cleanly stop replenish loop
+    g_resumeLoopAfterChime = false;      // do not resume after chime
+  }
+
+  g_chimeActive  = true;
+  g_audioOneShot = true;                  // ensures we don't auto-loop
+
+#if TREX_AUDIO_PROGMEM
+  const uint8_t* savedData = g_clipData; size_t savedLen = g_clipLen;
+  g_clipData = bonus_spawn_wav; g_clipLen = bonus_spawn_wav_len;
+  startAudio();
+  g_clipData = savedData; g_clipLen = savedLen;
+#else
+  const char* savedPath = g_clipPath;
+  g_clipPath = CLIP_PATH_SPAWN;
+  startAudio();
+  g_clipPath = savedPath;
+#endif
 }
 
 /* ── helpers ─────────────────────────────────────────── */
@@ -1091,8 +1132,8 @@ void onRx(const uint8_t* data, uint16_t len) {
       holdActive = false;
       holdId     = 0;
 
-      // For bonus (one-shot), let audio finish; in normal mode we stop immediately
-      if (!g_audioOneShot) {
+      // Do NOT stop audio if the spawn chime is playing
+      if (!g_audioOneShot && !g_chimeActive) {
         stopAudio();
       }
 
@@ -1202,9 +1243,15 @@ void onRx(const uint8_t* data, uint16_t len) {
     case MsgType::BONUS_UPDATE: {
       if (h->payloadLen != sizeof(BonusUpdatePayload)) break;
       auto* p = (const BonusUpdatePayload*)(data + sizeof(MsgHeader));
-      s_isBonusNow = ((p->mask >> STATION_ID) & 0x1) != 0;
+      bool wasBonus = s_isBonusNow;
+      s_isBonusNow  = ((p->mask >> STATION_ID) & 0x1) != 0;
 
-      // Immediate repaint so the gauge reflects bonus state right away
+      // Rising edge → chime (pre-empts loop, won't be stopped by HOLD_END)
+      if (!wasBonus && s_isBonusNow) {
+        playBonusSpawnChime();
+      }
+
+      // Immediate repaint (rainbow only in GREEN via drawGaugeAuto)
       if (gameActive && stationInited && !otaInProgress) {
         gaugeCacheValid = false;
         drawGaugeAuto(inv, cap);
@@ -1374,8 +1421,10 @@ void loop() {
       absentStartMs = 0;
       sendHoldStop();
 
-      // For bonus (one-shot), let audio finish after tap; otherwise stop now
-      if (!g_audioOneShot) stopAudio();
+      // Do NOT stop audio if the spawn chime is playing
+      if (!g_audioOneShot && !g_chimeActive) {
+        stopAudio();
+      }
 
       stopFullBlink();
       stopEmptyBlink();

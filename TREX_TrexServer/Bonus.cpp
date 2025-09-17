@@ -33,10 +33,20 @@ static inline BonusParams paramsForRound(uint8_t r) {
 static void drainActiveHoldsOnStation(Game& g, uint8_t sid) {
   for (uint8_t i = 0; i < MAX_HOLDS; ++i) {
     if (g.holds[i].active && g.holds[i].stationId == sid) {
-      // Reuse the same drain used at hold-start; it will Tick, StationUpdate, and HoldEnd.
       if (applyBonusOnHoldStart(g, g.holds[i].playerIdx, sid, g.holds[i].holdId)) {
-        g.holds[i].active = false;   // ended by drain (FULL/EMPTY)
+        g.holds[i].active = false;   // ended FULL/EMPTY by the drain
       }
+    }
+  }
+}
+
+// When a station enters BONUS while being looted, stop the current hold
+// but DON'T drain here; player must remove + re-tap to vacuum on hold start.
+static void endActiveHoldsOnStation(Game& g, uint8_t sid) {
+  for (uint8_t i = 0; i < MAX_HOLDS; ++i) {
+    if (g.holds[i].active && g.holds[i].stationId == sid) {
+      sendHoldEnd(g, g.holds[i].holdId, /*INTERRUPT*/2);  // reason value is arbitrary; clients ignore
+      g.holds[i].active = false;
     }
   }
 }
@@ -55,13 +65,11 @@ void bonusResetForRound(Game& g, uint32_t now) {
 }
 
 static void spawnNow(Game& g, uint32_t now, const BonusParams& p, bool obeyCap=true) {
-  // Respect concurrency cap
   if (obeyCap) {
     uint32_t m = g.bonusActiveMask; uint8_t active=0; while (m){ m&=(m-1); ++active; }
     if (active >= p.maxConcurrent) return;
   }
 
-  // Eligible set (skip empty + already bonus)
   uint8_t elig[MAX_STATIONS]; uint8_t eCount=0;
   for (uint8_t sid=1; sid<=MAX_STATIONS; ++sid) {
     if ((g.bonusActiveMask & (1u<<sid)) == 0 && g.stationInventory[sid] > 0) {
@@ -70,24 +78,22 @@ static void spawnNow(Game& g, uint32_t now, const BonusParams& p, bool obeyCap=t
   }
   if (eCount == 0) return;
 
-  // R3 = all eligible
   if (p.kAll) {
     for (uint8_t i=0;i<eCount;++i) {
       const uint8_t sid = elig[i];
       g.bonusActiveMask |= (1u<<sid);
       g.bonusEndsAt[sid] = now + p.durationMs;
-      drainActiveHoldsOnStation(g, sid);  // <--- NEW
+      endActiveHoldsOnStation(g, sid);   // end current hold; wait for re-tap to vacuum
     }
-  // R4 = pick 1
   } else {
     const uint8_t sid = elig[(uint8_t)random(0, eCount)];
     g.bonusActiveMask |= (1u<<sid);
     g.bonusEndsAt[sid] = now + p.durationMs;
-    drainActiveHoldsOnStation(g, sid);    // <--- NEW
+    endActiveHoldsOnStation(g, sid);
   }
 
   ++g.bonusSpawnsThisRound;
-  bcastBonusUpdate(g);
+  bcastBonusUpdate(g);                   // clients play chime + rainbow
 }
 
 void tickBonusDirector(Game& g, uint32_t now) {
@@ -131,9 +137,10 @@ void bonusClearAll(Game& g) {
   bcastBonusUpdate(g);
 }
 
-// Returns true if the hold was ended here (FULL or EMPTY), false to proceed normally.
+// Apply "bonus vacuum": empty the station and load EVERYTHING into player's carried,
+// even if it exceeds maxCarry. Returns true if we ended the hold here.
 bool applyBonusOnHoldStart(Game& g, uint8_t playerIdx, uint8_t stationId, uint32_t holdId) {
-  // Only act if this station is currently bonus and has inventory
+  // Only if this station is currently bonus and has inventory
   if ((g.bonusActiveMask & (1u << stationId)) == 0) return false;
 
   uint32_t inv = g.stationInventory[stationId];
@@ -141,38 +148,27 @@ bool applyBonusOnHoldStart(Game& g, uint8_t playerIdx, uint8_t stationId, uint32
 
   auto &pl = g.players[playerIdx];
 
-  // If player already FULL, end immediately as FULL; leave inventory untouched
-  if (pl.carried >= g.maxCarry) {
-    sendHoldEnd(g, holdId, /*FULL*/0);
-    return true;
-  }
+  // Take ALL remaining inventory from the station (no cap), add to carried
+  uint32_t beforeCarry = pl.carried;
+  pl.carried += inv;                  // can exceed g.maxCarry by design
+  g.stationInventory[stationId] = 0;  // station is now empty
 
-  const uint32_t space = (g.maxCarry > pl.carried) ? (g.maxCarry - pl.carried) : 0;
-  const uint32_t take  = (inv > space) ? space : inv;
-  const uint32_t after = inv - take;
-
-  pl.carried               += take;
-  g.stationInventory[stationId] = after;      // <-- keep remainder in station
-
-  // Notify everyone
-  sendLootTick(g, holdId, pl.carried, g.stationInventory[stationId]);
+  // Notify everyone (tick first so client sees FULL ring before HOLD_END)
+  sendLootTick(g, holdId, pl.carried, /*inventory*/0);
   bcastStation(g, stationId);
 
-  // If the station emptied because of this drain, end its bonus immediately
-  if (after == 0) {
-    g.bonusActiveMask &= ~(1u << stationId);
-    g.bonusEndsAt[stationId] = 0;
-    bcastBonusUpdate(g);
-  }
+  // Since station is empty, clear its bonus flag immediately
+  g.bonusActiveMask &= ~(1u << stationId);
+  g.bonusEndsAt[stationId] = 0;
+  bcastBonusUpdate(g);
 
-  // End this hold right away:
-  //  FULL if player is now full, otherwise EMPTY (station might still have loot left)
-  sendHoldEnd(g, holdId, (pl.carried >= g.maxCarry) ? /*FULL*/0 : /*EMPTY*/1);
+  // End this hold right away. We can mark FULL (client ignores reason, but matches UX).
+  sendHoldEnd(g, holdId, /*FULL*/0);
 
-  // Debug (optional): shows exactly what happened
-  Serial.printf("[BONUS DRAIN] sid=%u inv_before=%lu take=%lu inv_after=%lu carried=%u/%u\n",
-                stationId, (unsigned long)inv, (unsigned long)take, (unsigned long)after,
-                pl.carried, g.maxCarry);
+  // Debug: trace how much we moved
+  Serial.printf("[BONUS VACUUM] sid=%u took=%lu carry %lu->%lu\n",
+                stationId, (unsigned long)inv,
+                (unsigned long)beforeCarry, (unsigned long)pl.carried);
 
   return true;
 }
