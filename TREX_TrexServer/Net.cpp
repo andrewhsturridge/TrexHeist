@@ -13,7 +13,6 @@ void netBroadcastRaw(const uint8_t* data, uint16_t len) {
   // Transport::sendAll(data, len);       // ← OR whatever your project calls it
 }
 
-
 static void packHeader(Game& g, uint8_t type, uint16_t payLen, uint8_t* buf, uint16_t seqOverride=0) {
   auto* h=(MsgHeader*)buf;
   h->version=TREX_PROTO_VERSION;
@@ -94,6 +93,14 @@ void bcastRoundStatus(Game& g) {
   Transport::broadcast(buf, sizeof(buf));
 }
 
+void bcastBonusUpdate(Game& g) {
+  uint8_t buf[sizeof(MsgHeader) + sizeof(BonusUpdatePayload)];
+  packHeader(g, (uint8_t)MsgType::BONUS_UPDATE, sizeof(BonusUpdatePayload), buf);
+  auto* p = (BonusUpdatePayload*)(buf + sizeof(MsgHeader));
+  p->mask = g.bonusActiveMask;
+  Transport::broadcast(buf, sizeof(buf));
+}
+
 void sendDropResult(Game& g, uint16_t dropped) {
   uint8_t buf[sizeof(MsgHeader)+sizeof(DropResultPayload)];
   packHeader(g, (uint8_t)MsgType::DROP_RESULT, sizeof(DropResultPayload), buf);
@@ -117,6 +124,38 @@ void sendLootTick(Game& g, uint32_t holdId, uint8_t carried, uint16_t stationInv
   auto* t=(LootTickPayload*)(buf+sizeof(MsgHeader));
   t->holdId=holdId; t->carried=carried; t->inventory=stationInv;
   Transport::broadcast(buf,sizeof(buf));
+}
+
+// Returns true if the hold was ended here (FULL or EMPTY), false if it should continue ticking normally.
+bool applyBonusOnHoldStart(Game& g, uint8_t playerIdx, uint8_t stationId, uint16_t holdId) {
+  if ((g.bonusActiveMask & (1u << stationId)) == 0) return false;   // not bonus
+  uint32_t available = g.stationInventory[stationId];
+  if (available == 0) return false;                                  // nothing to drain
+
+  auto &pl = g.players[playerIdx];
+
+  // Empty the station immediately.
+  g.stationInventory[stationId] = 0;
+
+  // Add as much as possible to player's carried (overflow beyond maxCarry is discarded by design).
+  if (pl.carried < g.maxCarry) {
+    uint32_t space   = g.maxCarry - pl.carried;
+    uint32_t toAdd   = (available > space) ? space : available;
+    pl.carried      += toAdd;
+  }
+
+  // Notify clients about the tick & station change
+  sendLootTick(g, holdId, pl.carried, g.stationInventory[stationId]);
+  bcastStation(g, stationId);
+
+  // End the hold if we're FULL or station is EMPTY (both true here typically)
+  if (pl.carried >= g.maxCarry) {
+    sendHoldEnd(g, holdId, /*FULL*/0);
+    return true;
+  } else {
+    sendHoldEnd(g, holdId, /*EMPTY*/1);
+    return true;
+  }
 }
 
 /* ── RX handler (stations → server) ───────────────────────── */
@@ -264,6 +303,11 @@ void onRx(const uint8_t* data, uint16_t len) {
     a->capacity =G.stationCapacity[p->stationId];
     a->denyReason=0;
     Transport::broadcast(buf,sizeof(buf));
+
+    // === BONUS: instant-drain on hold start (no overflow discard) ===
+    if (applyBonusOnHoldStart(G, G.holds[hi].playerIdx, G.holds[hi].stationId, G.holds[hi].holdId)) {
+      G.holds[hi].active = false;   // ended immediately (FULL or EMPTY)
+    }
     break;
   }
 

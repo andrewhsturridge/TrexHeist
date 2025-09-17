@@ -35,6 +35,11 @@ void resetGame(Game& g) {
   g.lootPerTick = 1;
   g.lootRateMs  = 1000;
 
+  // Bonus reset
+  g.bonusActiveMask = 0;
+  for (int i = 0; i < MAX_STATIONS; ++i) g.bonusEndsAt[i] = 0;
+  g.bonusNextSpawnAt = 0;
+  g.bonusSpawnsThisRound = 0;
 
   // Clear station state; Round 1 will set inventory=20 later
   for (uint8_t sid = 1; sid < MAX_STATIONS; ++sid) {

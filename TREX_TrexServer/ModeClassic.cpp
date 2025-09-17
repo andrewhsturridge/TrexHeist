@@ -2,6 +2,7 @@
 #include "Cadence.h"
 #include "Net.h" 
 #include "GameAudio.h"
+#include "Bonus.h"
 
 // --- Random split of TOTAL across 5 stations, each <= 56 ---
 static void splitInventoryRandom(Game& g, uint16_t total /*=100*/) {
@@ -53,6 +54,7 @@ static void startRound(Game& g, uint8_t idx) {
     g.pending.nextStation   = 1;
     g.pending.needScore     = true;
 
+    bonusResetForRound(g, now);
     enterGreen(g);  // lock GREEN in Round 1
     bcastRoundStatus(g);
   } else {
@@ -78,6 +80,7 @@ static void startRound(Game& g, uint8_t idx) {
       g.pending.nextStation = 1;
       g.pending.needScore   = true;
 
+      bonusResetForRound(g, now);
       enterGreen(g);
       bcastRoundStatus(g);
     } else if (idx == 3) {
@@ -104,6 +107,7 @@ static void startRound(Game& g, uint8_t idx) {
       g.redMsMin   = 6500;  g.redMsMax   = 8000;     // ~6–11 s
       g.yellowMsMin= g.yellowMs; g.yellowMsMax = g.yellowMs;  // no randomization (yet)
 
+      bonusResetForRound(g, now);
       enterGreen(g);
       bcastRoundStatus(g);
     } else { // idx >= 4
@@ -133,6 +137,8 @@ static void startRound(Game& g, uint8_t idx) {
  
       // Fake-out tease range via existing fields (0.5–0.9 s)
       g.yellowMsMin = 3000; g.yellowMsMax = 3000;  // keep g.yellowMs at its global (3000 ms)
+
+      bonusResetForRound(g, now);
       enterGreen(g);
       bcastRoundStatus(g);
     }
