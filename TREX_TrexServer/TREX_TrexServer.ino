@@ -21,7 +21,7 @@
 #include "Bonus.h"
 
 // --- OTA defaults (edit these per release) ---
-#define DEFAULT_OTA_URL          "http://192.168.2.231:8000/TREX_Loot.ino.bin"
+#define DEFAULT_OTA_URL          "http://192.168.2.231:8000/TrexHeist/TREX_Loot/build/esp32.esp32.um_feathers3/TREX_Loot.ino.bin"
 #define DEFAULT_OTA_EXPECT_MAJOR TREX_FW_MAJOR
 #define DEFAULT_OTA_EXPECT_MINOR TREX_FW_MINOR
 
@@ -248,6 +248,9 @@ void loop() {
   if (g.phase == Phase::PLAYING) {
     modeClassicMaybeAdvance(g);
   }
+
+  // NEW: auto-drain during intermission (no-op otherwise)
+  if (g.bonusIntermission) tickBonusIntermission(g, now);
 
   tickCadence(g, now);
 }

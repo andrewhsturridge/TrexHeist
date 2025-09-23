@@ -63,6 +63,12 @@ struct Game {
   uint16_t roundGoal = 100;
   uint32_t roundStartScore = 0;
 
+  // --- Intermission between R2 and R3 (bonus-all for 10s) ---
+  bool     bonusIntermission = false;
+  uint32_t bonusInterStart   = 0;
+  uint32_t bonusInterEnd     = 0;
+  uint16_t bonusInterMs      = 10000;  // default 10s
+
   // --- Bonus runtime state (cleared at round start) ---
   uint32_t bonusActiveMask = 0;                 // bit i => station i is bonus-active
   uint32_t bonusEndsAt[MAX_STATIONS] = {0};     // per-station TTL end time (millis)

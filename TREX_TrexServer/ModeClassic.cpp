@@ -3,6 +3,7 @@
 #include "Net.h" 
 #include "GameAudio.h"
 #include "Bonus.h"
+#include "Media.h"
 
 // --- Random split of TOTAL across 5 stations, each <= 56 ---
 static void splitInventoryRandom(Game& g, uint16_t total /*=100*/) {
@@ -178,6 +179,75 @@ static void startRound(Game& g, uint8_t idx) {
   bcastRoundStatus(g);
 }
 
+static const uint8_t ST_FIRST = 1;
+static const uint8_t ST_LAST  = MAX_STATIONS;
+
+void startBonusIntermission(Game& g, uint16_t durationMs /*=15000*/) {
+  // End any holds and clear carried so nothing rolls into intermission
+  endAndClearHoldsAndCarried(g);
+
+  // Mark intermission window
+  g.bonusIntermission = true;
+  g.bonusInterMs      = durationMs;
+  g.bonusInterStart   = millis();
+  g.bonusInterEnd     = g.bonusInterStart + durationMs;
+
+  // Lock cadence to GREEN (no yellow/red during intermission)
+  g.noRedThisRound       = true;
+  g.allowYellowThisRound = false;
+  enterGreen(g);
+
+  // NEW: play the intermission video on the Sprite
+  spritePlay(CLIP_LUNCHBREAK);
+
+  // Fill every station to capacity, broadcast, and mark bonus ON for all
+  g.bonusActiveMask = 0;
+  for (uint8_t sid = ST_FIRST; sid <= ST_LAST; ++sid) {
+    g.stationInventory[sid] = g.stationCapacity[sid];
+    bcastStation(g, sid);
+    g.bonusActiveMask |= (1u << sid);
+    g.bonusEndsAt[sid] = g.bonusInterEnd;
+  }
+  bcastBonusUpdate(g);  // clients: rainbow + spawn chime
+}
+
+void tickBonusIntermission(Game& g, uint32_t now) {
+  if (!g.bonusIntermission) return;
+
+  // Finish condition
+  if ((int32_t)(now - g.bonusInterEnd) >= 0) {
+    for (uint8_t sid = ST_FIRST; sid <= ST_LAST; ++sid) {
+      if (g.stationInventory[sid] != 0) {
+        g.stationInventory[sid] = 0;
+        bcastStation(g, sid);
+      }
+      g.bonusEndsAt[sid] = 0;
+    }
+    g.bonusActiveMask   = 0;
+    bcastBonusUpdate(g);
+
+    g.bonusIntermission = false;
+
+    // Restore cadence policy and start Round 3
+    g.noRedThisRound       = false;
+    g.allowYellowThisRound = true;
+    startRound(g, /*idx=*/3);
+    return;
+  }
+
+  // Linear auto-decay toward 0 by end-of-window
+  const uint32_t T        = g.bonusInterEnd - g.bonusInterStart;
+  const uint32_t timeLeft = g.bonusInterEnd - now;
+  for (uint8_t sid = ST_FIRST; sid <= ST_LAST; ++sid) {
+    const uint16_t cap    = g.stationCapacity[sid];
+    const uint16_t target = (uint16_t)((uint64_t)cap * timeLeft / T);
+    if (g.stationInventory[sid] > target) {
+      g.stationInventory[sid] = target;
+      bcastStation(g, sid);
+    }
+  }
+}
+
 void modeClassicForceRound(Game& g, uint8_t idx, bool playWin) {
   if (idx < 1) idx = 1;
   if (idx > 4) idx = 4;
@@ -194,8 +264,20 @@ void modeClassicForceRound(Game& g, uint8_t idx, bool playWin) {
 }
 
 void modeClassicNextRound(Game& g, bool playWin) {
+  // If we are currently in Round 2 and not yet in the intermission, go to R2.5.
+  if (g.roundIndex == 2 && !g.bonusIntermission) {
+    startBonusIntermission(g, /*durationMs=*/15000);  // 15s
+    return;
+  }
+
+  // If we're *in* the intermission already and tester presses "next", finish early to R3.
+  if (g.bonusIntermission) {
+    startRound(g, /*idx=*/3);  // same behavior as natural end
+    return;
+  }
+
+  // Otherwise behave like before.
   uint8_t next = (g.roundIndex >= 4) ? 4 : (g.roundIndex + 1);
-  // For next from R0/END, treat as R1 without sting:
   if (g.roundIndex == 0 || g.phase == Phase::END) {
     modeClassicForceRound(g, 1, /*playWin=*/false);
   } else {
@@ -218,11 +300,14 @@ void modeClassicMaybeAdvance(Game& g) {
   // 0) Global expiry wins over everything
   if (now >= g.gameEndAt) { bcastGameOver(g, /*TIME_UP*/0); return; }
 
+  // NEW: During the 2.5 intermission, advancement is driven by tickBonusIntermission()
+  if (g.bonusIntermission) return;
+
   // 1) Early advance on goal
   if (g.teamScore >= g.roundGoal) {
     gameAudioStop();
     if      (g.roundIndex == 1) { startRound(g, 2); return; }
-    else if (g.roundIndex == 2) { startRound(g, 3); return; }
+    else if (g.roundIndex == 2) { startBonusIntermission(g, /*durationMs=*/10000); return; }
     else if (g.roundIndex == 3) { startRound(g, 4); return; }
   }
 
@@ -231,7 +316,7 @@ void modeClassicMaybeAdvance(Game& g) {
     if (g.teamScore < g.roundGoal) { bcastGameOver(g, /*GOAL_NOT_MET*/4); return; }
     gameAudioStop();
     if      (g.roundIndex == 1) { startRound(g, 2); return; }
-    else if (g.roundIndex == 2) { startRound(g, 3); return; }
+    else if (g.roundIndex == 2) { startBonusIntermission(g, /*durationMs=*/10000); return; }
     else if (g.roundIndex == 3) { startRound(g, 4); return; }
   }
 }
