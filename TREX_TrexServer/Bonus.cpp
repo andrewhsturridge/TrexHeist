@@ -98,13 +98,13 @@ static void spawnNow(Game& g, uint32_t now, const BonusParams& p, bool obeyCap=t
 
 void tickBonusDirector(Game& g, uint32_t now) {
   // Expire finished or empty immediately
-  bool dirty=false;
-  for (uint8_t sid=1; sid<=MAX_STATIONS; ++sid) {
-    if (g.bonusActiveMask & (1u<<sid)) {
+  bool dirty = false;
+  for (uint8_t sid = 1; sid <= MAX_STATIONS; ++sid) {
+    if (g.bonusActiveMask & (1u << sid)) {
       const bool ttlOver = (g.bonusEndsAt[sid] > 0) && (now >= g.bonusEndsAt[sid]);
       const bool empty   = (g.stationInventory[sid] == 0);
       if (ttlOver || empty) {
-        g.bonusActiveMask &= ~(1u<<sid);
+        g.bonusActiveMask &= ~(1u << sid);
         g.bonusEndsAt[sid] = 0;
         dirty = true;
       }
@@ -119,16 +119,36 @@ void tickBonusDirector(Game& g, uint32_t now) {
   if (g.bonusSpawnsThisRound >= p.maxSpawnsPerRound) return;
   if (g.bonusNextSpawnAt == 0 || now < g.bonusNextSpawnAt) return;
 
+  // NEW: If we're not GREEN, defer the spawn until we are.
+  if (g.light == LightState::RED) {
+    // Do NOT reschedule; keeping nextSpawnAt in the past guarantees
+    // we will spawn immediately on the first GREEN tick.
+    return;
+  }
+
+  // GREEN (or YELLOW) → proceed
   spawnNow(g, now, p, /*obeyCap=*/true);
   g.bonusNextSpawnAt = now + jittered(p.intervalMeanMs, p.intervalJitterMs);
 }
 
 void bonusForceSpawn(Game& g, uint32_t now) {
-  if (!(g.roundIndex == 3 || g.roundIndex == 4)) { Serial.println("[BONUS] force ignored (not R3/R4)"); return; }
+  if (!(g.roundIndex == 3 || g.roundIndex == 4)) {
+    Serial.println("[BONUS] force ignored (not R3/R4)");
+    return;
+  }
+
+  // NEW: Defer if RED; will auto-fire on first GREEN via tickBonusDirector
+  if (g.light == LightState::RED) {
+    Serial.println("[BONUS] force deferred (RED)");
+    // Ensure the scheduler sees it as "due" the moment we turn GREEN
+    if (g.bonusNextSpawnAt == 0 || g.bonusNextSpawnAt > now) g.bonusNextSpawnAt = now;
+    return;
+  }
+
   Serial.println("[BONUS] Starting");
   BonusParams p = paramsForRound(g.roundIndex);
   spawnNow(g, now, p, /*obeyCap=*/true);
-  // do not advance counters/timers here; manual trigger is ad-hoc
+  // (do not advance counters/timers for manual; keep current behavior)
 }
 
 void bonusClearAll(Game& g) {

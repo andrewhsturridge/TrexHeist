@@ -30,10 +30,6 @@
 #include <AudioGeneratorWAV.h>
 #include <AudioOutputI2S.h>
 
-#if TREX_AUDIO_PROGMEM
-  #include <AudioFileSourcePROGMEM.h>   // <-- ADD THIS
-#endif
-
 #include <cstring>
 #include <WiFi.h>
 #include <HTTPClient.h>
@@ -42,6 +38,7 @@
 #include <ArduinoJson.h>
 #include <Preferences.h>
 #include "esp_ota_ops.h"
+#include "esp_system.h"
 
 #if TREX_AUDIO_PROGMEM
   #include <AudioFileSourcePROGMEM.h>
@@ -258,6 +255,12 @@ uint8_t   otaSpinnerIdx     = 0;
 uint32_t  otaSpinnerLastMs  = 0;
 constexpr uint16_t OTA_SPINNER_MS = 60;
 
+// ── Soft staggering to avoid same-ms spikes ──────────────────────────────
+// Tweak these if you like; they just separate events in time a bit.
+constexpr uint16_t RING_STAGGER_MS   = 0;   // ring can stay at 0 (baseline)
+constexpr uint16_t EMPTY_STAGGER_MS  = 70;  // empty-gauge blink toggles 70ms after ring
+constexpr uint16_t AUDIO_STOP_STAGGER_MS = 12; // stop audio slightly after a FULL ring starts
+
 // ---- Serial identity commands (whoami / id / host / ident) ----
 static void processIdentitySerial() {
   static char buf[96]; static size_t len = 0;
@@ -437,9 +440,17 @@ void packHeader(uint8_t type, uint16_t payLen, uint8_t* buf) {
   h->seq          = g_seq++;
 }
 
-/* ── LED drawing ─────────────────────────────────────── */
-inline void pumpAudio() { handleAudio(); }  // feed while we block on LED shows
+// One-shot scheduled audio stop
+static uint32_t schedAudioStopAt = 0;
+inline void scheduleAudioStop(uint16_t delayMs) { schedAudioStopAt = millis() + delayMs; }
+inline void tickScheduledAudio() {
+  if (schedAudioStopAt && (int32_t)(millis() - schedAudioStopAt) >= 0) {
+    stopAudio();
+    schedAudioStopAt = 0;
+  }
+}
 
+/* ── LED drawing ─────────────────────────────────────── */
 inline uint32_t gaugeColor() {
   return (g_lightState == LightState::GREEN) ? GREEN : RED;
 }
@@ -483,56 +494,102 @@ void drawRingCarried(uint8_t cur, uint8_t maxC) {
 void drawGaugeInventory(uint16_t inventory, uint16_t capacity) {
   if (otaInProgress) return;
   const LightState colorState = g_lightState;
+  const bool offPhase = (colorState == LightState::YELLOW && yellowBlinkActive && !yellowBlinkOn);
 
-  // If we're in YELLOW and currently in the blink OFF phase, keep the gauge dark.
-  if (colorState == LightState::YELLOW && yellowBlinkActive && !yellowBlinkOn) {
-    fillGauge(OFF);
+  // Locals cached across calls to avoid redundant work
+  static bool     lastOffPhase   = false;
+  static uint16_t lastLitPainted = 0xFFFF;  // impossible value forces first paint
+  static bool     lastLampOn     = false;
+
+  // ----- EXTREME GUARD: empty -----
+  if (inventory == 0) {
+    // Only repaint if something relevant changed (phase/color/capacity or we weren't already empty)
+    if (!(gaugeCacheValid && lastInvPainted == 0 &&
+          lastCapPainted == capacity && lastGaugeColor == colorState &&
+          lastOffPhase == offPhase)) {
+
+      if (emptyBlinkActive && tagPresent && !offPhase) {
+        // Show the “empty” overlay pixel
+        fillGauge(OFF);
+        gauge.setPixelColor(0, emptyBlinkOn ? WHITE : OFF);
+        gauge.show();
+      } else {
+        fillGauge(OFF);
+        gauge.show();
+      }
+
+      lastInvPainted   = 0;
+      lastCapPainted   = capacity;
+      lastGaugeColor   = colorState;
+      lastLitPainted   = 0;
+      lastOffPhase     = offPhase;
+      gaugeCacheValid  = true;
+    }
+
+    // Lamp OFF only if we weren’t already off
+    if (lastLampOn) { digitalWrite(PIN_MOSFET, LOW); lastLampOn = false; }
     return;
   }
 
-  // Only skip when the cache is valid
-  if (gaugeCacheValid &&
-      inventory == lastInvPainted &&
-      capacity  == lastCapPainted &&
-      colorState == lastGaugeColor) return;
+  // ----- YELLOW off-phase: keep bar dark but only paint on phase edges -----
+  if (offPhase) {
+    if (!gaugeCacheValid || !lastOffPhase) {
+      fillGauge(OFF);
+      gauge.show();
+      gaugeCacheValid = true;
+      lastOffPhase    = true;
+      // keep other caches consistent
+      lastInvPainted  = inventory;
+      lastCapPainted  = capacity;
+      lastGaugeColor  = colorState;
+      lastLitPainted  = 0;
+    }
+    // Lamp ON when not empty (avoid redundant write)
+    if (!lastLampOn) { digitalWrite(PIN_MOSFET, HIGH); lastLampOn = true; }
+    return;
+  } else if (lastOffPhase) {
+    // We’re leaving off-phase; force one repaint
+    lastOffPhase    = false;
+    gaugeCacheValid = false;
+  }
 
-  // 1:1 mapping — each loot lights one LED on the gauge
-  uint16_t lit = (inventory > GAUGE_LEN) ? GAUGE_LEN : inventory;
+  // Clamp lit count (1:1 mapping; never > GAUGE_LEN)
+  const uint16_t lit = (inventory > GAUGE_LEN) ? GAUGE_LEN : inventory;
 
+  // Choose color by current light
   uint32_t col = RED;
   if      (colorState == LightState::GREEN)  col = GREEN;
   else if (colorState == LightState::YELLOW) col = YELLOW;
 
+  // Skip if nothing visible changed (lit length, capacity, or color)
+  if (gaugeCacheValid &&
+      lit == lastLitPainted &&
+      capacity == lastCapPainted &&
+      colorState == lastGaugeColor) {
+    // Ensure lamp ON (since inventory > 0)
+    if (!lastLampOn) { digitalWrite(PIN_MOSFET, HIGH); lastLampOn = true; }
+    return;
+  }
+
+  // Draw (bounded, no edge writes)
   for (uint16_t i = 0; i < GAUGE_LEN; ++i) {
     gauge.setPixelColor(i, (i < lit) ? col : OFF);
   }
-
-  // Inject the empty-station overlay (LED 0 white) into the same frame
-  if (emptyBlinkActive && tagPresent && inv == 0) {
-    // Optional: respect YELLOW off-phase; keep if you want the whole bar dark
-    if (!(g_lightState == LightState::YELLOW && yellowBlinkActive && !yellowBlinkOn)) {
-      gauge.setPixelColor(0, emptyBlinkOn ? WHITE : OFF);
-    }
-  }
-
   gauge.show();
 
-  // MOSFET lamp follows inventory: off when out of loot
-  if (inventory == 0) digitalWrite(PIN_MOSFET, LOW);
-  else                digitalWrite(PIN_MOSFET, HIGH);
+  // Lamp follows inventory (ON when not empty); avoid redundant write
+  if (!lastLampOn) { digitalWrite(PIN_MOSFET, HIGH); lastLampOn = true; }
 
-  lastInvPainted = inventory;
-  lastCapPainted = capacity;
-  lastGaugeColor = colorState;
-  gaugeCacheValid = true;
+  lastInvPainted   = inventory;
+  lastCapPainted   = capacity;
+  lastGaugeColor   = colorState;
+  lastLitPainted   = lit;
+  gaugeCacheValid  = true;
 }
 
 void drawGaugeInventoryRainbowAnimated(uint16_t inventory, uint16_t capacity, uint16_t phase) {
   if (otaInProgress) return;
   if (g_lightState != LightState::GREEN) { drawGaugeInventory(inventory, capacity); return; }
-  if (g_lightState == LightState::YELLOW && yellowBlinkActive && !yellowBlinkOn) {
-    fillGauge(OFF); return;
-  }
 
   uint16_t lit = (inventory > GAUGE_LEN) ? GAUGE_LEN : inventory;
 
@@ -646,8 +703,8 @@ void gameOverBlinkAndOff() {
 
 inline void startYellowBlinkImmediate() {
   yellowBlinkActive = true;
-  yellowBlinkOn = true;
-  yellowBlinkLastMs = millis();
+  yellowBlinkOn     = true;
+  yellowBlinkLastMs = millis() + RING_STAGGER_MS;  // ← stagger start
   // Paint immediately in current color (YELLOW) at current inv level
   drawGaugeInventory(inv, cap);
 }
@@ -689,16 +746,18 @@ inline void applyEmptyOverlay() {
   gauge.show();
 }
 
+// Empty gauge blink: stop audio once when the blink begins, then blink as usual.
 inline void startEmptyBlink() {
   emptyBlinkActive = true;
   emptyBlinkOn     = true;
-  emptyBlinkLastMs = millis();
-  forceGaugeRepaint();
+  emptyBlinkLastMs = millis() + EMPTY_STAGGER_MS;  // ← stagger start
+  forceGaugeRepaint();                             // keep your immediate visual
 }
 
 inline void stopEmptyBlink() {
   if (!emptyBlinkActive) return;
   emptyBlinkActive = false;
+  emptyBlinkOn     = false;
   forceGaugeRepaint();
 }
 
@@ -1044,7 +1103,8 @@ void onRx(const uint8_t* data, uint16_t len) {
 
     case MsgType::LOOT_HOLD_ACK: {
       if (h->payloadLen != sizeof(LootHoldAckPayload)) break;
-      auto* p = (const LootHoldAckPayload*)(data + sizeof(MsgHeader));
+      const LootHoldAckPayload* p =
+          (const LootHoldAckPayload*)(data + sizeof(MsgHeader));
       if (p->holdId != holdId) break;
 
       // Update state from ACK
@@ -1059,16 +1119,19 @@ void onRx(const uint8_t* data, uint16_t len) {
       else                        stopEmptyBlink();
 
       if (p->accepted) {
+        if (!gameActive) break;   // if game ended mid-flight, ignore visuals
+
         holdActive = true;
 
-        // ***** HERE: start audio with bonus clip if this station is bonus *****
         startLootAudio(s_isBonusNow);
 
+        // FULL indicator (ring blink) vs carried ring
         if (carried >= maxCarry) {
           if (!fullAnnounced || blinkHoldId != p->holdId) {
-            startFullBlinkImmediate();   // one-shot full indicator
+            startFullBlinkImmediate();      // (has chime guard, or add if you like)
             fullAnnounced = true;
             blinkHoldId   = p->holdId;
+            scheduleAudioStop(AUDIO_STOP_STAGGER_MS);   // ← stop audio a few ms later
           }
         } else {
           if (fullBlinkActive) stopFullBlink();
@@ -1076,36 +1139,36 @@ void onRx(const uint8_t* data, uint16_t len) {
           drawRingCarried(carried, maxCarry);
         }
 
+        // Throttled gauge repaint first (so LED frame doesn't coincide with audio begin)
         uint32_t now = millis();
-        if ((int32_t)(now - nextGaugeDrawAtMs) >= 0) {
-          // Rainbow gauge is handled in LOOT_TICK/STATION_UPDATE when s_isBonusNow is true
+        if ((int32_t)(now - nextGaugeDrawAtMs) >= 0 && canPaintGaugeNow()) {
           drawGaugeAuto(inv, cap);
           nextGaugeDrawAtMs = now + 20;
         }
-
-      } else { // denied
-        // We were denied (FULL / EMPTY / EDGE_GRACE / RED, etc.) — make sure visuals reset AND the gauge repaints
+      } else { // denied (FULL / EMPTY / EDGE_GRACE / RED, etc.)
         holdActive = false;
-        stopAudio();
+        // NOTE: do NOT stop audio here globally — only stop if FULL blink actually starts.
 
         if (carried >= maxCarry) {
+          // FULL — ring blink + stop audio only on rising edge (inside startFullBlinkImmediate)
           if (!fullAnnounced || blinkHoldId != p->holdId) {
             startFullBlinkImmediate();
             fullAnnounced = true;
             blinkHoldId   = p->holdId;
+            scheduleAudioStop(AUDIO_STOP_STAGGER_MS);   // ← stop audio a few ms later
           }
+          // Defer gauge repaint; normal updates will paint soon
         } else {
           fullAnnounced = false;
           stopFullBlink();
           fillRing(RED);
-        }
 
-        // Always schedule a gauge repaint so inventory reflects current state even while a tag is present.
-        // (Honors YELLOW off-phase via drawGaugeAuto -> drawGaugeInventory guard.)
-        uint32_t now = millis();
-        if ((int32_t)(now - nextGaugeDrawAtMs) >= 0) {
-          drawGaugeAuto(inv, cap);
-          nextGaugeDrawAtMs = now + 20;
+          // Reflect inventory now (even if tag still present), but only if game still active
+          uint32_t now = millis();
+          if (gameActive && (int32_t)(now - nextGaugeDrawAtMs) >= 0 && canPaintGaugeNow()) {
+            drawGaugeAuto(inv, cap);
+            nextGaugeDrawAtMs = now + 20;
+          }
         }
       }
       break;
@@ -1130,6 +1193,7 @@ void onRx(const uint8_t* data, uint16_t len) {
           startFullBlinkImmediate();
           fullAnnounced = true;
           blinkHoldId   = p->holdId;
+          scheduleAudioStop(AUDIO_STOP_STAGGER_MS);   // ← stop audio a few ms later
         }
       } else {
         if (fullBlinkActive) stopFullBlink();
@@ -1319,6 +1383,10 @@ void setup() {
   delay(50);
   Serial.println("\n[LOOT] Boot");
 
+  // Log why we reset last time (brownout, WDT, etc.)
+  esp_reset_reason_t rr = esp_reset_reason();
+  Serial.printf("[BOOT] Reset reason: %d\n", (int)rr);
+
   const esp_partition_t* running = esp_ota_get_running_partition();
   const esp_partition_t* next    = esp_ota_get_next_update_partition(NULL);
   Serial.printf("[PART] running=%s size=%u\n", running? running->label : "?", running? running->size : 0);
@@ -1494,4 +1562,6 @@ void loop() {
   tickYellowBlink();
   tickEmptyBlink();
   tickBonusRainbow();
+  tickScheduledAudio();   // run any deferred audio stop
+
 }

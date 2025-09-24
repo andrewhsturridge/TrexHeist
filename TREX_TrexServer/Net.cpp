@@ -1,5 +1,6 @@
 #include <TrexTransport.h>
 #include <esp_random.h>
+#include <TrexProtocol.h>
 #include "Net.h"
 #include "Media.h"
 #include "OtaCampaign.h"
@@ -157,140 +158,147 @@ void onRx(const uint8_t* data, uint16_t len) {
       break;
     }
 
-  case MsgType::LOOT_HOLD_START: {
-    if (h->payloadLen != sizeof(LootHoldStartPayload)) break;
-    auto* p = (const LootHoldStartPayload*)(data + sizeof(MsgHeader));
+    case MsgType::LOOT_HOLD_START: {
+      if (h->payloadLen != sizeof(LootHoldStartPayload)) break;
+      auto* p = (const LootHoldStartPayload*)(data + sizeof(MsgHeader));
 
-    extern Game g; Game& G = g;
+      extern Game g; Game& G = g;
+      const uint32_t now = millis();
 
-    const uint32_t now = millis();
+      // Compute truthful rateHz from lootRateMs (used in all ACKs)
+      uint8_t rateHz = 1;
+      if (G.lootRateMs > 0) {
+        uint32_t hz = 1000U / G.lootRateMs;
+        if (hz < 1)   hz = 1;
+        if (hz > 255) hz = 255;
+        rateHz = (uint8_t)hz;
+      }
 
-    // Compute truthful rateHz from lootRateMs (used in all ACKs below)
-    uint8_t rateHz = 1;
-    if (G.lootRateMs > 0) {
-      uint32_t hz = 1000U / G.lootRateMs;
-      if (hz < 1)   hz = 1;
-      if (hz > 255) hz = 255;
-      rateHz = (uint8_t)hz;
-    }
-
-    // Validate basic conditions
-    if (G.phase != Phase::PLAYING || p->stationId < 1 || p->stationId > 5) {
-      uint8_t buf[sizeof(MsgHeader)+sizeof(LootHoldAckPayload)];
-      packHeader(G, (uint8_t)MsgType::LOOT_HOLD_ACK, sizeof(LootHoldAckPayload), buf, h->seq);
-      auto* a=(LootHoldAckPayload*)(buf+sizeof(MsgHeader));
-      a->holdId=p->holdId; a->accepted=0; a->rateHz=rateHz; a->maxCarry=G.maxCarry;
-      a->carried=0;
-      a->inventory=(p->stationId>=1 && p->stationId<=5) ? G.stationInventory[p->stationId] : 0;
-      a->capacity =(p->stationId>=1 && p->stationId<=5) ? G.stationCapacity[p->stationId]  : 0;
-      a->denyReason=5; // DENIED (bad state or bad station)
-      Transport::broadcast(buf,sizeof(buf));
-      break;
-    }
-
-    // Helper: validate station id (adjust range if you have >5)
-    auto validSid = [](uint8_t sid){ return sid >= 1 && sid <= 5; };
-    // Prefer payload stationId; fall back to header srcStationId; else ALL
-    uint8_t offenderSid =
-        validSid(p->stationId)     ? p->stationId :
-        (validSid(h->srcStationId) ? h->srcStationId : GAMEOVER_BLAME_ALL);
-
-    // RED violation handling with edge grace
-    if (G.light == LightState::RED) {
-      if (now - G.lastFlipMs <= G.edgeGraceMs) {
-        // within grace: deny politely (no game over)
+      // Validate basic conditions (phase/station id)
+      if (G.phase != Phase::PLAYING || p->stationId < 1 || p->stationId > 5) {
         uint8_t buf[sizeof(MsgHeader)+sizeof(LootHoldAckPayload)];
         packHeader(G, (uint8_t)MsgType::LOOT_HOLD_ACK, sizeof(LootHoldAckPayload), buf, h->seq);
         auto* a=(LootHoldAckPayload*)(buf+sizeof(MsgHeader));
         a->holdId=p->holdId; a->accepted=0; a->rateHz=rateHz; a->maxCarry=G.maxCarry;
         a->carried=0;
-        a->inventory= validSid(p->stationId) ? G.stationInventory[p->stationId] : 0;
-        a->capacity = validSid(p->stationId) ? G.stationCapacity[p->stationId]  : 0;
-        a->denyReason=6; // EDGE_GRACE
+        a->inventory=(p->stationId>=1 && p->stationId<=5) ? G.stationInventory[p->stationId] : 0;
+        a->capacity =(p->stationId>=1 && p->stationId<=5) ? G.stationCapacity[p->stationId]  : 0;
+        a->denyReason=5; // DENIED (bad state or bad station)
         Transport::broadcast(buf,sizeof(buf));
         break;
       }
-      // outside grace: end game - blame the offending station
-      uint8_t blame = validSid(offenderSid) ? offenderSid : GAMEOVER_BLAME_ALL;
-      Serial.printf("[RX] RED violation; ending game. blameSid=%u holdId=%lu\n",
-                    blame, (unsigned long)p->holdId);
-      bcastGameOver(G, /*RED_LOOT*/1, blame);
-      break;
-    }
 
-    // Ensure player record
-    int pi = ensurePlayer(G, p->uid);
-    if (pi < 0) {
+      // Helper: validate station id (adjust if you have >5)
+      auto validSid = [](uint8_t sid){ return sid >= 1 && sid <= 5; };
+      // Prefer payload stationId; fall back to header srcStationId; else ALL
+      uint8_t offenderSid =
+          validSid(p->stationId)     ? p->stationId :
+          (validSid(h->srcStationId) ? h->srcStationId : GAMEOVER_BLAME_ALL);
+
+      // --- RED handling only (YELLOW is allowed like GREEN) ---
+      if (G.light == LightState::RED) {
+        if (now - G.lastFlipMs <= G.edgeGraceMs) {
+          // within grace: deny politely (no game over)
+          uint8_t buf[sizeof(MsgHeader)+sizeof(LootHoldAckPayload)];
+          packHeader(G, (uint8_t)MsgType::LOOT_HOLD_ACK, sizeof(LootHoldAckPayload), buf, h->seq);
+          auto* a=(LootHoldAckPayload*)(buf+sizeof(MsgHeader));
+          a->holdId=p->holdId; a->accepted=0; a->rateHz=rateHz; a->maxCarry=G.maxCarry;
+          a->carried=0;
+          a->inventory= validSid(p->stationId) ? G.stationInventory[p->stationId] : 0;
+          a->capacity = validSid(p->stationId) ? G.stationCapacity[p->stationId]  : 0;
+          a->denyReason=6; // EDGE_GRACE
+          Transport::broadcast(buf,sizeof(buf));
+          break;
+        }
+        // outside grace: end game - blame the offending station
+        uint8_t blame = validSid(offenderSid) ? offenderSid : GAMEOVER_BLAME_ALL;
+        Serial.printf("[RX] RED violation; ending game. blameSid=%u holdId=%lu\n",
+                      blame, (unsigned long)p->holdId);
+        bcastGameOver(G, /*RED_LOOT*/1, blame);
+        break;
+      }
+
+      // Ensure player record
+      int pi = ensurePlayer(G, p->uid);
+      if (pi < 0) {
+        uint8_t buf[sizeof(MsgHeader)+sizeof(LootHoldAckPayload)];
+        packHeader(G, (uint8_t)MsgType::LOOT_HOLD_ACK, sizeof(LootHoldAckPayload), buf, h->seq);
+        auto* a=(LootHoldAckPayload*)(buf+sizeof(MsgHeader));
+        a->holdId=p->holdId; a->accepted=0; a->rateHz=rateHz; a->maxCarry=G.maxCarry;
+        a->carried=0;
+        a->inventory=G.stationInventory[p->stationId];
+        a->capacity =G.stationCapacity[p->stationId];
+        a->denyReason=5; // DENIED (no player)
+        Transport::broadcast(buf,sizeof(buf));
+        break;
+      }
+
+      // Full carry?
+      if (G.players[pi].carried >= G.maxCarry) {
+        uint8_t buf[sizeof(MsgHeader)+sizeof(LootHoldAckPayload)];
+        packHeader(G, (uint8_t)MsgType::LOOT_HOLD_ACK, sizeof(LootHoldAckPayload), buf, h->seq);
+        auto* a=(LootHoldAckPayload*)(buf+sizeof(MsgHeader));
+        a->holdId=p->holdId; a->accepted=0; a->rateHz=rateHz; a->maxCarry=G.maxCarry;
+        a->carried=G.players[pi].carried;
+        a->inventory=G.stationInventory[p->stationId];
+        a->capacity =G.stationCapacity[p->stationId];
+        a->denyReason=0; // FULL
+        Transport::broadcast(buf,sizeof(buf));
+        break;
+      }
+
+      // Station empty?
+      if (G.stationInventory[p->stationId] == 0) {
+        uint8_t buf[sizeof(MsgHeader)+sizeof(LootHoldAckPayload)];
+        packHeader(G, (uint8_t)MsgType::LOOT_HOLD_ACK, sizeof(LootHoldAckPayload), buf, h->seq);
+        auto* a=(LootHoldAckPayload*)(buf+sizeof(MsgHeader));
+        a->holdId=p->holdId; a->accepted=0; a->rateHz=rateHz; a->maxCarry=G.maxCarry;
+        a->carried=G.players[pi].carried;
+        a->inventory=0;
+        a->capacity =G.stationCapacity[p->stationId];
+        a->denyReason=1; // EMPTY
+        Transport::broadcast(buf,sizeof(buf));
+        break;
+      }
+
+      // Allocate hold slot
+      int hi = allocHold(G);
+      if (hi < 0) {
+        uint8_t buf[sizeof(MsgHeader)+sizeof(LootHoldAckPayload)];
+        packHeader(G, (uint8_t)MsgType::LOOT_HOLD_ACK, sizeof(LootHoldAckPayload), buf, h->seq);
+        auto* a=(LootHoldAckPayload*)(buf+sizeof(MsgHeader));
+        a->holdId=p->holdId; a->accepted=0; a->rateHz=rateHz; a->maxCarry=G.maxCarry;
+        a->carried=G.players[pi].carried;
+        a->inventory=G.stationInventory[p->stationId];
+        a->capacity =G.stationCapacity[p->stationId];
+        a->denyReason=5; // DENIED (no slots)
+        Transport::broadcast(buf,sizeof(buf));
+        break;
+      }
+
+      // Accept hold
+      G.holds[hi].active     = true;
+      G.holds[hi].holdId     = p->holdId;
+      G.holds[hi].stationId  = p->stationId;
+      G.holds[hi].playerIdx  = pi;
+      G.holds[hi].nextTickAt = now + (G.lootRateMs ? G.lootRateMs : 250); // safe fallback
+
       uint8_t buf[sizeof(MsgHeader)+sizeof(LootHoldAckPayload)];
       packHeader(G, (uint8_t)MsgType::LOOT_HOLD_ACK, sizeof(LootHoldAckPayload), buf, h->seq);
       auto* a=(LootHoldAckPayload*)(buf+sizeof(MsgHeader));
-      a->holdId=p->holdId; a->accepted=0; a->rateHz=rateHz; a->maxCarry=G.maxCarry;
-      a->carried=0; a->inventory=G.stationInventory[p->stationId];
-      a->capacity=G.stationCapacity[p->stationId]; a->denyReason=5; // DENIED
+      a->holdId=p->holdId; a->accepted=1; a->rateHz=rateHz; a->maxCarry=G.maxCarry;
+      a->carried=G.players[pi].carried;
+      a->inventory=G.stationInventory[p->stationId];
+      a->capacity =G.stationCapacity[p->stationId];
+      a->denyReason=0;
       Transport::broadcast(buf,sizeof(buf));
+
+      // === BONUS: instant-drain on hold start (no overflow discard) ===
+      if (applyBonusOnHoldStart(G, G.holds[hi].playerIdx, G.holds[hi].stationId, G.holds[hi].holdId)) {
+        G.holds[hi].active = false;   // ended immediately (FULL or EMPTY)
+      }
       break;
     }
-
-    // Full carry?
-    if (G.players[pi].carried >= G.maxCarry) {
-      uint8_t buf[sizeof(MsgHeader)+sizeof(LootHoldAckPayload)];
-      packHeader(G, (uint8_t)MsgType::LOOT_HOLD_ACK, sizeof(LootHoldAckPayload), buf, h->seq);
-      auto* a=(LootHoldAckPayload*)(buf+sizeof(MsgHeader));
-      a->holdId=p->holdId; a->accepted=0; a->rateHz=rateHz; a->maxCarry=G.maxCarry;
-      a->carried=G.players[pi].carried; a->inventory=G.stationInventory[p->stationId];
-      a->capacity=G.stationCapacity[p->stationId]; a->denyReason=0; // FULL
-      Transport::broadcast(buf,sizeof(buf));
-      break;
-    }
-
-    // Station empty?
-    if (G.stationInventory[p->stationId] == 0) {
-      uint8_t buf[sizeof(MsgHeader)+sizeof(LootHoldAckPayload)];
-      packHeader(G, (uint8_t)MsgType::LOOT_HOLD_ACK, sizeof(LootHoldAckPayload), buf, h->seq);
-      auto* a=(LootHoldAckPayload*)(buf+sizeof(MsgHeader));
-      a->holdId=p->holdId; a->accepted=0; a->rateHz=rateHz; a->maxCarry=G.maxCarry;
-      a->carried=G.players[pi].carried; a->inventory=0;
-      a->capacity=G.stationCapacity[p->stationId]; a->denyReason=1; // EMPTY
-      Transport::broadcast(buf,sizeof(buf));
-      break;
-    }
-
-    // Allocate hold slot
-    int hi = allocHold(G);
-    if (hi < 0) {
-      uint8_t buf[sizeof(MsgHeader)+sizeof(LootHoldAckPayload)];
-      packHeader(G, (uint8_t)MsgType::LOOT_HOLD_ACK, sizeof(LootHoldAckPayload), buf, h->seq);
-      auto* a=(LootHoldAckPayload*)(buf+sizeof(MsgHeader));
-      a->holdId=p->holdId; a->accepted=0; a->rateHz=rateHz; a->maxCarry=G.maxCarry;
-      a->carried=G.players[pi].carried; a->inventory=G.stationInventory[p->stationId];
-      a->capacity=G.stationCapacity[p->stationId]; a->denyReason=5; // DENIED (no slots)
-      Transport::broadcast(buf,sizeof(buf));
-      break;
-    }
-
-    // Accept hold
-    G.holds[hi].active     = true;
-    G.holds[hi].holdId     = p->holdId;
-    G.holds[hi].stationId  = p->stationId;
-    G.holds[hi].playerIdx  = pi;
-    G.holds[hi].nextTickAt = now + (G.lootRateMs ? G.lootRateMs : 250); // safe fallback
-
-    uint8_t buf[sizeof(MsgHeader)+sizeof(LootHoldAckPayload)];
-    packHeader(G, (uint8_t)MsgType::LOOT_HOLD_ACK, sizeof(LootHoldAckPayload), buf, h->seq);
-    auto* a=(LootHoldAckPayload*)(buf+sizeof(MsgHeader));
-    a->holdId=p->holdId; a->accepted=1; a->rateHz=rateHz; a->maxCarry=G.maxCarry;
-    a->carried=G.players[pi].carried;
-    a->inventory=G.stationInventory[p->stationId];
-    a->capacity =G.stationCapacity[p->stationId];
-    a->denyReason=0;
-    Transport::broadcast(buf,sizeof(buf));
-
-    // === BONUS: instant-drain on hold start (no overflow discard) ===
-    if (applyBonusOnHoldStart(G, G.holds[hi].playerIdx, G.holds[hi].stationId, G.holds[hi].holdId)) {
-      G.holds[hi].active = false;   // ended immediately (FULL or EMPTY)
-    }
-    break;
-  }
 
     case MsgType::LOOT_HOLD_STOP: {
       if (h->payloadLen != sizeof(LootHoldStopPayload)) break;
