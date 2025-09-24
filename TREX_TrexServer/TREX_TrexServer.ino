@@ -166,20 +166,14 @@ void loop() {
     }
   }
 
-  // STATE_TICK @ tickHz  (only while PLAYING, and for the current phase)
+  // STATE_TICK @ tickHz  (only while PLAYING; use current phase timer)
   const uint32_t tickMs = max<uint32_t>(10, 1000 / g.tickHz);
   if (now - g.lastTickSentMs >= tickMs) {
     if (g.phase == Phase::PLAYING) {
       uint32_t msLeft = 0;
-
-      if (g.bonusIntermission) {
-        // R2.5 intermission window
-        msLeft = (g.bonusInterEnd > now) ? (g.bonusInterEnd - now) : 0;
-      } else {
-        // Normal round (R1/R2/R3/R4)
-        msLeft = (g.roundEndAt > now) ? (g.roundEndAt - now) : 0;
-      }
-
+      if      (g.bonusIntermission)  msLeft = (g.bonusInterEnd  > now) ? (g.bonusInterEnd  - now) : 0;
+      else if (g.bonusIntermission2) msLeft = (g.bonus2End      > now) ? (g.bonus2End      - now) : 0;
+      else                           msLeft = (g.roundEndAt     > now) ? (g.roundEndAt     - now) : 0;
       sendStateTick(g, msLeft);
     }
     g.lastTickSentMs = now;
@@ -261,7 +255,8 @@ void loop() {
     modeClassicMaybeAdvance(g);
   }
 
-  if (g.bonusIntermission) { tickBonusIntermission(g, now); } 
+  if      (g.bonusIntermission)  { tickBonusIntermission(g, now); }
+  else if (g.bonusIntermission2) { tickBonusIntermission2(g, now); }
+  else                           { tickCadence(g, now); }
 
-  tickCadence(g, now);
 }

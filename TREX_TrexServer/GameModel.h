@@ -70,6 +70,19 @@ struct Game {
   uint16_t bonusInterMs      = 15000;  // default 10s
   bool     bonusWarnTickStarted = false;
 
+  // --- Intermission after R3 (R3.5): single-station bonus that hops every N ms ---
+  bool     bonusIntermission2   = false;
+  uint32_t bonus2Start          = 0;
+  uint32_t bonus2End            = 0;
+  uint16_t bonus2Ms             = 15000;   // 15 s window (like R2.5)
+  uint16_t bonus2HopMs          = 3000;    // hop the bonus every 3 s
+  uint8_t  bonus2Sid            = 0;       // currently highlighted station
+  uint32_t bonus2NextHopAt      = 0;       // next hop time (millis)
+  
+  // R3.5 random hop order (shuffle without repeats)
+  uint8_t  bonus2Order[MAX_STATIONS];  // 1..MAX_STATIONS
+  uint8_t  bonus2Idx = 0;              // next index into bonus2Order
+
   // --- Bonus runtime state (cleared at round start) ---
   uint32_t bonusActiveMask = 0;                 // bit i => station i is bonus-active
   uint32_t bonusEndsAt[MAX_STATIONS] = {0};     // per-station TTL end time (millis)
