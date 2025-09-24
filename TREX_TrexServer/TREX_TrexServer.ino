@@ -174,8 +174,9 @@ void loop() {
     g.lastTickSentMs = now;
   }
 
-  // Accrual while GREEN (tick every lootRateMs; grant lootPerTick each tick)
-  if (g.phase == Phase::PLAYING && g.light == LightState::GREEN) {
+  // Accrual while GREEN and YELLOW (tick every lootRateMs; grant lootPerTick each tick)
+  if (g.phase == Phase::PLAYING &&
+    (g.light == LightState::GREEN || g.light == LightState::YELLOW)) {
     for (int i = 0; i < MAX_HOLDS; ++i) if (g.holds[i].active) {
       auto &h  = g.holds[i];
       uint8_t sid = h.stationId;
