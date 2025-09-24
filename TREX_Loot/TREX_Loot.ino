@@ -261,6 +261,23 @@ constexpr uint16_t RING_STAGGER_MS   = 0;   // ring can stay at 0 (baseline)
 constexpr uint16_t EMPTY_STAGGER_MS  = 70;  // empty-gauge blink toggles 70ms after ring
 constexpr uint16_t AUDIO_STOP_STAGGER_MS = 12; // stop audio slightly after a FULL ring starts
 
+// ── Round 4.5 mini-game (local) ────────────────────────
+static bool     r45Active   = false;
+static bool     r45Used     = false;   // one try per station
+static bool     r45Success  = false;
+
+static uint8_t  r45SegStart = 0;       // random segment [start, start+len-1]
+static uint8_t  r45SegLen   = 10;
+static uint16_t r45StepMs   = 30;      // ms per pixel step
+static uint8_t  r45Pos      = 0;       // green LED pos 0..GAUGE_LEN-1
+static int8_t   r45Dir      = +1;      // +1/-1 bounce
+static uint32_t r45NextStepAt = 0;
+
+static const uint16_t R45_HOLD_MS = 200; // must hold inside segment this long
+static bool     r45Attempting = false;
+static uint32_t r45AttemptStart = 0;
+static uint8_t  r45FreezePos = 0;      // where we freeze on miss
+
 // ---- Serial identity commands (whoami / id / host / ident) ----
 static void processIdentitySerial() {
   static char buf[96]; static size_t len = 0;
@@ -777,6 +794,29 @@ inline bool canPaintGaugeNow() {
   return (!yellowBlinkActive || yellowBlinkOn);
 }
 
+inline bool r45Inside(uint8_t pos) {
+  return (pos >= r45SegStart) && (pos < (uint8_t)(r45SegStart + r45SegLen));
+}
+
+void drawR45Frame() {
+  // Base: OFF
+  for (uint16_t i=0;i<GAUGE_LEN;++i) gauge.setPixelColor(i, 0);
+
+  // Rainbow segment
+  for (uint16_t i=0;i<r45SegLen;++i) {
+    uint16_t idx = (uint16_t)(r45SegStart + i);
+    if (idx < GAUGE_LEN) {
+      uint32_t hue = (uint32_t)((i * 65535u) / (r45SegLen ? r45SegLen : 1));
+      gauge.setPixelColor(idx, gauge.ColorHSV((uint16_t)hue, 255, 255));
+    }
+  }
+
+  // Green LED (moving or frozen)
+  uint8_t gp = r45Used && !r45Success ? r45FreezePos : r45Pos;
+  if (gp < GAUGE_LEN) gauge.setPixelColor(gp, GREEN);
+
+  gauge.show();
+}
 
 /* ── OTA visuals ─────────────────────────────────────── */
 void otaVisualStart() {
@@ -1059,6 +1099,20 @@ void sendHoldStop() {
   holdId = 0;
 }
 
+// sender
+static void sendRound45Result(bool success, uint8_t greenPos, uint8_t segStart, uint8_t segLen) {
+  if (!transportReady) return;
+  uint8_t buf[sizeof(MsgHeader)+sizeof(Round45ResultPayload)];
+  packHeader((uint8_t)MsgType::ROUND45_RESULT, sizeof(Round45ResultPayload), buf);
+  auto* p = (Round45ResultPayload*)(buf + sizeof(MsgHeader));
+  p->stationId = STATION_ID;
+  p->success   = success ? 1 : 0;
+  p->greenPos  = greenPos;
+  p->segStart  = segStart;
+  p->segLen    = segLen;
+  Transport::sendToServer(buf, sizeof(buf));
+}
+
 /* ── RX handler ─────────────────────────────────────── */
 void onRx(const uint8_t* data, uint16_t len) {
   if (len < sizeof(MsgHeader)) return;
@@ -1079,6 +1133,9 @@ void onRx(const uint8_t* data, uint16_t len) {
       if      (p->state == (uint8_t)LightState::GREEN)  g_lightState = LightState::GREEN;
       else if (p->state == (uint8_t)LightState::YELLOW) g_lightState = LightState::YELLOW;
       else                                              g_lightState = LightState::RED;
+
+      // If we're in 4.5, don't paint the gauge here
+      if (r45Active) break;
 
       // Arm/stop Yellow blink using your existing flags
       if (g_lightState == LightState::YELLOW) {
@@ -1101,11 +1158,44 @@ void onRx(const uint8_t* data, uint16_t len) {
       break;
     }
 
+    case MsgType::ROUND45_START: {
+      if (h->payloadLen != sizeof(Round45StartPayload)) break;
+      auto* p = (const Round45StartPayload*)(data + sizeof(MsgHeader));
+
+      // Enter 4.5 mode, reset attempt flags
+      r45Active = true; r45Used = false; r45Success = false; r45Attempting = false;
+
+      // Randomize segment and speed within windows
+      uint8_t segMin = p->segMin, segMax = p->segMax;
+      if (segMin < 1) segMin = 1;
+      if (segMax < segMin) segMax = segMin;
+      r45SegLen = segMin + (esp_random() % (uint32_t)(segMax - segMin + 1));
+      if (r45SegLen > GAUGE_LEN) r45SegLen = GAUGE_LEN;
+      if (r45SegLen < 1) r45SegLen = 1;
+
+      uint8_t maxStart = (GAUGE_LEN > r45SegLen) ? (uint8_t)(GAUGE_LEN - r45SegLen) : 0;
+      r45SegStart = (maxStart > 0) ? (uint8_t)(esp_random() % (maxStart + 1)) : 0;
+
+      uint16_t sMin = p->stepMsMin, sMax = p->stepMsMax;
+      if (sMin < 5) sMin = 5;
+      if (sMax < sMin) sMax = sMin;
+      r45StepMs     = sMin + (uint32_t)(esp_random() % (uint32_t)(sMax - sMin + 1));
+
+      // Init green at 0 moving forward
+      r45Pos = 0; r45Dir = +1; r45NextStepAt = millis() + r45StepMs;
+
+      // Draw first frame
+      drawR45Frame();
+      break;
+    }
+
     case MsgType::LOOT_HOLD_ACK: {
       if (h->payloadLen != sizeof(LootHoldAckPayload)) break;
       const LootHoldAckPayload* p =
           (const LootHoldAckPayload*)(data + sizeof(MsgHeader));
       if (p->holdId != holdId) break;
+
+      if (r45Active) break; // ignore normal looting visuals during 4.5
 
       // Update state from ACK
       maxCarry = p->maxCarry;
@@ -1179,6 +1269,8 @@ void onRx(const uint8_t* data, uint16_t len) {
       auto* p = (const LootTickPayload*)(data + sizeof(MsgHeader));
       if (!holdActive || p->holdId != holdId) break;
 
+      if (r45Active) break; // ignore normal looting visuals during 4.5
+
       carried = (p->carried > maxCarry) ? maxCarry : p->carried;  // clamp
       inv     = p->inventory;
       stationInited = true;
@@ -1248,6 +1340,9 @@ void onRx(const uint8_t* data, uint16_t len) {
       cap = p->capacity;
       stationInited = true;
 
+      // In 4.5, do NOT repaint from inventory (always 0)
+      if (r45Active) break;
+
       // Don't repaint after GAME_OVER
       if (!gameActive) break;
 
@@ -1292,6 +1387,8 @@ void onRx(const uint8_t* data, uint16_t len) {
       holdActive     = false;
       tagPresent     = false;
       fullBlinkActive= false;
+
+      r45Active = false; r45Used = false; r45Attempting = false;
 
       // Leave bonus & stop last-3s blinker so it can't repaint the gauge
       s_isBonusNow = false;
@@ -1521,10 +1618,15 @@ void loop() {
       absentStartMs = 0;
       carried       = 0;
       stopFullBlink();
-      sendHoldStart(currentUid);
 
-      if (inv == 0) startEmptyBlink();
-      else          stopEmptyBlink(); 
+      if (!r45Active) {
+        // Normal behavior
+        sendHoldStart(currentUid);
+        if (inv == 0) startEmptyBlink(); else stopEmptyBlink();
+      } else {
+        // 4.5: handled in the r45Active loop above (no LOOT_HOLD_START)
+        stopEmptyBlink();
+      }
     }
   }
 
@@ -1563,5 +1665,62 @@ void loop() {
   tickEmptyBlink();
   tickBonusRainbow();
   tickScheduledAudio();   // run any deferred audio stop
+
+  // R4.5 animation & detection
+  if (r45Active) {
+    uint32_t now = millis();
+
+    // Move green (unless we've used and failed)
+    if (!(r45Used && !r45Success) && (int32_t)(now - r45NextStepAt) >= 0) {
+      r45NextStepAt = now + r45StepMs;
+      int16_t np = (int16_t)r45Pos + r45Dir;
+      if (np < 0) { np = 1; r45Dir = +1; }
+      if (np >= (int16_t)GAUGE_LEN) { np = GAUGE_LEN-2; r45Dir = -1; }
+      r45Pos = (uint8_t)np;
+      drawR45Frame();
+    }
+
+    // Attempt logic: arrival based
+    if (!r45Used && tagPresent && !r45Attempting) {
+      // Start attempt immediately on first arrival
+      r45Attempting = true;
+      r45AttemptStart = now;
+      // If not inside segment at arrival, immediate miss
+      if (!r45Inside(r45Pos)) {
+        r45Used = true; r45Success = false; r45FreezePos = r45Pos;
+        // freeze & flash red on ring
+        fillRing(RED);
+        drawR45Frame();
+        sendRound45Result(false, r45FreezePos, r45SegStart, r45SegLen);
+      }
+    }
+    if (!r45Used && r45Attempting) {
+      if (!tagPresent) {
+        // Tag removed during attempt → treat as miss unless already succeeded
+        if (!r45Success) {
+          r45Used = true; r45Success = false; r45FreezePos = r45Pos;
+          fillRing(RED);
+          drawR45Frame();
+          sendRound45Result(false, r45FreezePos, r45SegStart, r45SegLen);
+        }
+      } else {
+        if (r45Inside(r45Pos)) {
+          if ((now - r45AttemptStart) >= R45_HOLD_MS) {
+            // Success
+            r45Used = true; r45Success = true;
+            playBonusSpawnChime();        // success sound
+            // optional: flash segment once (drawR45Frame already shows it)
+            sendRound45Result(true, r45Pos, r45SegStart, r45SegLen);
+          }
+        } else {
+          // Moved outside before meeting hold → miss
+          r45Used = true; r45Success = false; r45FreezePos = r45Pos;
+          fillRing(RED);
+          drawR45Frame();
+          sendRound45Result(false, r45FreezePos, r45SegStart, r45SegLen);
+        }
+      }
+    }
+  }
 
 }

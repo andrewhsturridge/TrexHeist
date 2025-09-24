@@ -89,6 +89,16 @@ struct Game {
   uint32_t bonusNextSpawnAt = 0;                // scheduler next fire (millis)
   uint8_t  bonusSpawnsThisRound = 0;            // number of spawns so far in current round
 
+  // --- Intermission 4.5 (after Round 4): reflex mini-game (all stations) ---
+  bool     r45Active        = false;
+  uint32_t r45Start         = 0;
+  uint32_t r45End           = 0;
+  uint16_t r45Ms            = 60000;   // 60 s window
+
+  uint8_t  r45UsedMask      = 0;       // bit per station: 1 = attempted (success or miss)
+  uint8_t  r45SuccessMask   = 0;       // bit per station: 1 = success
+  uint32_t r45AllUsedAt     = 0;       // when all stations have attempted (for +3s end)
+
   // Grace + PIR
   uint32_t edgeGraceMs     = 300;
   uint32_t redHoldGraceMs  = 400;

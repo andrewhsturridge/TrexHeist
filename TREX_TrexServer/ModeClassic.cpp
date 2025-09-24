@@ -416,6 +416,57 @@ void tickBonusIntermission2(Game& g, uint32_t now) {
   }
 }
 
+void startRound45(Game& g, uint16_t msTotal,
+                  uint8_t segMin, uint8_t segMax,
+                  uint16_t stepMsMin, uint16_t stepMsMax) {
+  // End holds & clear carried to avoid normal looting during mini-game
+  endAndClearHoldsAndCarried(g);
+
+  g.r45Active  = true;
+  g.r45Start   = millis();
+  g.r45End     = g.r45Start + msTotal;
+  g.r45Ms      = msTotal;
+  g.r45UsedMask = 0;
+  g.r45SuccessMask = 0;
+  g.r45AllUsedAt = 0;
+
+  // Force GREEN and suppress cadence changes
+  g.noRedThisRound       = true;
+  g.allowYellowThisRound = false;
+  enterGreen(g);
+
+  // Zero all station inventory so normal LOOT paths don't trigger
+  for (uint8_t sid=1; sid<=MAX_STATIONS; ++sid) {
+    g.stationInventory[sid] = 0;
+    bcastStation(g, sid);
+  }
+
+  // Instruct Loot stations to enter 4.5 mini-game and randomize locally
+  sendRound45Start(g, msTotal, segMin, segMax, stepMsMin, stepMsMax);
+}
+
+void tickRound45(Game& g, uint32_t now) {
+  if (!g.r45Active) return;
+
+  // End by timer
+  if ((int32_t)(now - g.r45End) >= 0) {
+    g.r45Active = false;
+    g.noRedThisRound       = false;
+    g.allowYellowThisRound = true;
+    bcastGameOver(g, /*MANUAL*/2, GAMEOVER_BLAME_ALL);
+    return;
+  }
+
+  // Or: all stations have tried → end 3 s later
+  if (g.r45AllUsedAt && (now - g.r45AllUsedAt >= 3000)) {
+    g.r45Active = false;
+    g.noRedThisRound       = false;
+    g.allowYellowThisRound = true;
+    bcastGameOver(g, /*MANUAL*/2, GAMEOVER_BLAME_ALL);
+    return;
+  }
+}
+
 void modeClassicForceRound(Game& g, uint8_t idx, bool playWin) {
   if (idx < 1) idx = 1;
   if (idx > 4) idx = 4;
@@ -487,6 +538,17 @@ void modeClassicNextRound(Game& g, bool playWin) {
     return;
   }
 
+  // From R4, go to 4.5 (if not active)
+  if (g.roundIndex == 4 && !g.r45Active) { startRound45(g); return; }
+  // If already in 4.5, end early (GAME_OVER)
+  if (g.r45Active) {
+    g.r45Active = false;
+    g.noRedThisRound       = false;
+    g.allowYellowThisRound = true;
+    bcastGameOver(g, /*MANUAL*/2, GAMEOVER_BLAME_ALL);
+    return;
+  }
+
   // Otherwise behave like before: advance one round (but never beyond 4).
   uint8_t next = (g.roundIndex >= 4) ? 4 : (g.roundIndex + 1);
 
@@ -519,26 +581,30 @@ void modeClassicInit(Game& g) {
 void modeClassicMaybeAdvance(Game& g) {
   const uint32_t now = millis();
 
-  // 0) Global expiry wins over everything
+  // (Global game timer disabled by design)
   // if (now >= g.gameEndAt) { bcastGameOver(g, /*TIME_UP*/0); return; }
 
-  // NEW: During the 2.5 intermission, advancement is driven by tickBonusIntermission()
-  if (g.bonusIntermission) return;
+  // During intermissions (2.5 / 3.5) and 4.5, advancement is driven by their tickers.
+  if (g.bonusIntermission      ) return;  // 2.5
+  if (g.bonusIntermission2     ) return;  // 3.5
+  if (g.r45Active              ) return;  // 4.5
 
   // 1) Early advance on goal
   if (g.teamScore >= g.roundGoal) {
     gameAudioStop();
-    if      (g.roundIndex == 1) { startRound(g, 2); return; }
-    else if (g.roundIndex == 2) { startBonusIntermission(g, /*durationMs=*/15000); return; }
-    else if (g.roundIndex == 3) { startBonusIntermission2(g, /*durationMs=*/15000, /*hopMs=*/3000); }
+    if      (g.roundIndex == 1) { startRound(g, 2);                                  return; }
+    else if (g.roundIndex == 2) { startBonusIntermission(g, /*durationMs=*/15000);    return; } // 2.5
+    else if (g.roundIndex == 3) { startBonusIntermission2(g, /*durationMs=*/15000, /*hop*/3000); return; } // 3.5
+    else if (g.roundIndex == 4) { startRound45(g);                                     return; } // 4.5
   }
 
   // 2) Round timeout: must meet goal, else game over; on success, advance
   if (now >= g.roundEndAt) {
     if (g.teamScore < g.roundGoal) { bcastGameOver(g, /*GOAL_NOT_MET*/4); return; }
     gameAudioStop();
-    if      (g.roundIndex == 1) { startRound(g, 2); return; }
-    else if (g.roundIndex == 2) { startBonusIntermission(g, /*durationMs=*/15000); return; }
-    else if (g.roundIndex == 3) { startBonusIntermission2(g, /*durationMs=*/15000, /*hopMs=*/3000); return; }
+    if      (g.roundIndex == 1) { startRound(g, 2);                                  return; }
+    else if (g.roundIndex == 2) { startBonusIntermission(g, /*durationMs=*/15000);    return; } // 2.5
+    else if (g.roundIndex == 3) { startBonusIntermission2(g, /*durationMs=*/15000, /*hop*/3000); return; } // 3.5
+    else if (g.roundIndex == 4) { startRound45(g);                                     return; } // 4.5
   }
 }

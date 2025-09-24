@@ -145,6 +145,19 @@ void sendLootTick(Game& g, uint32_t holdId, uint8_t carried, uint16_t stationInv
   Transport::broadcast(buf,sizeof(buf));
 }
 
+void sendRound45Start(Game& g, uint16_t msTotal, uint8_t segMin, uint8_t segMax,
+                      uint16_t stepMsMin, uint16_t stepMsMax) {
+  uint8_t buf[sizeof(MsgHeader) + sizeof(Round45StartPayload)];
+  packHeader(g, (uint8_t)MsgType::ROUND45_START, sizeof(Round45StartPayload), buf);
+  auto* p = (Round45StartPayload*)(buf + sizeof(MsgHeader));
+  p->msTotal   = msTotal;
+  p->segMin    = segMin;
+  p->segMax    = segMax;
+  p->stepMsMin = stepMsMin;
+  p->stepMsMax = stepMsMax;
+  Transport::broadcast(buf, sizeof(buf));
+}
+
 /* ── RX handler (stations → server) ───────────────────────── */
 void onRx(const uint8_t* data, uint16_t len) {
   if (len < sizeof(MsgHeader)) return;
@@ -333,6 +346,34 @@ void onRx(const uint8_t* data, uint16_t len) {
 
       sendDropResult(G, dropped, p->readerIndex);
       bcastScore(G);
+      break;
+    }
+
+    case MsgType::ROUND45_RESULT: {
+      if (h->payloadLen != sizeof(Round45ResultPayload)) break;
+      auto* p = (const Round45ResultPayload*)(data + sizeof(MsgHeader));
+
+      // Use the global Game via a local alias (matches other cases)
+      extern Game g; Game& G = g;
+
+      if (!G.r45Active) break;
+      uint8_t sid = p->stationId;
+      if (sid < 1 || sid > MAX_STATIONS) break;
+
+      uint8_t bit = (1u << sid);
+
+      // Only record the first report per station
+      if (!(G.r45UsedMask & bit)) {
+        G.r45UsedMask |= bit;
+        if (p->success) G.r45SuccessMask |= bit;
+
+        // If that was the last unused station, arm the +3 s end window
+        uint8_t allMask = 0;
+        for (uint8_t i = 1; i <= MAX_STATIONS; ++i) allMask |= (1u << i);
+        if ((G.r45UsedMask & allMask) == allMask && G.r45AllUsedAt == 0) {
+          G.r45AllUsedAt = millis();
+        }
+      }
       break;
     }
 
