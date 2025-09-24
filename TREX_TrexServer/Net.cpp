@@ -62,6 +62,11 @@ void bcastGameOver(Game& g, uint8_t reason, uint8_t blameSid /*=GAMEOVER_BLAME_A
   p->blameSid = blameSid;
   Transport::broadcast(buf,sizeof(buf));
 
+  // Final STATE_TICK with 0 to freeze any wall timers
+  sendStateTick(g, 0);
+  // keep scheduler from immediately sending more ticks
+  g.lastTickSentMs = millis();
+
   // Clean up holds and media
   for (auto &h : g.holds) h.active = false;
   gameAudioPlayOnce(TRK_TREX_LOSE);

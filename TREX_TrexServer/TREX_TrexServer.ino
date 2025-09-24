@@ -166,11 +166,22 @@ void loop() {
     }
   }
 
-  // STATE_TICK @ tickHz
+  // STATE_TICK @ tickHz  (only while PLAYING, and for the current phase)
   const uint32_t tickMs = max<uint32_t>(10, 1000 / g.tickHz);
   if (now - g.lastTickSentMs >= tickMs) {
-    uint32_t msLeft = (g.roundIndex==1) ? ((g.roundEndAt>now)?(g.roundEndAt-now):0) : ((g.gameEndAt>now)?(g.gameEndAt-now):0);
-    sendStateTick(g, msLeft);
+    if (g.phase == Phase::PLAYING) {
+      uint32_t msLeft = 0;
+
+      if (g.bonusIntermission) {
+        // R2.5 intermission window
+        msLeft = (g.bonusInterEnd > now) ? (g.bonusInterEnd - now) : 0;
+      } else {
+        // Normal round (R1/R2/R3/R4)
+        msLeft = (g.roundEndAt > now) ? (g.roundEndAt - now) : 0;
+      }
+
+      sendStateTick(g, msLeft);
+    }
     g.lastTickSentMs = now;
   }
 
@@ -250,11 +261,7 @@ void loop() {
     modeClassicMaybeAdvance(g);
   }
 
-  if (g.bonusIntermission) {
-    tickBonusIntermission(g, now);
-  } else {
-    tickCadence(g, now);
-  }
+  if (g.bonusIntermission) { tickBonusIntermission(g, now); } 
 
   tickCadence(g, now);
 }

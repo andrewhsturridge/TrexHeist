@@ -55,6 +55,8 @@ static void startRound(Game& g, uint8_t idx) {
     g.gameEndAt   = now + 300000UL;  // 5:00 total
     g.roundEndAt  = now + 120000UL;  // 2:00
 
+    sendStateTick(g, (g.roundEndAt > now) ? (g.roundEndAt - now) : 0);
+
     g.roundStartScore = 0;
     g.roundGoal       = 40;
     g.lootPerTick     = 4;
@@ -192,6 +194,9 @@ void startBonusIntermission(Game& g, uint16_t durationMs /*=15000*/) {
   g.bonusInterStart   = millis();
   g.bonusInterEnd     = g.bonusInterStart + durationMs;
   g.bonusWarnTickStarted = false;   // arm the last-3s tick
+  
+  uint32_t now = millis();
+  sendStateTick(g, (g.bonusInterEnd > now) ? (g.bonusInterEnd - now) : 0);
 
   // Lock cadence to GREEN (no yellow/red during intermission)
   g.noRedThisRound       = true;
@@ -313,7 +318,7 @@ void modeClassicMaybeAdvance(Game& g) {
   const uint32_t now = millis();
 
   // 0) Global expiry wins over everything
-  if (now >= g.gameEndAt) { bcastGameOver(g, /*TIME_UP*/0); return; }
+  // if (now >= g.gameEndAt) { bcastGameOver(g, /*TIME_UP*/0); return; }
 
   // NEW: During the 2.5 intermission, advancement is driven by tickBonusIntermission()
   if (g.bonusIntermission) return;
