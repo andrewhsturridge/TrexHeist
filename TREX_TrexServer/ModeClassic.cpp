@@ -248,6 +248,7 @@ void tickBonusIntermission(Game& g, uint32_t now) {
 
   // Start tick SFX once at T<=3s
   if (!g.bonusWarnTickStarted && timeLeft <= 3000) {
+    gameAudioStop();
     gameAudioPlayOnce(TRK_TICKS_LOOP);   // same tick you use for yellow
     g.bonusWarnTickStarted = true;
   }
@@ -321,7 +322,7 @@ void modeClassicMaybeAdvance(Game& g) {
   if (g.teamScore >= g.roundGoal) {
     gameAudioStop();
     if      (g.roundIndex == 1) { startRound(g, 2); return; }
-    else if (g.roundIndex == 2) { startBonusIntermission(g, /*durationMs=*/10000); return; }
+    else if (g.roundIndex == 2) { startBonusIntermission(g, /*durationMs=*/15000); return; }
     else if (g.roundIndex == 3) { startRound(g, 4); return; }
   }
 
@@ -330,7 +331,7 @@ void modeClassicMaybeAdvance(Game& g) {
     if (g.teamScore < g.roundGoal) { bcastGameOver(g, /*GOAL_NOT_MET*/4); return; }
     gameAudioStop();
     if      (g.roundIndex == 1) { startRound(g, 2); return; }
-    else if (g.roundIndex == 2) { startBonusIntermission(g, /*durationMs=*/10000); return; }
+    else if (g.roundIndex == 2) { startBonusIntermission(g, /*durationMs=*/15000); return; }
     else if (g.roundIndex == 3) { startRound(g, 4); return; }
   }
 }

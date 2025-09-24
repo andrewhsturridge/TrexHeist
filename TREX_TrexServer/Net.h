@@ -8,7 +8,9 @@ void bcastGameStart(Game& g);
 void bcastGameOver(Game& g, uint8_t reason, uint8_t blameSid = GAMEOVER_BLAME_ALL);
 void bcastScore(Game& g);
 void bcastStation(Game& g, uint8_t stationId);
-void sendDropResult(Game& g, uint16_t dropped);
+// Broadcast that a drop has completed
+void sendDropResult(Game& g, uint16_t dropped, uint8_t readerIndex = DROP_READER_UNKNOWN);
+
 void bcastRoundStatus(Game& g);
 void bcastBonusUpdate(Game& g);
 

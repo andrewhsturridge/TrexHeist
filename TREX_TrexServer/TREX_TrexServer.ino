@@ -249,8 +249,11 @@ void loop() {
     modeClassicMaybeAdvance(g);
   }
 
-  // NEW: auto-drain during intermission (no-op otherwise)
-  if (g.bonusIntermission) tickBonusIntermission(g, now);
+  if (g.bonusIntermission) {
+    tickBonusIntermission(g, now);
+  } else {
+    tickCadence(g, now);
+  }
 
   tickCadence(g, now);
 }

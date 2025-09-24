@@ -43,17 +43,26 @@ void bcastGameStart(Game& g) {
 void bcastGameOver(Game& g, uint8_t reason, uint8_t blameSid /*=GAMEOVER_BLAME_ALL*/) {
   if (g.phase == Phase::END) return; // single-shot
   g.phase = Phase::END;
+
+  // Kill any intermission/bonus and notify clients so rainbow stops
+  g.bonusIntermission = false;
+  g.bonusActiveMask   = 0;
+  for (uint8_t sid = 1; sid <= MAX_STATIONS; ++sid) g.bonusEndsAt[sid] = 0;
+  bcastBonusUpdate(g);  // mask=0
+
+  // Stop any looping SFX before we play the lose sting
+  gameAudioStop();
+
+  // GAME_OVER payload
   uint8_t buf[sizeof(MsgHeader) + sizeof(GameOverPayload)];
   packHeader(g, (uint8_t)MsgType::GAME_OVER, sizeof(GameOverPayload), buf);
   auto *p = (GameOverPayload*)(buf + sizeof(MsgHeader));
   p->reason   = reason;
   p->blameSid = blameSid;
-
   Transport::broadcast(buf,sizeof(buf));
 
-  // stop all holds
+  // Clean up holds and media
   for (auto &h : g.holds) h.active = false;
-
   gameAudioPlayOnce(TRK_TREX_LOSE);
   spritePlay(CLIP_GAME_OVER);
   Serial.printf("[TREX] GAME OVER! reason=%u blameSid=%u\n", reason, blameSid);
@@ -74,10 +83,10 @@ void bcastStation(Game& g, uint8_t stationId) {
   p->inventory = g.stationInventory[stationId];
   p->capacity  = g.stationCapacity[stationId];
   Transport::broadcast(buf,sizeof(buf));
-  Serial.printf("[BCAST_STATION] sid=%u inv=%u cap=%u\n",
-                stationId,
-                g.stationInventory[stationId],
-                g.stationCapacity[stationId]);
+  // Serial.printf("[BCAST_STATION] sid=%u inv=%u cap=%u\n",
+  //               stationId,
+  //               g.stationInventory[stationId],
+  //               g.stationCapacity[stationId]);
 }
 
 void bcastRoundStatus(Game& g) {
@@ -102,13 +111,16 @@ void bcastBonusUpdate(Game& g) {
   Transport::broadcast(buf, sizeof(buf));
 }
 
-void sendDropResult(Game& g, uint16_t dropped) {
-  uint8_t buf[sizeof(MsgHeader)+sizeof(DropResultPayload)];
+void sendDropResult(Game& g, uint16_t dropped, uint8_t readerIndex /*=DROP_READER_UNKNOWN*/) {
+  uint8_t buf[sizeof(MsgHeader) + sizeof(DropResultPayload)];
   packHeader(g, (uint8_t)MsgType::DROP_RESULT, sizeof(DropResultPayload), buf);
-  auto* p=(DropResultPayload*)(buf+sizeof(MsgHeader));
-  p->dropped = dropped;
-  p->teamScore = g.teamScore;
-  Transport::broadcast(buf,sizeof(buf));
+
+  auto* p = (DropResultPayload*)(buf + sizeof(MsgHeader));
+  p->dropped     = dropped;
+  p->teamScore   = g.teamScore;
+  p->readerIndex = readerIndex;
+
+  Transport::broadcast(buf, sizeof(buf));
 }
 
 void sendHoldEnd(Game& g, uint32_t holdId, uint8_t reason) {
@@ -306,7 +318,7 @@ void onRx(const uint8_t* data, uint16_t len) {
       G.players[pi].banked += dropped;
       G.teamScore += dropped;
 
-      sendDropResult(G, dropped);
+      sendDropResult(G, dropped, p->readerIndex);
       bcastScore(G);
       break;
     }

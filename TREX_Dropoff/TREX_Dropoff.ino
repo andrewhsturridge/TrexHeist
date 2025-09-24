@@ -439,17 +439,32 @@ void onRx(const uint8_t* data, uint16_t len) {
     }
     
     case MsgType::DROP_RESULT: {
-      if (h->payloadLen != sizeof(DropResultPayload)) break;
-      auto* p = (const DropResultPayload*)(data + sizeof(MsgHeader));
+      // Accept both old (6-byte) and new (7-byte) payloads.
+      // Old:  dropped(2) + teamScore(4)
+      // New:  dropped(2) + teamScore(4) + readerIndex(1)
+      if (h->payloadLen < 6) break;
+
+      const uint8_t* pl = data + sizeof(MsgHeader);
+
+      // Parse teamScore (we don't use 'dropped' in this UI path)
+      uint32_t newTeamScore =  (uint32_t)pl[2]
+                            | ((uint32_t)pl[3] << 8)
+                            | ((uint32_t)pl[4] << 16)
+                            | ((uint32_t)pl[5] << 24);
 
       uint32_t prev = teamScore;
-      teamScore = p->teamScore;
+      teamScore = newTeamScore;
 
-      // Always consume the head of the request→result FIFO
+      // Always consume the head of the request→result FIFO to keep alignment.
+      int8_t idxFromFifo = reqDequeue();
+
+      // Prefer readerIndex from payload when available & valid (0..3).
       int8_t idx = -1;
-      // If your payload includes readerIndex, prefer it:
-      // idx = p->readerIndex;
-      if (idx < 0 || idx >= 4) idx = reqDequeue();
+      if (h->payloadLen >= 7) {
+        uint8_t readerIndex = pl[6];
+        if (readerIndex < 4) idx = (int8_t)readerIndex;
+      }
+      if (idx < 0) idx = idxFromFifo;
 
       // Paint gauges now if safe, or defer while audio is exclusive
       if (!audioExclusive) {
@@ -478,13 +493,12 @@ void onRx(const uint8_t* data, uint16_t len) {
           scanLocked   = true;
           scanUnlockAt = ringHoldUntil[idx];
         }
-        // Short audio window
+        // Short audio window to avoid LED/SPI contention during celebration
         startAudioExclusiveShort();
 
       } else {
         // Reject / no score change:
-        // We already dequeued the matching reader above, so mapping stays aligned.
-        // Ensure its ring isn't left green from arrival (we removed arrival green, but guard anyway).
+        // We already consumed the FIFO head above, so mapping stays aligned.
         if (idx >= 0 && idx < 4 && !ringHoldActive[idx] && !audioExclusive) {
           if (!tagPresent[idx]) fillRing((uint8_t)idx, RED);
         }
