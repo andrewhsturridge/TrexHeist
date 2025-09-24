@@ -191,6 +191,7 @@ void startBonusIntermission(Game& g, uint16_t durationMs /*=15000*/) {
   g.bonusInterMs      = durationMs;
   g.bonusInterStart   = millis();
   g.bonusInterEnd     = g.bonusInterStart + durationMs;
+  g.bonusWarnTickStarted = false;   // arm the last-3s tick
 
   // Lock cadence to GREEN (no yellow/red during intermission)
   g.noRedThisRound       = true;
@@ -231,6 +232,12 @@ void tickBonusIntermission(Game& g, uint32_t now) {
     // Restore cadence policy and start Round 3
     g.noRedThisRound       = false;
     g.allowYellowThisRound = true;
+
+    if (g.bonusWarnTickStarted) {
+      gameAudioStop();                    // stop the tick when intermission ends
+      g.bonusWarnTickStarted = false;
+    }
+    
     startRound(g, /*idx=*/3);
     return;
   }
@@ -238,6 +245,13 @@ void tickBonusIntermission(Game& g, uint32_t now) {
   // Linear auto-decay toward 0 by end-of-window
   const uint32_t T        = g.bonusInterEnd - g.bonusInterStart;
   const uint32_t timeLeft = g.bonusInterEnd - now;
+
+  // Start tick SFX once at T<=3s
+  if (!g.bonusWarnTickStarted && timeLeft <= 3000) {
+    gameAudioPlayOnce(TRK_TICKS_LOOP);   // same tick you use for yellow
+    g.bonusWarnTickStarted = true;
+  }
+
   for (uint8_t sid = ST_FIRST; sid <= ST_LAST; ++sid) {
     const uint16_t cap    = g.stationCapacity[sid];
     const uint16_t target = (uint16_t)((uint64_t)cap * timeLeft / T);

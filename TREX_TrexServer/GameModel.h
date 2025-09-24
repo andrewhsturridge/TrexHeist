@@ -67,7 +67,8 @@ struct Game {
   bool     bonusIntermission = false;
   uint32_t bonusInterStart   = 0;
   uint32_t bonusInterEnd     = 0;
-  uint16_t bonusInterMs      = 10000;  // default 10s
+  uint16_t bonusInterMs      = 15000;  // default 10s
+  bool     bonusWarnTickStarted = false;
 
   // --- Bonus runtime state (cleared at round start) ---
   uint32_t bonusActiveMask = 0;                 // bit i => station i is bonus-active

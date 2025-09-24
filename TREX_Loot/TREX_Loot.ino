@@ -206,8 +206,10 @@ constexpr uint32_t BONUS_BLINK_PERIOD_MS = 220;   // ~4.5 Hz
 
 static bool     bonusBlinkActive   = false;
 static bool     bonusBlinkPhaseOn  = true;
-static uint32_t bonusBlinkToggleAt = 0;
-static uint32_t bonusBlinkArmAt    = 0;  // when to start blinking (millis)
+
+inline void startBonusBlink() { /* disabled */ }
+inline void stopBonusBlink()  { bonusBlinkActive = false; }
+inline void tickBonusBlink()  { /* disabled */ }
 
 /* ── Game/hold state (server-auth) ───────────────────── */
 volatile bool gameActive = true;     // flipped by GAME_OVER/START in onRx()
@@ -711,36 +713,11 @@ inline void tickEmptyBlink() {
   }
 }
 
-inline void startBonusBlink() {
-  bonusBlinkActive   = true;
-  bonusBlinkPhaseOn  = true;
-  bonusBlinkToggleAt = millis() + BONUS_BLINK_PERIOD_MS;
+// Paint only when we’re not in an OFF phase of Yellow blink (bonus blink removed)
+inline bool canPaintGaugeNow() {
+  return (!yellowBlinkActive || yellowBlinkOn);
 }
 
-inline void stopBonusBlink() {
-  bonusBlinkActive = false;
-  bonusBlinkArmAt  = 0;
-  drawGaugeAuto(inv, cap);  // ensure gauge is visible when we stop blinking
-}
-
-inline void tickBonusBlink() {
-  if (!gameActive || otaInProgress) return;
-  uint32_t now = millis();
-
-  // Arm → start
-  if (!bonusBlinkActive && bonusBlinkArmAt && (int32_t)(now - bonusBlinkArmAt) >= 0) {
-    startBonusBlink();
-  }
-
-  // Toggle while active
-  if (!bonusBlinkActive) return;
-  if ((int32_t)(now - bonusBlinkToggleAt) >= 0) {
-    bonusBlinkToggleAt = now + BONUS_BLINK_PERIOD_MS;
-    bonusBlinkPhaseOn = !bonusBlinkPhaseOn;
-    if (bonusBlinkPhaseOn) drawGaugeAuto(inv, cap);
-    else                  fillGauge(OFF);
-  }
-}
 
 /* ── OTA visuals ─────────────────────────────────────── */
 void otaVisualStart() {
@@ -1035,8 +1012,6 @@ void onRx(const uint8_t* data, uint16_t len) {
 
   switch ((MsgType)h->type) {
     case MsgType::STATE_TICK: {
-      // At least a 'state' byte is expected; your payload also has msLeft, but we
-      // no longer use it for painting after moving the 3s blink local.
       if (h->payloadLen < 1) break;
       const StateTickPayload* p =
           (const StateTickPayload*)(data + sizeof(MsgHeader));
@@ -1046,21 +1021,26 @@ void onRx(const uint8_t* data, uint16_t len) {
       else if (p->state == (uint8_t)LightState::YELLOW) g_lightState = LightState::YELLOW;
       else                                              g_lightState = LightState::RED;
 
-      // If the game is over, do not touch the gauge (kept OFF by GAME_OVER handler)
+      // Arm/stop Yellow blink using your existing flags
+      if (g_lightState == LightState::YELLOW) {
+        yellowBlinkActive = true;   // tickYellowBlink() will manage phase
+      } else {
+        stopYellowBlink();
+      }
+
+      // After GAME_OVER keep gauge off
       if (!gameActive) {
-        // Optional: keep ring red if we’re idle
         if (g_lightState == LightState::RED &&
             !holdActive && !otaInProgress) fillRing(RED);
         break;
       }
 
-      // During game: refresh gauge unless blink OFF phase
-      if (stationInited && (!bonusBlinkActive || bonusBlinkPhaseOn)) {
+      // During game: draw gauge unless Yellow blink OFF phase
+      if (stationInited && canPaintGaugeNow()) {
         drawGaugeAuto(inv, cap);
       }
       break;
     }
-
 
     case MsgType::LOOT_HOLD_ACK: {
       if (h->payloadLen != sizeof(LootHoldAckPayload)) break;
@@ -1197,19 +1177,17 @@ void onRx(const uint8_t* data, uint16_t len) {
       if (h->payloadLen != sizeof(StationUpdatePayload)) break;
       const StationUpdatePayload* p =
           (const StationUpdatePayload*)(data + sizeof(MsgHeader));
-
       if (p->stationId != STATION_ID) break;
 
-      // Always update cached values so the next game starts from correct numbers
+      // Cache latest values
       inv = p->inventory;
       cap = p->capacity;
       stationInited = true;
 
-      // ⛔️ After GAME_OVER we do NOT repaint the gauge. Keep it off.
+      // Don't repaint after GAME_OVER
       if (!gameActive) break;
 
-      // During game: repaint unless we’re in the OFF phase of the bonus blink
-      if (!holdActive && (!bonusBlinkActive || bonusBlinkPhaseOn) && !otaInProgress) {
+      if (!holdActive && !otaInProgress && canPaintGaugeNow()) {
         drawGaugeAuto(inv, cap);
       }
       break;
@@ -1305,51 +1283,28 @@ void onRx(const uint8_t* data, uint16_t len) {
     }
 
     case MsgType::BONUS_UPDATE: {
-      // Payload is either 4 bytes (mask) or 8 bytes (mask + msLeft)
       if (h->payloadLen < 4) break;
-
       const uint8_t* pl = data + sizeof(MsgHeader);
+
       uint32_t mask = (uint32_t)pl[0]
                     | ((uint32_t)pl[1] << 8)
                     | ((uint32_t)pl[2] << 16)
                     | ((uint32_t)pl[3] << 24);
 
-      uint32_t msLeft = 0xFFFFFFFF;
-      if (h->payloadLen >= 8) {
-        msLeft = (uint32_t)pl[4]
-              | ((uint32_t)pl[5] << 8)
-              | ((uint32_t)pl[6] << 16)
-              | ((uint32_t)pl[7] << 24);
-      }
-
       bool wasBonus = s_isBonusNow;
       s_isBonusNow  = ((mask >> STATION_ID) & 0x1u) != 0;
 
-      // Rising edge → spawn chime + arm local blink timer (start at msLeft-3s)
       if (!wasBonus && s_isBonusNow) {
-        playBonusSpawnChime();   // existing function in your sketch
-
-        uint32_t armDelay = 0;
-        if (msLeft != 0xFFFFFFFF) {
-          armDelay = (msLeft > BONUS_WARN_MS) ? (msLeft - BONUS_WARN_MS) : 0;
-        } else {
-          // Fallback if server sent mask-only: assume 15s intermission.
-          armDelay = 15000 - BONUS_WARN_MS;
-        }
-        bonusBlinkArmAt  = millis() + armDelay;
-        bonusBlinkActive = false;   // ensure we start fresh at the arm time
+        playBonusSpawnChime();              // your existing chime
       }
-
-      // Leaving bonus → cancel blink and show gauge normally
       if (wasBonus && !s_isBonusNow) {
-        stopBonusBlink();
+        stopBonusBlink();                   // no-op, but keeps state clean
       }
 
-      // Immediate repaint so gauge reflects bonus state (rainbow in GREEN).
-      if (gameActive && stationInited && !otaInProgress) {
-        if (!bonusBlinkActive || bonusBlinkPhaseOn) {
-          drawGaugeAuto(inv, cap);
-        }
+      // Immediate repaint (rainbow in GREEN when bonus is on)
+      if (gameActive && stationInited && !otaInProgress && canPaintGaugeNow()) {
+        gaugeCacheValid = false;
+        drawGaugeAuto(inv, cap);
       }
       break;
     }
@@ -1538,6 +1493,5 @@ void loop() {
   tickFullBlink();
   tickYellowBlink();
   tickEmptyBlink();
-  tickBonusBlink();
   tickBonusRainbow();
 }
