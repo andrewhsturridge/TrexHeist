@@ -117,15 +117,17 @@ void bcastBonusUpdate(Game& g) {
   Transport::broadcast(buf, sizeof(buf));
 }
 
-// Broadcast BONUS_UPDATE with an explicit flags value in the header
+// Net.cpp
 void bcastBonusUpdateFlags(Game& g, uint32_t mask, uint8_t flags) {
-  uint8_t buf[sizeof(MsgHeader) + sizeof(BonusUpdatePayload)];
-  packHeader(g, (uint8_t)MsgType::BONUS_UPDATE, sizeof(BonusUpdatePayload), buf);
-  // Set the flag bit(s) on the header AFTER packing
-  ((MsgHeader*)buf)->flags |= flags;
-
-  auto* p = (BonusUpdatePayload*)(buf + sizeof(MsgHeader));
-  p->mask = mask;
+  uint8_t buf[sizeof(MsgHeader) + 4];
+  packHeader(g, (uint8_t)MsgType::BONUS_UPDATE, /*payloadLen=*/4, buf);
+  auto* h = (MsgHeader*)buf;
+  h->flags = flags;                         // <— Loot checks this for R45 mode
+  uint8_t* pl = buf + sizeof(MsgHeader);
+  pl[0] = (uint8_t)(mask      & 0xFF);
+  pl[1] = (uint8_t)((mask>>8) & 0xFF);
+  pl[2] = (uint8_t)((mask>>16)& 0xFF);
+  pl[3] = (uint8_t)((mask>>24)& 0xFF);
   Transport::broadcast(buf, sizeof(buf));
 }
 

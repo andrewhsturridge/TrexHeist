@@ -664,6 +664,7 @@ void drawGaugeInventoryRainbowAnimated(uint16_t inventory, uint16_t capacity, ui
 // Only show rainbow when BONUS is active, there is inventory, and we are GREEN.
 // Otherwise fall back to the normal draw (YELLOW and RED always override).
 inline void drawGaugeAuto(uint16_t inventory, uint16_t capacity) {
+  if (r45Active) return;
   if (s_isBonusNow && inventory > 0 && g_lightState == LightState::GREEN) {
     drawGaugeInventoryRainbowAnimated(inventory, capacity, g_rainbowPhase);
   } else {
@@ -826,10 +827,15 @@ inline void tickEmptyBlink() {
   }
 }
 
-// Paint only when we’re not in an OFF phase of Yellow blink (bonus blink removed)
+// Only allow normal inventory paints when the overlay isn't active, we’re live,
+// and we’re not in the OFF phase of yellow blink.
 inline bool canPaintGaugeNow() {
-  if (r45Active) return false;
-  return (!yellowBlinkActive || yellowBlinkOn);
+  if (r45Active) return false;                 // 4.5 overlay owns the gauge
+  if (otaInProgress) return false;
+  if (!gameActive || !stationInited) return false;
+  if (holdActive) return false;
+  if (yellowBlinkActive && !yellowBlinkOn) return false;  // respect OFF phase
+  return true;
 }
 
 inline bool r45Inside(uint8_t pos) {
@@ -1179,13 +1185,12 @@ void onRx(const uint8_t* data, uint16_t len) {
       const StateTickPayload* p =
           (const StateTickPayload*)(data + sizeof(MsgHeader));
 
+      if (r45Active) break;
+
       // Update light state
       if      (p->state == (uint8_t)LightState::GREEN)  g_lightState = LightState::GREEN;
       else if (p->state == (uint8_t)LightState::YELLOW) g_lightState = LightState::YELLOW;
       else                                              g_lightState = LightState::RED;
-
-      // If we're in 4.5, don't paint the gauge here
-      if (r45Active) break;
 
       // Arm/stop Yellow blink using your existing flags
       if (g_lightState == LightState::YELLOW) {
@@ -1362,6 +1367,14 @@ void onRx(const uint8_t* data, uint16_t len) {
       // Cache latest values
       inv = p->inventory;
       cap = p->capacity;
+
+      // After you set: inv = ...; cap = ...;
+      if (r45Active) {
+        // Don't repaint normal inventory during the mini-game.
+        // Keep cache invalid so we force a clean repaint when 4.5 ends.
+        gaugeCacheValid = false;
+        break;
+      }
       stationInited = true;
 
       // In 4.5, do NOT repaint from inventory (always 0)

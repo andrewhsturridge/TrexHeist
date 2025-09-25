@@ -452,70 +452,66 @@ void tickBonusIntermission2(Game& g, uint32_t now) {
   }
 }
 
+// ModeClassic.cpp
 void startBonusIntermission3(Game& g, uint16_t durationMs /*=60000*/) {
-  // end holds & clear carried so nothing rolls in
+  // End holds & clear carried so normal loot is fully paused
   endAndClearHoldsAndCarried(g);
 
-  // mark window
-  g.bonusIntermission3 = true;
-  g.bonus3Start        = millis();
-  g.bonus3End          = g.bonus3Start + durationMs;
-  g.bonus3Ms           = durationMs;
+  // Mark the window
+  g.bonusIntermission3   = true;
+  g.bonus3Start          = millis();
+  g.bonus3End            = g.bonus3Start + durationMs;
+  g.bonus3Ms             = durationMs;
   g.bonusWarnTickStarted = false;
 
-  // phase timer snap (for wall timer)
-  uint32_t now = millis();
-  sendStateTick(g, (g.bonus3End > now) ? (g.bonus3End - now) : 0);
-
-  // lock GREEN (no yellow/red during intermission)
+  // Hold cadence at GREEN (mini-game runs under GREEN)
   g.noRedThisRound       = true;
   g.allowYellowThisRound = false;
   enterGreen(g);
+
+  // Optional: video for intermission
   spritePlay(CLIP_LUNCHBREAK);
 
-  // R4.5: do NOT fill inventories; keep all at 0 so normal looting visuals never run
-  for (uint8_t sid = 1; sid <= MAX_STATIONS; ++sid) {
-    g.stationInventory[sid] = 0;
-    g.bonusEndsAt[sid]      = g.bonus3End;   // optional: TTL mirror (unused by Loot here)
-    bcastStation(g, sid);
-  }
-
-  // Tell all Loots to ENTER the mini-game via BONUS_UPDATE with the R45 flag
+  // IMPORTANT: Do NOT broadcast inventory changes here — avoids gauge “off” flicker.
+  // Instead, turn ON the R45 mini-game on ALL stations using BONUS_UPDATE + flags.
   uint32_t maskAll = 0; for (uint8_t sid = 1; sid <= MAX_STATIONS; ++sid) maskAll |= (1u << sid);
   bcastBonusUpdateFlags(g, maskAll, BONUS_F_R45);
+
+  // Snap wall timer to this intermission window
+  uint32_t now = millis();
+  sendStateTick(g, (g.bonus3End > now) ? (g.bonus3End - now) : 0);
+
+  Serial.println("[R45I] START (bonus intermission 3)");
 }
 
 void tickBonusIntermission3(Game& g, uint32_t now) {
   if (!g.bonusIntermission3) return;
 
-  // finish?
+  // End condition
   if ((int32_t)(now - g.bonus3End) >= 0) {
-    // force inventories to 0 (already are) and clear mini-game flag on Loot
-    for (uint8_t sid = 1; sid <= MAX_STATIONS; ++sid) {
-      if (g.stationInventory[sid] != 0) { g.stationInventory[sid] = 0; bcastStation(g, sid); }
-      g.bonusEndsAt[sid] = 0;
-    }
-    bcastBonusUpdateFlags(g, /*mask=*/0, BONUS_F_R45); // EXIT mini-game
+    // Turn OFF the mini-game on all stations
+    bcastBonusUpdateFlags(g, /*mask=*/0, BONUS_F_R45);
 
+    // Clean up tick SFX if it started
     if (g.bonusWarnTickStarted) { gameAudioStop(); g.bonusWarnTickStarted = false; }
 
-    g.bonusIntermission3 = false;
+    // Leave intermission and proceed to Round 5
+    g.bonusIntermission3   = false;
     g.noRedThisRound       = false;
     g.allowYellowThisRound = true;
+    startRound(g, /*idx=*/5);
 
-    startRound(g, /*idx=*/5);   // dummy R5
+    Serial.println("[R45I] END → Round 5");
     return;
   }
 
-  // last-3s tick SFX (same as your other intermissions)
+  // Last-3-seconds tick
   const uint32_t timeLeft = g.bonus3End - now;
   if (!g.bonusWarnTickStarted && timeLeft <= 3000) {
     gameAudioStop();
     gameAudioPlayOnce(TRK_TICKS_LOOP);
     g.bonusWarnTickStarted = true;
   }
-
-  // NOTE: No auto-decay here — Loot renders the mini-game locally.
 }
 
 void startRound45(Game& g, uint16_t msTotal,
