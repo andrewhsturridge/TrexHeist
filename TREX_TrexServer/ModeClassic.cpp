@@ -471,61 +471,51 @@ void startBonusIntermission3(Game& g, uint16_t durationMs /*=60000*/) {
   g.noRedThisRound       = true;
   g.allowYellowThisRound = false;
   enterGreen(g);
-
-  // optional: intermission video
   spritePlay(CLIP_LUNCHBREAK);
 
-  // fill all stations to capacity, broadcast, mark bonus ON for all
-  g.bonusActiveMask = 0;
-  for (uint8_t sid = ST_FIRST; sid <= ST_LAST; ++sid) {
-    g.stationInventory[sid] = g.stationCapacity[sid];
+  // R4.5: do NOT fill inventories; keep all at 0 so normal looting visuals never run
+  for (uint8_t sid = 1; sid <= MAX_STATIONS; ++sid) {
+    g.stationInventory[sid] = 0;
+    g.bonusEndsAt[sid]      = g.bonus3End;   // optional: TTL mirror (unused by Loot here)
     bcastStation(g, sid);
-    g.bonusActiveMask |= (1u << sid);
-    g.bonusEndsAt[sid] = g.bonus3End;
   }
-  bcastBonusUpdate(g);
+
+  // Tell all Loots to ENTER the mini-game via BONUS_UPDATE with the R45 flag
+  uint32_t maskAll = 0; for (uint8_t sid = 1; sid <= MAX_STATIONS; ++sid) maskAll |= (1u << sid);
+  bcastBonusUpdateFlags(g, maskAll, BONUS_F_R45);
 }
 
 void tickBonusIntermission3(Game& g, uint32_t now) {
   if (!g.bonusIntermission3) return;
 
-  // finish
+  // finish?
   if ((int32_t)(now - g.bonus3End) >= 0) {
-    for (uint8_t sid = ST_FIRST; sid <= ST_LAST; ++sid) {
+    // force inventories to 0 (already are) and clear mini-game flag on Loot
+    for (uint8_t sid = 1; sid <= MAX_STATIONS; ++sid) {
       if (g.stationInventory[sid] != 0) { g.stationInventory[sid] = 0; bcastStation(g, sid); }
       g.bonusEndsAt[sid] = 0;
     }
-    g.bonusActiveMask = 0; bcastBonusUpdate(g);
+    bcastBonusUpdateFlags(g, /*mask=*/0, BONUS_F_R45); // EXIT mini-game
+
     if (g.bonusWarnTickStarted) { gameAudioStop(); g.bonusWarnTickStarted = false; }
 
     g.bonusIntermission3 = false;
     g.noRedThisRound       = false;
     g.allowYellowThisRound = true;
 
-    // proceed to Round 5 (dummy: same as Round 4 for now)
-    startRound(g, /*idx=*/5);
+    startRound(g, /*idx=*/5);   // dummy R5
     return;
   }
 
-  // linear auto-decay toward 0 by end
-  const uint32_t T        = g.bonus3End - g.bonus3Start;
+  // last-3s tick SFX (same as your other intermissions)
   const uint32_t timeLeft = g.bonus3End - now;
-
-  // last 3 seconds tick SFX
   if (!g.bonusWarnTickStarted && timeLeft <= 3000) {
     gameAudioStop();
     gameAudioPlayOnce(TRK_TICKS_LOOP);
     g.bonusWarnTickStarted = true;
   }
 
-  for (uint8_t sid = ST_FIRST; sid <= ST_LAST; ++sid) {
-    const uint16_t cap    = g.stationCapacity[sid];
-    const uint16_t target = (uint16_t)((uint64_t)cap * timeLeft / T);
-    if (g.stationInventory[sid] > target) {
-      g.stationInventory[sid] = target;
-      bcastStation(g, sid);
-    }
-  }
+  // NOTE: No auto-decay here — Loot renders the mini-game locally.
 }
 
 void startRound45(Game& g, uint16_t msTotal,

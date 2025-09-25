@@ -246,6 +246,7 @@ static bool g_audioOneShot = false;
 static uint32_t g_bonusExclusiveUntilMs = 0;
 static bool     g_chimeActive = false;
 static bool     g_resumeLoopAfterChime = false;   // resume replenish loop after chime
+static bool g_bonusAtTap = false;
 
 /* ── OTA campaign state ──────────────────────────────── */
 bool      otaInProgress     = false;
@@ -406,9 +407,14 @@ static inline void selectClip(bool bonus) {
 }
 
 static inline bool startLootAudio(bool bonus) {
-  g_audioOneShot = bonus;         // tap = one-shot
-  if (bonus) g_bonusExclusiveUntilMs = millis() + 350;   // first 350 ms: be gentle
-  else       g_bonusExclusiveUntilMs = 0;
+  g_audioOneShot = bonus;                 // bonus => one-shot
+  if (bonus) {
+    g_bonusExclusiveUntilMs = millis() + 350;
+    if (playing) stopAudio();             // <-- ensure the bonus clip actually starts
+  } else {
+    g_bonusExclusiveUntilMs = 0;
+    // normal loop: it's fine to keep playing if already running
+  }
   selectClip(bonus);
   return startAudio();
 }
@@ -440,6 +446,16 @@ static void playBonusSpawnChime() {
 #endif
 }
 
+// Force-replace any currently playing audio (e.g., the spawn chime) with the loot clip.
+static inline void forceStartLootAudio(bool bonus) {
+  if (playing) stopAudio();                 // pre-empt chime/loop immediately
+  g_chimeActive = false;                    // cancel chime state
+  g_audioOneShot = bonus;                   // one-shot semantics when bonus
+  g_bonusExclusiveUntilMs = bonus ? (millis() + 350) : 0;
+  selectClip(bonus);
+  startAudio();
+}
+
 /* ── helpers ─────────────────────────────────────────── */
 bool isAnyCardPresent(MFRC522 &m) {
   byte atqa[2]; byte len = 2;
@@ -462,12 +478,19 @@ void packHeader(uint8_t type, uint16_t payLen, uint8_t* buf) {
   h->seq          = g_seq++;
 }
 
-// One-shot scheduled audio stop
+// One-shot scheduled audio stop (guarded so bonus/chime keep playing)
 static uint32_t schedAudioStopAt = 0;
-inline void scheduleAudioStop(uint16_t delayMs) { schedAudioStopAt = millis() + delayMs; }
+
+inline void scheduleAudioStop(uint16_t delayMs) {
+  schedAudioStopAt = millis() + delayMs;
+}
+
 inline void tickScheduledAudio() {
   if (schedAudioStopAt && (int32_t)(millis() - schedAudioStopAt) >= 0) {
-    stopAudio();
+    // Don't kill bonus one-shots or the spawn chime
+    if (!g_audioOneShot && !g_chimeActive) {
+      stopAudio();
+    }
     schedAudioStopAt = 0;
   }
 }
@@ -671,6 +694,7 @@ void fillRing(uint32_t c) {
 }
 
 void fillGauge(uint32_t c) {
+  if (r45Active) return;     // ignore generic fills while mini-game is active
   for (uint16_t i=0;i<GAUGE_LEN;++i) gauge.setPixelColor(i,c);
 
   // Inject overlay into this same frame (no second show)
@@ -738,17 +762,18 @@ inline void stopYellowBlink() {
 }
 
 inline void tickYellowBlink() {
-  if (r45Active) return;
+  if (r45Active) return;  // your existing guard for R4.5
+  // NEW: don’t blink the gauge while in a regular BONUS and light is GREEN
+  if (s_isBonusNow && g_lightState == LightState::GREEN) return;
+
   if (!yellowBlinkActive) return;
   uint32_t now = millis();
   if ((now - yellowBlinkLastMs) >= YELLOW_BLINK_PERIOD_MS) {
     yellowBlinkLastMs = now;
     yellowBlinkOn = !yellowBlinkOn;
     if (yellowBlinkOn) {
-      // ON phase: draw lit portion in YELLOW (via drawGaugeInventory)
       drawGaugeInventory(inv, cap);
     } else {
-      // OFF phase: darken the gauge (don’t affect MOSFET)
       fillGauge(OFF);
     }
   }
@@ -756,8 +781,12 @@ inline void tickYellowBlink() {
 
 // ── Empty-station blink (first gauge LED white) ─────────────
 inline void forceGaugeRepaint() {
-  gaugeCacheValid = false;         // bust cache so we truly repaint
-  drawGaugeAuto(inv, cap);         // rainbow if bonus
+  if (r45Active) {           // 4.5 owns the gauge; repaint the mini-game frame
+    drawR45Frame();
+    return;
+  }
+  gaugeCacheValid = false;
+  drawGaugeAuto(inv, cap);
 }
 
 inline void applyEmptyOverlay() {
@@ -1088,12 +1117,23 @@ void sendHello() {
   Transport::sendToServer(buf, sizeof(buf));
 }
 
+// Start a hold and snapshot bonus-at-tap to defeat races with BONUS_UPDATE
 void sendHoldStart(const TrexUid& uid) {
-  uint8_t buf[sizeof(MsgHeader)+sizeof(LootHoldStartPayload)];
+  uint8_t buf[sizeof(MsgHeader) + sizeof(LootHoldStartPayload)];
+
+  // Create a new hold id
   holdId = (uint32_t)esp_random();
+
+  // Pack header + payload
   packHeader((uint8_t)MsgType::LOOT_HOLD_START, sizeof(LootHoldStartPayload), buf);
   auto* p = (LootHoldStartPayload*)(buf + sizeof(MsgHeader));
-  p->holdId = holdId; p->uid = uid; p->stationId = STATION_ID;
+  p->holdId    = holdId;
+  p->uid       = uid;
+  p->stationId = STATION_ID;
+
+  // >>> Snapshot whether we're in BONUS *now* (at the tap)
+  g_bonusAtTap = s_isBonusNow;
+
   Transport::sendToServer(buf, sizeof(buf));
 }
 
@@ -1106,6 +1146,7 @@ void sendHoldStop() {
   Transport::sendToServer(buf, sizeof(buf));
   holdActive = false;
   holdId = 0;
+  g_bonusAtTap = false;  // clear snapshot at end of hold
 }
 
 // sender
@@ -1191,15 +1232,19 @@ void onRx(const uint8_t* data, uint16_t len) {
 
         holdActive = true;
 
-        startLootAudio(s_isBonusNow);
+        // Pre-empt spawn chime (or any clip) and start the correct one immediately
+        forceStartLootAudio(g_bonusAtTap || s_isBonusNow);
 
         // FULL indicator (ring blink) vs carried ring
         if (carried >= maxCarry) {
           if (!fullAnnounced || blinkHoldId != p->holdId) {
-            startFullBlinkImmediate();      // (has chime guard, or add if you like)
+            startFullBlinkImmediate();
             fullAnnounced = true;
             blinkHoldId   = p->holdId;
-            scheduleAudioStop(AUDIO_STOP_STAGGER_MS);   // ← stop audio a few ms later
+            // Do not stop audio if this tap is a bonus one-shot or a spawn chime is active
+            if (!(s_isBonusNow || g_audioOneShot || g_chimeActive)) {
+              scheduleAudioStop(AUDIO_STOP_STAGGER_MS);
+            }
           }
         } else {
           if (fullBlinkActive) stopFullBlink();
@@ -1295,6 +1340,7 @@ void onRx(const uint8_t* data, uint16_t len) {
       if (!g_audioOneShot && !g_chimeActive) {
         stopAudio();
       }
+      g_bonusAtTap = false;  // clear snapshot at end of hold
 
       fullAnnounced = false;
 
@@ -1432,52 +1478,55 @@ void onRx(const uint8_t* data, uint16_t len) {
       const bool r45mode = (h->flags & BONUS_F_R45) != 0;
 
       if (r45mode) {
-        // R4.5 mini-game is controlled by mask bits: if my bit is set -> RUN; else -> STOP
         const bool mine = ((mask >> STATION_ID) & 0x1u) != 0;
 
         if (mine && !r45Active) {
-          // Enter mini-game locally: reset attempt flags; kill blinkers; randomize segment & speed; draw
+          // Enter mini-game
           r45Active = true; r45Used = false; r45Success = false; r45Attempting = false;
-          stopYellowBlink();
-          stopEmptyBlink();
+          stopYellowBlink(); stopEmptyBlink();
 
-          // reasonable defaults (can tweak if you like)
-          uint8_t segMin=8, segMax=16;
+          // Randomize segment + speed
+          uint8_t segMin = 8, segMax = 16;
           r45SegLen = segMin + (esp_random() % (uint32_t)(segMax - segMin + 1));
           if (r45SegLen > GAUGE_LEN) r45SegLen = GAUGE_LEN;
           uint8_t maxStart = (GAUGE_LEN > r45SegLen) ? (uint8_t)(GAUGE_LEN - r45SegLen) : 0;
           r45SegStart = (maxStart > 0) ? (uint8_t)(esp_random() % (maxStart + 1)) : 0;
 
-          uint16_t stepMin=20, stepMax=60;
+          uint16_t stepMin = 20, stepMax = 60;
           r45StepMs = stepMin + (esp_random() % (uint32_t)(stepMax - stepMin + 1));
 
           r45Pos = 0; r45Dir = +1; r45NextStepAt = millis() + r45StepMs;
           digitalWrite(PIN_MOSFET, HIGH);
           drawR45Frame();
-
-          // Optional: ring ping to confirm visually
-          // for (int i=0;i<2;i++){ fillRing(Adafruit_NeoPixel::Color(255,0,255)); delay(60); fillRing(OFF); delay(40); }
         }
 
         if (!mine && r45Active) {
-          // Exit mini-game locally
+          // Exit mini-game
           r45Active = false; r45Used = false; r45Attempting = false;
           fillGauge(OFF); fillRing(RED);
         }
 
-        break; // IMPORTANT: don't fall through to normal bonus logic
+        break;  // do not fall through to normal bonus logic
       }
 
       // --- Normal BONUS behavior (no R4.5 flag) ---
       bool wasBonus = s_isBonusNow;
       s_isBonusNow  = ((mask >> STATION_ID) & 0x1u) != 0;
 
-      if (!wasBonus && s_isBonusNow) playBonusSpawnChime();
-      if (wasBonus && !s_isBonusNow) stopBonusBlink();
+      if (!wasBonus && s_isBonusNow) {
+        // Entering bonus: chime + kill blinkers so nothing blanks the next frame
+        playBonusSpawnChime();
+        stopYellowBlink();
+        stopEmptyBlink();
+      }
+      if (wasBonus && !s_isBonusNow) {
+        stopBonusBlink();
+      }
 
-      if (gameActive && stationInited && !otaInProgress && canPaintGaugeNow()) {
+      // Paint immediately, bypassing yellow OFF gating so the frame can’t be blanked
+      if (gameActive && stationInited && !otaInProgress) {
         gaugeCacheValid = false;
-        drawGaugeAuto(inv, cap);
+        drawGaugeAuto(inv, cap);   // draws rainbow in GREEN when s_isBonusNow==true
       }
       break;
     }
