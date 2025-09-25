@@ -156,6 +156,9 @@ void sendRound45Start(Game& g, uint16_t msTotal, uint8_t segMin, uint8_t segMax,
   p->stepMsMin = stepMsMin;
   p->stepMsMax = stepMsMax;
   Transport::broadcast(buf, sizeof(buf));
+  Serial.printf("[R45] START ms=%u seg[%u..%u] step[%u..%u]\n",
+              (unsigned)msTotal, (unsigned)segMin, (unsigned)segMax,
+              (unsigned)stepMsMin, (unsigned)stepMsMax);
 }
 
 /* ── RX handler (stations → server) ───────────────────────── */
@@ -352,6 +355,14 @@ void onRx(const uint8_t* data, uint16_t len) {
     case MsgType::ROUND45_RESULT: {
       if (h->payloadLen != sizeof(Round45ResultPayload)) break;
       auto* p = (const Round45ResultPayload*)(data + sizeof(MsgHeader));
+
+      if (p->success == 2) {
+        Serial.printf("[R45] READY from sid=%u (plen=%u) seg=%u len=%u step? (client)\n",
+                      (unsigned)p->stationId, (unsigned)h->payloadLen,
+                      (unsigned)p->segStart, (unsigned)p->segLen);
+        // Do not mark used; just a readiness ping
+        break;
+      }
 
       // Use the global Game via a local alias (matches other cases)
       extern Game g; Game& G = g;

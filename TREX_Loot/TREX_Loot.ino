@@ -646,6 +646,7 @@ inline void drawGaugeAuto(uint16_t inventory, uint16_t capacity) {
 inline void tickBonusRainbow() {
   // Only animate when: game active, bonus on THIS station, we have inventory, and light is GREEN
   if (!(gameActive && s_isBonusNow && inv > 0 && g_lightState == LightState::GREEN)) return;
+  if (r45Active) return;
 
   uint32_t now = millis();
   if ((int32_t)(now - nextGaugeDrawAtMs) < 0) return;  // reuse your 20ms throttle
@@ -732,6 +733,7 @@ inline void stopYellowBlink() {
 }
 
 inline void tickYellowBlink() {
+  if (r45Active) return;
   if (!yellowBlinkActive) return;
   uint32_t now = millis();
   if ((now - yellowBlinkLastMs) >= YELLOW_BLINK_PERIOD_MS) {
@@ -779,6 +781,7 @@ inline void stopEmptyBlink() {
 }
 
 inline void tickEmptyBlink() {
+  if (r45Active) return;
   if (!emptyBlinkActive) return;
   uint32_t now = millis();
   if ((now - emptyBlinkLastMs) >= EMPTY_BLINK_PERIOD_MS) {
@@ -791,6 +794,7 @@ inline void tickEmptyBlink() {
 
 // Paint only when we’re not in an OFF phase of Yellow blink (bonus blink removed)
 inline bool canPaintGaugeNow() {
+  if (r45Active) return false;
   return (!yellowBlinkActive || yellowBlinkOn);
 }
 
@@ -1159,33 +1163,42 @@ void onRx(const uint8_t* data, uint16_t len) {
     }
 
     case MsgType::ROUND45_START: {
-      if (h->payloadLen != sizeof(Round45StartPayload)) break;
-      auto* p = (const Round45StartPayload*)(data + sizeof(MsgHeader));
+      // Accept 6..8 bytes: [msTotal(2)][segMin(1)][segMax(1)][stepMin(2?)][stepMax(2?)]
+      if (h->payloadLen < 4) break;
+      const uint8_t* pl = data + sizeof(MsgHeader);
 
-      // Enter 4.5 mode, reset attempt flags
+      // Enter 4.5; reset flags; kill blinkers that could repaint over the frame
       r45Active = true; r45Used = false; r45Success = false; r45Attempting = false;
+      stopYellowBlink();
+      stopEmptyBlink();
 
-      // Randomize segment and speed within windows
-      uint8_t segMin = p->segMin, segMax = p->segMax;
+      // Parse with tolerant bounds
+      uint16_t msTotal  = (uint16_t)pl[0] | ((uint16_t)pl[1] << 8);
+      uint8_t  segMin   = pl[2];
+      uint8_t  segMax   = pl[3];
+      uint16_t stepMin  = 30, stepMax = 60;
+      if (h->payloadLen >= 6) stepMin = (uint16_t)pl[4] | ((uint16_t)pl[5] << 8);
+      if (h->payloadLen >= 8) stepMax = (uint16_t)pl[6] | ((uint16_t)pl[7] << 8);
+
       if (segMin < 1) segMin = 1;
       if (segMax < segMin) segMax = segMin;
       r45SegLen = segMin + (esp_random() % (uint32_t)(segMax - segMin + 1));
       if (r45SegLen > GAUGE_LEN) r45SegLen = GAUGE_LEN;
-      if (r45SegLen < 1) r45SegLen = 1;
 
       uint8_t maxStart = (GAUGE_LEN > r45SegLen) ? (uint8_t)(GAUGE_LEN - r45SegLen) : 0;
       r45SegStart = (maxStart > 0) ? (uint8_t)(esp_random() % (maxStart + 1)) : 0;
 
-      uint16_t sMin = p->stepMsMin, sMax = p->stepMsMax;
-      if (sMin < 5) sMin = 5;
-      if (sMax < sMin) sMax = sMin;
-      r45StepMs     = sMin + (uint32_t)(esp_random() % (uint32_t)(sMax - sMin + 1));
+      if (stepMin < 5) stepMin = 5;
+      if (stepMax < stepMin) stepMax = stepMin;
+      r45StepMs = stepMin + (uint32_t)(esp_random() % (uint32_t)(stepMax - stepMin + 1));
 
-      // Init green at 0 moving forward
+      // Init moving green and draw first frame
       r45Pos = 0; r45Dir = +1; r45NextStepAt = millis() + r45StepMs;
-
-      // Draw first frame
+      digitalWrite(PIN_MOSFET, HIGH);     // ensure lamp is on during 4.5
       drawR45Frame();
+
+      // Optional: “ready” ping so you can see from server that we entered 4.5
+      sendRound45Result(/*success*/2, r45Pos, r45SegStart, r45SegLen);
       break;
     }
 
