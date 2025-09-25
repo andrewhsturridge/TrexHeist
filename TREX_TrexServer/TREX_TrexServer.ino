@@ -173,7 +173,7 @@ void loop() {
       uint32_t msLeft = 0;
       if      (g.bonusIntermission)  msLeft = (g.bonusInterEnd  > now)?(g.bonusInterEnd  - now):0;
       else if (g.bonusIntermission2) msLeft = (g.bonus2End      > now)?(g.bonus2End      - now):0;
-      else if (g.r45Active)          msLeft = (g.r45End         > now)?(g.r45End         - now):0;
+      else if (g.bonusIntermission3) msLeft = (g.bonus3End      > now)?(g.bonus3End      - now):0;
       else                           msLeft = (g.roundEndAt     > now)?(g.roundEndAt     - now):0;
       sendStateTick(g, msLeft);
     }
@@ -258,7 +258,7 @@ void loop() {
 
   if      (g.bonusIntermission)  { tickBonusIntermission(g, now); }
   else if (g.bonusIntermission2) { tickBonusIntermission2(g, now); }
-  else if (g.r45Active)          { tickRound45(g, now); }
+  else if (g.bonusIntermission3) { tickBonusIntermission3(g, now); }
   else                           { tickCadence(g, now); }
 
 }

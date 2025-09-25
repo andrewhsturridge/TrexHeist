@@ -83,6 +83,12 @@ struct Game {
   uint8_t  bonus2Order[MAX_STATIONS];  // 1..MAX_STATIONS
   uint8_t  bonus2Idx = 0;              // next index into bonus2Order
 
+  // --- Intermission after R4 (R4.5): all stations bonus, auto-drain to 0 ---
+  bool     bonusIntermission3 = false;
+  uint32_t bonus3Start        = 0;
+  uint32_t bonus3End          = 0;
+  uint16_t bonus3Ms           = 60000;   // 60 s window
+
   // --- Bonus runtime state (cleared at round start) ---
   uint32_t bonusActiveMask = 0;                 // bit i => station i is bonus-active
   uint32_t bonusEndsAt[MAX_STATIONS] = {0};     // per-station TTL end time (millis)

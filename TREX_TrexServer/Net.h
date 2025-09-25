@@ -13,6 +13,8 @@ void sendDropResult(Game& g, uint16_t dropped, uint8_t readerIndex = DROP_READER
 
 void bcastRoundStatus(Game& g);
 void bcastBonusUpdate(Game& g);
+// BONUS_UPDATE with header flags (used by R4.5 control)
+void bcastBonusUpdateFlags(Game& g, uint32_t mask, uint8_t flags);
 
 // Point messages
 void sendHoldEnd(Game& g, uint32_t holdId, uint8_t reason);

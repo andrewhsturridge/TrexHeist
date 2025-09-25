@@ -108,6 +108,11 @@ static void ensureIdentity() {
     Serial.printf("[ID] Loaded -> id=%u host=%s\n", STATION_ID, HOSTNAME);
   }
 }
+//temp selftest
+// ---- DEV SELFTEST for R4.5 (auto-start once after boot) ----
+static bool devR45TestArmed = true;  // set false to disable
+static uint32_t devR45TestAt = 0;
+
 
 /* ── LED config ──────────────────────────────────────── */
 constexpr uint16_t GAUGE_LEN        = 56;     // pipe gauge length (px)
@@ -1162,46 +1167,6 @@ void onRx(const uint8_t* data, uint16_t len) {
       break;
     }
 
-    case MsgType::ROUND45_START: {
-      // Accept 6..8 bytes: [msTotal(2)][segMin(1)][segMax(1)][stepMin(2?)][stepMax(2?)]
-      if (h->payloadLen < 4) break;
-      const uint8_t* pl = data + sizeof(MsgHeader);
-
-      // Enter 4.5; reset flags; kill blinkers that could repaint over the frame
-      r45Active = true; r45Used = false; r45Success = false; r45Attempting = false;
-      stopYellowBlink();
-      stopEmptyBlink();
-
-      // Parse with tolerant bounds
-      uint16_t msTotal  = (uint16_t)pl[0] | ((uint16_t)pl[1] << 8);
-      uint8_t  segMin   = pl[2];
-      uint8_t  segMax   = pl[3];
-      uint16_t stepMin  = 30, stepMax = 60;
-      if (h->payloadLen >= 6) stepMin = (uint16_t)pl[4] | ((uint16_t)pl[5] << 8);
-      if (h->payloadLen >= 8) stepMax = (uint16_t)pl[6] | ((uint16_t)pl[7] << 8);
-
-      if (segMin < 1) segMin = 1;
-      if (segMax < segMin) segMax = segMin;
-      r45SegLen = segMin + (esp_random() % (uint32_t)(segMax - segMin + 1));
-      if (r45SegLen > GAUGE_LEN) r45SegLen = GAUGE_LEN;
-
-      uint8_t maxStart = (GAUGE_LEN > r45SegLen) ? (uint8_t)(GAUGE_LEN - r45SegLen) : 0;
-      r45SegStart = (maxStart > 0) ? (uint8_t)(esp_random() % (maxStart + 1)) : 0;
-
-      if (stepMin < 5) stepMin = 5;
-      if (stepMax < stepMin) stepMax = stepMin;
-      r45StepMs = stepMin + (uint32_t)(esp_random() % (uint32_t)(stepMax - stepMin + 1));
-
-      // Init moving green and draw first frame
-      r45Pos = 0; r45Dir = +1; r45NextStepAt = millis() + r45StepMs;
-      digitalWrite(PIN_MOSFET, HIGH);     // ensure lamp is on during 4.5
-      drawR45Frame();
-
-      // Optional: “ready” ping so you can see from server that we entered 4.5
-      sendRound45Result(/*success*/2, r45Pos, r45SegStart, r45SegLen);
-      break;
-    }
-
     case MsgType::LOOT_HOLD_ACK: {
       if (h->payloadLen != sizeof(LootHoldAckPayload)) break;
       const LootHoldAckPayload* p =
@@ -1459,23 +1424,57 @@ void onRx(const uint8_t* data, uint16_t len) {
     case MsgType::BONUS_UPDATE: {
       if (h->payloadLen < 4) break;
       const uint8_t* pl = data + sizeof(MsgHeader);
-
       uint32_t mask = (uint32_t)pl[0]
                     | ((uint32_t)pl[1] << 8)
                     | ((uint32_t)pl[2] << 16)
                     | ((uint32_t)pl[3] << 24);
 
+      const bool r45mode = (h->flags & BONUS_F_R45) != 0;
+
+      if (r45mode) {
+        // R4.5 mini-game is controlled by mask bits: if my bit is set -> RUN; else -> STOP
+        const bool mine = ((mask >> STATION_ID) & 0x1u) != 0;
+
+        if (mine && !r45Active) {
+          // Enter mini-game locally: reset attempt flags; kill blinkers; randomize segment & speed; draw
+          r45Active = true; r45Used = false; r45Success = false; r45Attempting = false;
+          stopYellowBlink();
+          stopEmptyBlink();
+
+          // reasonable defaults (can tweak if you like)
+          uint8_t segMin=8, segMax=16;
+          r45SegLen = segMin + (esp_random() % (uint32_t)(segMax - segMin + 1));
+          if (r45SegLen > GAUGE_LEN) r45SegLen = GAUGE_LEN;
+          uint8_t maxStart = (GAUGE_LEN > r45SegLen) ? (uint8_t)(GAUGE_LEN - r45SegLen) : 0;
+          r45SegStart = (maxStart > 0) ? (uint8_t)(esp_random() % (maxStart + 1)) : 0;
+
+          uint16_t stepMin=20, stepMax=60;
+          r45StepMs = stepMin + (esp_random() % (uint32_t)(stepMax - stepMin + 1));
+
+          r45Pos = 0; r45Dir = +1; r45NextStepAt = millis() + r45StepMs;
+          digitalWrite(PIN_MOSFET, HIGH);
+          drawR45Frame();
+
+          // Optional: ring ping to confirm visually
+          // for (int i=0;i<2;i++){ fillRing(Adafruit_NeoPixel::Color(255,0,255)); delay(60); fillRing(OFF); delay(40); }
+        }
+
+        if (!mine && r45Active) {
+          // Exit mini-game locally
+          r45Active = false; r45Used = false; r45Attempting = false;
+          fillGauge(OFF); fillRing(RED);
+        }
+
+        break; // IMPORTANT: don't fall through to normal bonus logic
+      }
+
+      // --- Normal BONUS behavior (no R4.5 flag) ---
       bool wasBonus = s_isBonusNow;
       s_isBonusNow  = ((mask >> STATION_ID) & 0x1u) != 0;
 
-      if (!wasBonus && s_isBonusNow) {
-        playBonusSpawnChime();              // your existing chime
-      }
-      if (wasBonus && !s_isBonusNow) {
-        stopBonusBlink();                   // no-op, but keeps state clean
-      }
+      if (!wasBonus && s_isBonusNow) playBonusSpawnChime();
+      if (wasBonus && !s_isBonusNow) stopBonusBlink();
 
-      // Immediate repaint (rainbow in GREEN when bonus is on)
       if (gameActive && stationInited && !otaInProgress && canPaintGaugeNow()) {
         gaugeCacheValid = false;
         drawGaugeAuto(inv, cap);
@@ -1531,16 +1530,16 @@ void setup() {
   i2sOut->SetPinout(PIN_I2S_BCLK, PIN_I2S_LRCLK, PIN_I2S_DOUT);
   i2sOut->SetGain(0.6f);
 
-#if TREX_AUDIO_PROGMEM
-  // First construction (open state = true)
-  wavSrc = new (wavSrcStorage) AudioFileSourcePROGMEM(replenish_wav, replenish_wav_len);
-#endif
+  #if TREX_AUDIO_PROGMEM
+    // First construction (open state = true)
+    wavSrc = new (wavSrcStorage) AudioFileSourcePROGMEM(replenish_wav, replenish_wav_len);
+  #endif
 
-#if !TREX_AUDIO_PROGMEM
-  File f = LittleFS.open(CLIP_PATH, "r");
-  if (!f) Serial.println("[LOOT] Missing /replenish.wav on LittleFS");
-  else { Serial.printf("[LOOT] WAV size: %u bytes\n", (unsigned)f.size()); f.close(); }
-#endif
+  #if !TREX_AUDIO_PROGMEM
+    File f = LittleFS.open(CLIP_PATH, "r");
+    if (!f) Serial.println("[LOOT] Missing /replenish.wav on LittleFS");
+    else { Serial.printf("[LOOT] WAV size: %u bytes\n", (unsigned)f.size()); f.close(); }
+  #endif
 
   TransportConfig cfg{ /*maintenanceMode=*/false, /*wifiChannel=*/WIFI_CHANNEL };
   if (!Transport::init(cfg, onRx)) {
@@ -1549,6 +1548,8 @@ void setup() {
   }
 
   transportReady = true;
+
+  devR45TestAt = millis() + 3000;   // start selftest at t=3s
 
   Serial.printf("Trex proto ver: %d\n", TREX_PROTO_VERSION);
   drawGaugeInventory(inv, cap);
@@ -1734,6 +1735,30 @@ void loop() {
         }
       }
     }
+  }
+
+  // ---- R4.5 SELFTEST (runs once if radio path isn’t working) ----
+  if (devR45TestArmed && (int32_t)(millis() - devR45TestAt) >= 0 && !r45Active && gameActive) {
+    devR45TestArmed = false;             // run once
+    // Enter 4.5 locally (no radio)
+    r45Active = true; r45Used = false; r45Success = false; r45Attempting = false;
+    stopYellowBlink(); stopEmptyBlink();
+    // Segment & speed: 8–16 px; 25–60 ms/px
+    r45SegLen = 8 + (esp_random() % 9);  // 8..16
+    if (r45SegLen > GAUGE_LEN) r45SegLen = GAUGE_LEN;
+    uint8_t maxStart = (GAUGE_LEN > r45SegLen) ? (uint8_t)(GAUGE_LEN - r45SegLen) : 0;
+    r45SegStart = (maxStart > 0) ? (uint8_t)(esp_random() % (maxStart + 1)) : 0;
+    r45StepMs = 25 + (esp_random() % 36); // 25..60
+    r45Pos = 0; r45Dir = +1; r45NextStepAt = millis() + r45StepMs;
+    digitalWrite(PIN_MOSFET, HIGH);
+    drawR45Frame();
+    // Auto-exit after 10 s so you’re not stuck
+    devR45TestAt = millis() + 10000;   // reuse as "selftest until" time
+  }
+  // End selftest after 10 s if it’s running
+  if (!devR45TestArmed && r45Active && (int32_t)(millis() - devR45TestAt) >= 0) {
+    r45Active = false;  // drop back to normal
+    fillGauge(OFF); fillRing(RED);
   }
 
 }

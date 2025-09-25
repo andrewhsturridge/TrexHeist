@@ -117,6 +117,18 @@ void bcastBonusUpdate(Game& g) {
   Transport::broadcast(buf, sizeof(buf));
 }
 
+// Broadcast BONUS_UPDATE with an explicit flags value in the header
+void bcastBonusUpdateFlags(Game& g, uint32_t mask, uint8_t flags) {
+  uint8_t buf[sizeof(MsgHeader) + sizeof(BonusUpdatePayload)];
+  packHeader(g, (uint8_t)MsgType::BONUS_UPDATE, sizeof(BonusUpdatePayload), buf);
+  // Set the flag bit(s) on the header AFTER packing
+  ((MsgHeader*)buf)->flags |= flags;
+
+  auto* p = (BonusUpdatePayload*)(buf + sizeof(MsgHeader));
+  p->mask = mask;
+  Transport::broadcast(buf, sizeof(buf));
+}
+
 void sendDropResult(Game& g, uint16_t dropped, uint8_t readerIndex /*=DROP_READER_UNKNOWN*/) {
   uint8_t buf[sizeof(MsgHeader) + sizeof(DropResultPayload)];
   packHeader(g, (uint8_t)MsgType::DROP_RESULT, sizeof(DropResultPayload), buf);
@@ -143,22 +155,6 @@ void sendLootTick(Game& g, uint32_t holdId, uint8_t carried, uint16_t stationInv
   auto* t=(LootTickPayload*)(buf+sizeof(MsgHeader));
   t->holdId=holdId; t->carried=carried; t->inventory=stationInv;
   Transport::broadcast(buf,sizeof(buf));
-}
-
-void sendRound45Start(Game& g, uint16_t msTotal, uint8_t segMin, uint8_t segMax,
-                      uint16_t stepMsMin, uint16_t stepMsMax) {
-  uint8_t buf[sizeof(MsgHeader) + sizeof(Round45StartPayload)];
-  packHeader(g, (uint8_t)MsgType::ROUND45_START, sizeof(Round45StartPayload), buf);
-  auto* p = (Round45StartPayload*)(buf + sizeof(MsgHeader));
-  p->msTotal   = msTotal;
-  p->segMin    = segMin;
-  p->segMax    = segMax;
-  p->stepMsMin = stepMsMin;
-  p->stepMsMax = stepMsMax;
-  Transport::broadcast(buf, sizeof(buf));
-  Serial.printf("[R45] START ms=%u seg[%u..%u] step[%u..%u]\n",
-              (unsigned)msTotal, (unsigned)segMin, (unsigned)segMax,
-              (unsigned)stepMsMin, (unsigned)stepMsMax);
 }
 
 /* ── RX handler (stations → server) ───────────────────────── */
@@ -349,42 +345,6 @@ void onRx(const uint8_t* data, uint16_t len) {
 
       sendDropResult(G, dropped, p->readerIndex);
       bcastScore(G);
-      break;
-    }
-
-    case MsgType::ROUND45_RESULT: {
-      if (h->payloadLen != sizeof(Round45ResultPayload)) break;
-      auto* p = (const Round45ResultPayload*)(data + sizeof(MsgHeader));
-
-      if (p->success == 2) {
-        Serial.printf("[R45] READY from sid=%u (plen=%u) seg=%u len=%u step? (client)\n",
-                      (unsigned)p->stationId, (unsigned)h->payloadLen,
-                      (unsigned)p->segStart, (unsigned)p->segLen);
-        // Do not mark used; just a readiness ping
-        break;
-      }
-
-      // Use the global Game via a local alias (matches other cases)
-      extern Game g; Game& G = g;
-
-      if (!G.r45Active) break;
-      uint8_t sid = p->stationId;
-      if (sid < 1 || sid > MAX_STATIONS) break;
-
-      uint8_t bit = (1u << sid);
-
-      // Only record the first report per station
-      if (!(G.r45UsedMask & bit)) {
-        G.r45UsedMask |= bit;
-        if (p->success) G.r45SuccessMask |= bit;
-
-        // If that was the last unused station, arm the +3 s end window
-        uint8_t allMask = 0;
-        for (uint8_t i = 1; i <= MAX_STATIONS; ++i) allMask |= (1u << i);
-        if ((G.r45UsedMask & allMask) == allMask && G.r45AllUsedAt == 0) {
-          G.r45AllUsedAt = millis();
-        }
-      }
       break;
     }
 
