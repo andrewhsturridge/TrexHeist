@@ -117,20 +117,6 @@ void bcastBonusUpdate(Game& g) {
   Transport::broadcast(buf, sizeof(buf));
 }
 
-// Net.cpp
-void bcastBonusUpdateFlags(Game& g, uint32_t mask, uint8_t flags) {
-  uint8_t buf[sizeof(MsgHeader) + 4];
-  packHeader(g, (uint8_t)MsgType::BONUS_UPDATE, /*payloadLen=*/4, buf);
-  auto* h = (MsgHeader*)buf;
-  h->flags = flags;                         // <— Loot checks this for R45 mode
-  uint8_t* pl = buf + sizeof(MsgHeader);
-  pl[0] = (uint8_t)(mask      & 0xFF);
-  pl[1] = (uint8_t)((mask>>8) & 0xFF);
-  pl[2] = (uint8_t)((mask>>16)& 0xFF);
-  pl[3] = (uint8_t)((mask>>24)& 0xFF);
-  Transport::broadcast(buf, sizeof(buf));
-}
-
 void sendDropResult(Game& g, uint16_t dropped, uint8_t readerIndex /*=DROP_READER_UNKNOWN*/) {
   uint8_t buf[sizeof(MsgHeader) + sizeof(DropResultPayload)];
   packHeader(g, (uint8_t)MsgType::DROP_RESULT, sizeof(DropResultPayload), buf);

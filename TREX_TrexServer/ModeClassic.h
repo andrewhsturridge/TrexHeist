@@ -13,10 +13,3 @@ void tickBonusIntermission(Game& g, uint32_t now);
 // R3.5 bonus intermission: 1 station active; hops every hopMs; ends → Round 4
 void startBonusIntermission2(Game& g, uint16_t durationMs = 15000, uint16_t hopMs = 3000);
 void tickBonusIntermission2(Game& g, uint32_t now);
-//R4..5
-void startBonusIntermission3(Game& g, uint16_t durationMs = 60000);
-void tickBonusIntermission3(Game& g, uint32_t now);
-void startRound45(Game& g, uint16_t msTotal = 60000,
-                  uint8_t segMin = 8, uint8_t segMax = 16,
-                  uint16_t stepMsMin = 20, uint16_t stepMsMax = 60);
-void tickRound45(Game& g, uint32_t now);

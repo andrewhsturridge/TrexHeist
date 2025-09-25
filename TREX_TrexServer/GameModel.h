@@ -83,27 +83,11 @@ struct Game {
   uint8_t  bonus2Order[MAX_STATIONS];  // 1..MAX_STATIONS
   uint8_t  bonus2Idx = 0;              // next index into bonus2Order
 
-  // --- Intermission after R4 (R4.5): all stations bonus, auto-drain to 0 ---
-  bool     bonusIntermission3 = false;
-  uint32_t bonus3Start        = 0;
-  uint32_t bonus3End          = 0;
-  uint16_t bonus3Ms           = 60000;   // 60 s window
-
   // --- Bonus runtime state (cleared at round start) ---
   uint32_t bonusActiveMask = 0;                 // bit i => station i is bonus-active
   uint32_t bonusEndsAt[MAX_STATIONS] = {0};     // per-station TTL end time (millis)
   uint32_t bonusNextSpawnAt = 0;                // scheduler next fire (millis)
   uint8_t  bonusSpawnsThisRound = 0;            // number of spawns so far in current round
-
-  // --- Intermission 4.5 (after Round 4): reflex mini-game (all stations) ---
-  bool     r45Active        = false;
-  uint32_t r45Start         = 0;
-  uint32_t r45End           = 0;
-  uint16_t r45Ms            = 60000;   // 60 s window
-
-  uint8_t  r45UsedMask      = 0;       // bit per station: 1 = attempted (success or miss)
-  uint8_t  r45SuccessMask   = 0;       // bit per station: 1 = success
-  uint32_t r45AllUsedAt     = 0;       // when all stations have attempted (for +3s end)
 
   // Grace + PIR
   uint32_t edgeGraceMs     = 300;

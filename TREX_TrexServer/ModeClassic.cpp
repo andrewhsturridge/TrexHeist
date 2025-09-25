@@ -452,128 +452,6 @@ void tickBonusIntermission2(Game& g, uint32_t now) {
   }
 }
 
-// ModeClassic.cpp
-void startBonusIntermission3(Game& g, uint16_t durationMs /*=60000*/) {
-  // End holds & clear carried so normal loot is fully paused
-  endAndClearHoldsAndCarried(g);
-
-  // Mark the window
-  g.bonusIntermission3   = true;
-  g.bonus3Start          = millis();
-  g.bonus3End            = g.bonus3Start + durationMs;
-  g.bonus3Ms             = durationMs;
-  g.bonusWarnTickStarted = false;
-
-  // Hold cadence at GREEN (mini-game runs under GREEN)
-  g.noRedThisRound       = true;
-  g.allowYellowThisRound = false;
-  enterGreen(g);
-
-  // Optional: video for intermission
-  spritePlay(CLIP_LUNCHBREAK);
-
-  // IMPORTANT: Do NOT broadcast inventory changes here — avoids gauge “off” flicker.
-  // Instead, turn ON the R45 mini-game on ALL stations using BONUS_UPDATE + flags.
-  uint32_t maskAll = 0; for (uint8_t sid = 1; sid <= MAX_STATIONS; ++sid) maskAll |= (1u << sid);
-  bcastBonusUpdateFlags(g, maskAll, BONUS_F_R45);
-
-  // Snap wall timer to this intermission window
-  uint32_t now = millis();
-  sendStateTick(g, (g.bonus3End > now) ? (g.bonus3End - now) : 0);
-
-  Serial.println("[R45I] START (bonus intermission 3)");
-}
-
-void tickBonusIntermission3(Game& g, uint32_t now) {
-  if (!g.bonusIntermission3) return;
-
-  // End condition
-  if ((int32_t)(now - g.bonus3End) >= 0) {
-    // Turn OFF the mini-game on all stations
-    bcastBonusUpdateFlags(g, /*mask=*/0, BONUS_F_R45);
-
-    // Clean up tick SFX if it started
-    if (g.bonusWarnTickStarted) { gameAudioStop(); g.bonusWarnTickStarted = false; }
-
-    // Leave intermission and proceed to Round 5
-    g.bonusIntermission3   = false;
-    g.noRedThisRound       = false;
-    g.allowYellowThisRound = true;
-    startRound(g, /*idx=*/5);
-
-    Serial.println("[R45I] END → Round 5");
-    return;
-  }
-
-  // Last-3-seconds tick
-  const uint32_t timeLeft = g.bonus3End - now;
-  if (!g.bonusWarnTickStarted && timeLeft <= 3000) {
-    gameAudioStop();
-    gameAudioPlayOnce(TRK_TICKS_LOOP);
-    g.bonusWarnTickStarted = true;
-  }
-}
-
-void startRound45(Game& g, uint16_t msTotal,
-                  uint8_t /*segMin*/, uint8_t /*segMax*/,
-                  uint16_t /*stepMsMin*/, uint16_t /*stepMsMax*/) {
-  endAndClearHoldsAndCarried(g);
-
-  g.r45Active   = true;
-  g.r45Start    = millis();
-  g.r45End      = g.r45Start + msTotal;
-  g.r45Ms       = msTotal;
-  g.r45UsedMask = 0;
-  g.r45SuccessMask = 0;
-  g.r45AllUsedAt = 0;
-
-  // Suppress cadence (hold GREEN)
-  g.noRedThisRound       = true;
-  g.allowYellowThisRound = false;
-  enterGreen(g);
-
-  // Zero station inventories so normal loot paths don't show visuals
-  for (uint8_t sid=1; sid<=MAX_STATIONS; ++sid) {
-    g.stationInventory[sid] = 0;
-    bcastStation(g, sid);
-  }
-
-  // Start mini-game on ALL stations using BONUS_UPDATE with the R45 flag
-  uint32_t maskAll = 0; for (uint8_t sid=1; sid<=MAX_STATIONS; ++sid) maskAll |= (1u<<sid);
-  bcastBonusUpdateFlags(g, maskAll, BONUS_F_R45);
-
-  // Snap external timer to 4.5
-  uint32_t now = millis();
-  sendStateTick(g, (g.r45End > now) ? (g.r45End - now) : 0);
-}
-
-void tickRound45(Game& g, uint32_t now) {
-  if (!g.r45Active) return;
-
-  // End by timer
-  if ((int32_t)(now - g.r45End) >= 0) {
-    g.r45Active = false;
-    // Clear the R45 flag & mask so Loot exits the mini-game
-    bcastBonusUpdateFlags(g, /*mask=*/0, BONUS_F_R45);
-
-    g.noRedThisRound       = false;
-    g.allowYellowThisRound = true;
-    bcastGameOver(g, /*MANUAL*/2, GAMEOVER_BLAME_ALL);
-    return;
-  }
-
-  // Or: all stations have tried → end 3 s later
-  if (g.r45AllUsedAt && (now - g.r45AllUsedAt >= 3000)) {
-    g.r45Active = false;
-    bcastBonusUpdateFlags(g, /*mask=*/0, BONUS_F_R45);
-
-    g.noRedThisRound       = false;
-    g.allowYellowThisRound = true;
-    bcastGameOver(g, /*MANUAL*/2, GAMEOVER_BLAME_ALL);
-    return;
-  }
-}
-
 void modeClassicForceRound(Game& g, uint8_t idx, bool playWin) {
   if (idx < 1) idx = 1;
   if (idx > 5) idx = 5;
@@ -645,19 +523,8 @@ void modeClassicNextRound(Game& g, bool playWin) {
     return;
   }
 
-  // From R4, go to 4.5 (intermission 3) if not active yet
-  if (g.roundIndex == 4 && !g.bonusIntermission3) { startBonusIntermission3(g, 60000); return; }
-
-  // If already in 4.5, finish early to R5
-  if (g.bonusIntermission3) {
-    g.bonusIntermission3 = false;
-    g.bonusActiveMask = 0;
-    for (uint8_t sid = 1; sid <= MAX_STATIONS; ++sid) g.bonusEndsAt[sid] = 0;
-    bcastBonusUpdate(g);
-    g.noRedThisRound = false; g.allowYellowThisRound = true;
-    startRound(g, /*idx=*/5);
-    return;
-  }
+  // From R4, go to 5
+  if (g.roundIndex == 4) { startRound(g, 5); return; }
 
   // Otherwise behave like before: advance one round (but never beyond 4).
   uint8_t next = (g.roundIndex >= 5) ? 5 : (g.roundIndex + 1);
@@ -692,7 +559,7 @@ void modeClassicMaybeAdvance(Game& g) {
   const uint32_t now = millis();
 
   // Do nothing while intermissions are running; their tickers advance them
-  if (g.bonusIntermission || g.bonusIntermission2 || g.bonusIntermission3) return;
+  if (g.bonusIntermission || g.bonusIntermission2) return;
 
   // Early advance when goal met
   if (g.teamScore >= g.roundGoal) {
@@ -700,7 +567,7 @@ void modeClassicMaybeAdvance(Game& g) {
     if      (g.roundIndex == 1) { startRound(g, 2); return; }
     else if (g.roundIndex == 2) { startBonusIntermission(g, 15000); return; }      // 2.5
     else if (g.roundIndex == 3) { startBonusIntermission2(g, 15000, 3000); return; } // 3.5
-    else if (g.roundIndex == 4) { startBonusIntermission3(g, 60000); return; }     // 4.5
+    else if (g.roundIndex == 4) { startRound(g, 5); return; }
   }
 
   // Timeout → success path or game over
@@ -710,6 +577,6 @@ void modeClassicMaybeAdvance(Game& g) {
     if      (g.roundIndex == 1) { startRound(g, 2); return; }
     else if (g.roundIndex == 2) { startBonusIntermission(g, 15000); return; }
     else if (g.roundIndex == 3) { startBonusIntermission2(g, 15000, 3000); return; }
-    else if (g.roundIndex == 4) { startBonusIntermission3(g, 60000); return; }
+    else if (g.roundIndex == 4) { startRound(g, 5); return; }
   }
 }

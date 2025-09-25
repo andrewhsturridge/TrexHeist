@@ -13,15 +13,10 @@ void sendDropResult(Game& g, uint16_t dropped, uint8_t readerIndex = DROP_READER
 
 void bcastRoundStatus(Game& g);
 void bcastBonusUpdate(Game& g);
-// BONUS_UPDATE with header flags (used by R4.5 control)
-void bcastBonusUpdateFlags(Game& g, uint32_t mask, uint8_t flags);
 
 // Point messages
 void sendHoldEnd(Game& g, uint32_t holdId, uint8_t reason);
 void sendLootTick(Game& g, uint32_t holdId, uint8_t carried, uint16_t stationInv);
-
-void sendRound45Start(Game& g, uint16_t msTotal, uint8_t segMin, uint8_t segMax,
-                      uint16_t stepMsMin, uint16_t stepMsMax);
 
 // RX dispatcher
 void onRx(const uint8_t* data, uint16_t len);
