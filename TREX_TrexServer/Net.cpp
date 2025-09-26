@@ -118,6 +118,25 @@ void bcastBonusUpdate(Game& g) {
   Transport::broadcast(buf, sizeof(buf));
 }
 
+void bcastMgStart(Game& g, const Game::MgConfig& c) {
+  uint8_t buf[sizeof(MsgHeader) + sizeof(MgStartPayload)];
+  packHeader(g, (uint8_t)MsgType::MG_START, sizeof(MgStartPayload), buf);
+  auto* p = (MgStartPayload*)(buf + sizeof(MsgHeader));
+  p->seed       = c.seed;
+  p->timerMs    = c.timerMs;
+  p->speedMinMs = c.speedMinMs;
+  p->speedMaxMs = c.speedMaxMs;
+  p->segMin     = c.segMin;
+  p->segMax     = c.segMax;
+  Transport::broadcast(buf, sizeof buf);
+}
+
+void bcastMgStop(Game& g) {
+  uint8_t buf[sizeof(MsgHeader)];
+  packHeader(g, (uint8_t)MsgType::MG_STOP, 0, buf);
+  Transport::broadcast(buf, sizeof buf);
+}
+
 void sendDropResult(Game& g, uint16_t dropped, uint8_t readerIndex /*=DROP_READER_UNKNOWN*/) {
   uint8_t buf[sizeof(MsgHeader) + sizeof(DropResultPayload)];
   packHeader(g, (uint8_t)MsgType::DROP_RESULT, sizeof(DropResultPayload), buf);
@@ -339,8 +358,28 @@ void onRx(const uint8_t* data, uint16_t len) {
 
     case MsgType::MG_RESULT: {
       if (h->payloadLen != sizeof(MgResultPayload)) break;
-      const auto* p = reinterpret_cast<const MgResultPayload*>(data + sizeof(MsgHeader));
-      MG_OnResult(g, *p, millis());
+      const auto* p = (const MgResultPayload*)(data + sizeof(MsgHeader));
+
+      extern Game g; Game& G = g;
+      if (!G.mgActive) break;
+      if (p->stationId < 1 || p->stationId > MAX_STATIONS) break;
+
+      const uint32_t bit = (1u << p->stationId);
+
+      // Only the first report per station counts
+      if (!(G.mgTriedMask & bit)) {
+        G.mgTriedMask |= bit;
+        if (p->success) {
+          G.mgSuccessMask |= bit;
+          G.teamScore += 1;            // +1 team point (swap to per-UID credit if you have it)
+          bcastScore(G);
+        }
+        // Arm the 3s all-done window the moment the last station tries
+        uint32_t allMask = 0; for (uint8_t sid=1; sid<=MAX_STATIONS; ++sid) allMask |= (1u<<sid);
+        if ((G.mgTriedMask & allMask) == allMask && G.mgAllTriedAt == 0) {
+          G.mgAllTriedAt = millis();
+        }
+      }
       break;
     }
 

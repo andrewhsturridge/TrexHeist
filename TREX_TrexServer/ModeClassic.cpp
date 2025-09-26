@@ -6,6 +6,8 @@
 #include "Media.h"
 #include "esp_system.h"
 #include "ServerMini.h"
+#include <esp_random.h>
+#include <TrexProtocol.h>
 
 // --- Random split of TOTAL across 5 stations, each <= 56 ---
 static void splitInventoryRandom(Game& g, uint16_t total /*=100*/) {
@@ -525,20 +527,25 @@ void modeClassicNextRound(Game& g, bool playWin) {
   }
 
   // From R4, go to minigame
-  if (g.round == 4) {
-    MgConfig cfg;
-    cfg.seed       = 0;      // auto from esp_random()
-    cfg.timerMs    = 60000;  // 1 minute
-    cfg.speedMinMs = 20;
-    cfg.speedMaxMs = 80;
-    cfg.segMin     = 6;
-    cfg.segMax     = 16;
+  if (g.roundIndex == 4) {
+    // Arm minigame (top-level fields, consistent with your .ino)
+    g.mgActive          = true;
+    g.mgCfg.seed        = esp_random();
+    g.mgCfg.timerMs     = 60000;   // 1 minute
+    g.mgCfg.speedMinMs  = 20;
+    g.mgCfg.speedMaxMs  = 80;
+    g.mgCfg.segMin      = 6;
+    g.mgCfg.segMax      = 16;
 
-    g.mg.expectedStations = 5;  // <-- set to your actual Loot count
-    MG_Start(g, cfg, millis());
+    g.mgStartedAt       = millis();
+    g.mgDeadline        = g.mgStartedAt + g.mgCfg.timerMs;
+    g.mgAllTriedAt      = 0;
+    g.mgTriedMask       = 0;
+    g.mgSuccessMask     = 0;
+    g.mgExpectedStations= 5;       // set to your actual number of Loot stations
 
-    // Do NOT call nextRound yet; MG_Tick will end & you'll proceed afterward
-    return;
+    bcastMgStart(g, g.mgCfg);      // broadcast MG_START to clients
+    return;                        // IMPORTANT: don't fall through to normal next-round logic yet
   }
 
   // Otherwise behave like before: advance one round (but never beyond 4).
@@ -576,22 +583,55 @@ void modeClassicMaybeAdvance(Game& g) {
   // Do nothing while intermissions are running; their tickers advance them
   if (g.bonusIntermission || g.bonusIntermission2) return;
 
-  // Early advance when goal met
+  // CASE: round goal met
   if (g.teamScore >= g.roundGoal) {
     gameAudioStop();
     if      (g.roundIndex == 1) { startRound(g, 2); return; }
-    else if (g.roundIndex == 2) { startBonusIntermission(g, 15000); return; }      // 2.5
-    else if (g.roundIndex == 3) { startBonusIntermission2(g, 15000, 3000); return; } // 3.5
-    else if (g.roundIndex == 4) { startRound(g, 5); return; }
+    else if (g.roundIndex == 2) { startBonusIntermission(g, /*durationMs=*/15000); return; }
+    else if (g.roundIndex == 3) { startRound(g, 4); return; }
+    else if (g.roundIndex == 4) {
+      // === START MINIGAME ===
+      g.mgActive     = true;
+      g.mgCfg.seed   = esp_random();
+      g.mgCfg.timerMs= 60000;
+      g.mgCfg.speedMinMs = 20;  g.mgCfg.speedMaxMs = 80;
+      g.mgCfg.segMin = 6;       g.mgCfg.segMax = 16;
+      g.mgStartedAt  = now;
+      g.mgDeadline   = now + g.mgCfg.timerMs;
+      g.mgAllTriedAt = 0;
+      g.mgTriedMask  = 0;
+      g.mgSuccessMask= 0;
+      g.mgExpectedStations = MAX_STATIONS;    // set 5 if only 5 Loots
+      bcastMgStart(g, g.mgCfg);
+      // Optional: freeze cadence to GREEN while MG runs
+      g.noRedThisRound = true; g.allowYellowThisRound = false;
+      return;
+    }
   }
 
-  // Timeout → success path or game over
+  // CASE: round timeout path — do the same for R4 timeout
   if (now >= g.roundEndAt) {
     if (g.teamScore < g.roundGoal) { bcastGameOver(g, /*GOAL_NOT_MET*/4); return; }
     gameAudioStop();
     if      (g.roundIndex == 1) { startRound(g, 2); return; }
-    else if (g.roundIndex == 2) { startBonusIntermission(g, 15000); return; }
-    else if (g.roundIndex == 3) { startBonusIntermission2(g, 15000, 3000); return; }
-    else if (g.roundIndex == 4) { startRound(g, 5); return; }
+    else if (g.roundIndex == 2) { startBonusIntermission(g, /*durationMs=*/15000); return; }
+    else if (g.roundIndex == 3) { startRound(g, 4); return; }
+    else if (g.roundIndex == 4) {
+      // Same MG start as above (timeout also enters MG)
+      g.mgActive     = true;
+      g.mgCfg.seed   = esp_random();
+      g.mgCfg.timerMs= 60000;
+      g.mgCfg.speedMinMs = 20;  g.mgCfg.speedMaxMs = 80;
+      g.mgCfg.segMin = 6;       g.mgCfg.segMax = 16;
+      g.mgStartedAt  = now;
+      g.mgDeadline   = now + g.mgCfg.timerMs;
+      g.mgAllTriedAt = 0;
+      g.mgTriedMask  = 0;
+      g.mgSuccessMask= 0;
+      g.mgExpectedStations = MAX_STATIONS;
+      bcastMgStart(g, g.mgCfg);
+      g.noRedThisRound = true; g.allowYellowThisRound = false;
+      return;
+    }
   }
 }

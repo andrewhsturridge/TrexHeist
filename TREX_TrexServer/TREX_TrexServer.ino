@@ -179,6 +179,32 @@ void loop() {
     g.lastTickSentMs = now;
   }
 
+    // === Minigame tick ===
+  if (g.mgActive) {
+    const uint32_t now = millis();
+
+    // Stop by timer
+    if ((int32_t)(now - g.mgDeadline) >= 0) {
+      g.mgActive = false;
+      bcastMgStop(g);
+      // Resume normal flow: proceed to Round 5
+      modeClassicForceRound(g, 5, /*playWin=*/false);
+      return;
+    }
+
+    // Or stop 3 s after all stations have tried
+    if (g.mgAllTriedAt && (now - g.mgAllTriedAt >= 3000)) {
+      g.mgActive = false;
+      bcastMgStop(g);
+      modeClassicForceRound(g, 5, /*playWin=*/false);
+      return;
+    }
+    
+    return;
+    // While MG is active, keep running the rest of loop (STATE_TICK, Transport::loop, etc.)
+    // but avoid advancing rounds elsewhere; just 'return' after mg handling if you want it isolated.
+  }
+
   // Accrual while GREEN and YELLOW (tick every lootRateMs; grant lootPerTick each tick)
   if (g.phase == Phase::PLAYING &&
     (g.light == LightState::GREEN || g.light == LightState::YELLOW)) {

@@ -90,8 +90,22 @@ struct Game {
   uint32_t bonusNextSpawnAt = 0;                // scheduler next fire (millis)
   uint8_t  bonusSpawnsThisRound = 0;            // number of spawns so far in current round
 
-  //Minigame
-  MgState mg;
+  // ---- Minigame (post-R4) ----
+  struct MgConfig {
+    uint32_t seed;
+    uint16_t timerMs;
+    uint8_t  speedMinMs, speedMaxMs;
+    uint8_t  segMin, segMax;
+  };
+
+  bool     mgActive         = false;
+  uint32_t mgStartedAt      = 0;
+  uint32_t mgDeadline       = 0;     // mgStartedAt + timer
+  uint32_t mgAllTriedAt     = 0;     // first time all stations have tried (for +3s end)
+  uint32_t mgTriedMask      = 0;     // bit i => station i has used its attempt
+  uint32_t mgSuccessMask    = 0;     // bit i => station i reported success
+  uint8_t  mgExpectedStations = MAX_STATIONS; // set to 5 if you only have 5 Loots
+  MgConfig mgCfg{};
 
   // Grace + PIR
   uint32_t edgeGraceMs     = 300;
