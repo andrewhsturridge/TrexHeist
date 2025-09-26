@@ -5,6 +5,7 @@
 #include "Bonus.h"
 #include "Media.h"
 #include "esp_system.h"
+#include "ServerMini.h"
 
 // --- Random split of TOTAL across 5 stations, each <= 56 ---
 static void splitInventoryRandom(Game& g, uint16_t total /*=100*/) {
@@ -523,8 +524,22 @@ void modeClassicNextRound(Game& g, bool playWin) {
     return;
   }
 
-  // From R4, go to 5
-  if (g.roundIndex == 4) { startRound(g, 5); return; }
+  // From R4, go to minigame
+  if (g.round == 4) {
+    MgConfig cfg;
+    cfg.seed       = 0;      // auto from esp_random()
+    cfg.timerMs    = 60000;  // 1 minute
+    cfg.speedMinMs = 20;
+    cfg.speedMaxMs = 80;
+    cfg.segMin     = 6;
+    cfg.segMax     = 16;
+
+    g.mg.expectedStations = 5;  // <-- set to your actual Loot count
+    MG_Start(g, cfg, millis());
+
+    // Do NOT call nextRound yet; MG_Tick will end & you'll proceed afterward
+    return;
+  }
 
   // Otherwise behave like before: advance one round (but never beyond 4).
   uint8_t next = (g.roundIndex >= 5) ? 5 : (g.roundIndex + 1);

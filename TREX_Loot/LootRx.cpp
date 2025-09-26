@@ -2,11 +2,12 @@
 #include <Arduino.h>
 #include <TrexProtocol.h>
 
-#include "Audio.h"      // startLootAudio, stopAudio, playing, g_audioOneShot, g_chimeActive
-#include "LootLeds.h"   // fillRing/fillGauge/blinkers/drawGaugeAuto/canPaintGaugeNow
-#include "Identity.h"   // STATION_ID
+#include "Audio.h"
+#include "LootLeds.h"
+#include "LootNet.h"
+#include "LootMini.h"
+#include "Identity.h"
 
-// -------- fallbacks for cross-TU constants (optional: move to a shared header) ----------
 #ifndef PIN_MOSFET
 #define PIN_MOSFET 17
 #endif
@@ -14,11 +15,9 @@
 #define AUDIO_STOP_STAGGER_MS 12
 #endif
 
-// -------- externs provided elsewhere (unchanged names) --------
-// Identity / config
+// -------- externs --------
 extern uint8_t STATION_ID;
 
-// Game/light state
 extern volatile bool gameActive;
 extern volatile bool holdActive;
 extern bool          wasPaused;
@@ -29,27 +28,23 @@ extern bool          fullBlinkActive;
 extern bool          fullAnnounced;
 extern bool          gaugeCacheValid;
 extern bool          s_isBonusNow;
-extern bool          g_bonusAtTap;
+extern bool          g_bonusAtTap;    // lives in the .ino; cleared on HOLD_END
 extern LightState    g_lightState;
 
-// Inventory/capacity and carry
 extern uint16_t inv, cap;
 extern uint8_t  carried, maxCarry;
 extern uint32_t holdId;
 
-// UI / timers
 extern bool     yellowBlinkActive;
 extern bool     yellowBlinkOn;
 extern uint32_t nextGaugeDrawAtMs;
 
-// OTA config-update latches
 extern bool      otaStartRequested;
 extern bool      otaInProgress;
 extern uint32_t  otaCampaignId;
 extern uint8_t   otaExpectMajor, otaExpectMinor;
 extern char      otaUrl[128];
 
-// Visual helpers
 extern void stopYellowBlink();
 extern void startEmptyBlink();
 extern void stopEmptyBlink();
@@ -58,11 +53,12 @@ extern void stopFullBlink();
 extern void gameOverBlinkAndOff();
 extern void drawRingCarried(uint8_t cur, uint8_t maxC);
 
-// Audio helpers
 extern void playBonusSpawnChime();
 extern void scheduleAudioStop(uint16_t delayMs);
 
-// ------------------ implementation ------------------
+// mg firewall
+extern volatile bool mgActive;
+static inline bool mgSwallowRepaints() { return mgActive && !otaInProgress; }
 
 void onRx(const uint8_t* data, uint16_t len) {
   if (len < sizeof(MsgHeader)) return;
@@ -79,65 +75,53 @@ void onRx(const uint8_t* data, uint16_t len) {
       const StateTickPayload* p =
           (const StateTickPayload*)(data + sizeof(MsgHeader));
 
-      // Update light state
       if      (p->state == (uint8_t)LightState::GREEN)  g_lightState = LightState::GREEN;
       else if (p->state == (uint8_t)LightState::YELLOW) g_lightState = LightState::YELLOW;
       else                                              g_lightState = LightState::RED;
 
-      // Arm/stop Yellow blink
       if (g_lightState == LightState::YELLOW) yellowBlinkActive = true;
       else                                    stopYellowBlink();
 
-      // After GAME_OVER keep gauge off; in steady RED show ring if idle
       if (!gameActive) {
-        if (g_lightState == LightState::RED && !holdActive && !otaInProgress) fillRing(0x00FF0000 /*RED*/);
+        if (g_lightState == LightState::RED && !holdActive && !otaInProgress) fillRing(Adafruit_NeoPixel::Color(255,0,0));
         break;
       }
 
-      // During game: draw gauge unless Yellow OFF phase
-      if (stationInited && canPaintGaugeNow()) {
-        drawGaugeAuto(inv, cap);
-      }
+      if (mgSwallowRepaints()) break;
+      if (stationInited && canPaintGaugeNow()) drawGaugeAuto(inv, cap);
       break;
     }
 
     case MsgType::LOOT_HOLD_ACK: {
+      if (mgActive) break;
       if (h->payloadLen != sizeof(LootHoldAckPayload)) break;
       const auto* p = (const LootHoldAckPayload*)(data + sizeof(MsgHeader));
       if (p->holdId != holdId) break;
 
-      // Update state from ACK
       maxCarry = p->maxCarry;
-      carried  = (p->carried > maxCarry) ? maxCarry : p->carried;  // clamp
+      carried  = (p->carried > maxCarry) ? maxCarry : p->carried;
       inv      = p->inventory;
       cap      = p->capacity;
       stationInited = true;
 
-      // Maintain empty indicator
       if (tagPresent && inv == 0) startEmptyBlink();
       else                        stopEmptyBlink();
 
       if (p->accepted) {
-        if (!gameActive) break;   // ignore visuals if game ended mid-flight
+        if (!gameActive) break;
         holdActive = true;
 
-        // === forceStartLootAudio(g_bonusAtTap || s_isBonusNow) ===
-        // Pre-empt any chime/loop and start the correct clip immediately.
         const bool wantBonus = (g_bonusAtTap || s_isBonusNow);
         if (playing) stopAudio();
         g_chimeActive = false;
         startLootAudio(wantBonus);
 
-        // FULL indicator (ring blink) vs carried ring
         if (carried >= maxCarry) {
           if (!fullAnnounced || blinkHoldId != p->holdId) {
             startFullBlinkImmediate();
             fullAnnounced = true;
             blinkHoldId   = p->holdId;
-            // Guard: don’t stop if it’s a bonus one-shot or a chime is active
-            if (!(s_isBonusNow || g_audioOneShot || g_chimeActive)) {
-              scheduleAudioStop(AUDIO_STOP_STAGGER_MS);
-            }
+            if (!(s_isBonusNow || g_audioOneShot || g_chimeActive)) scheduleAudioStop(AUDIO_STOP_STAGGER_MS);
           }
         } else {
           if (fullBlinkActive) stopFullBlink();
@@ -145,31 +129,25 @@ void onRx(const uint8_t* data, uint16_t len) {
           drawRingCarried(carried, maxCarry);
         }
 
-        // Throttled repaint first so LED frame doesn’t coincide with audio begin
         uint32_t now = millis();
         if ((int32_t)(now - nextGaugeDrawAtMs) >= 0 && canPaintGaugeNow()) {
           drawGaugeAuto(inv, cap);
           nextGaugeDrawAtMs = now + 20;
         }
       } else {
-        // Denied (FULL/EMPTY/EDGE_GRACE/RED etc.)
         holdActive = false;
 
         if (carried >= maxCarry) {
-          // FULL → start blink; stop audio via scheduled stagger
           if (!fullAnnounced || blinkHoldId != p->holdId) {
             startFullBlinkImmediate();
             fullAnnounced = true;
             blinkHoldId   = p->holdId;
             scheduleAudioStop(AUDIO_STOP_STAGGER_MS);
           }
-          // Defer gauge repaint; normal updates will paint soon
         } else {
           fullAnnounced = false;
           stopFullBlink();
-          fillRing(0x00FF0000 /*RED*/);
-
-          // Reflect inventory now (honors Yellow OFF phase)
+          fillRing(Adafruit_NeoPixel::Color(255,0,0));
           uint32_t now = millis();
           if (gameActive && (int32_t)(now - nextGaugeDrawAtMs) >= 0 && canPaintGaugeNow()) {
             drawGaugeAuto(inv, cap);
@@ -181,19 +159,18 @@ void onRx(const uint8_t* data, uint16_t len) {
     }
 
     case MsgType::LOOT_TICK: {
+      if (mgActive) break;
       if (h->payloadLen != sizeof(LootTickPayload)) break;
       const auto* p = (const LootTickPayload*)(data + sizeof(MsgHeader));
       if (!holdActive || p->holdId != holdId) break;
 
-      carried = (p->carried > maxCarry) ? maxCarry : p->carried;  // clamp
+      carried = (p->carried > maxCarry) ? maxCarry : p->carried;
       inv     = p->inventory;
       stationInited = true;
 
-      // Maintain empty indicator
       if (tagPresent && inv == 0) startEmptyBlink();
       else                        stopEmptyBlink();
 
-      // FULL handling + ring update
       if (carried >= maxCarry) {
         if (!fullAnnounced || blinkHoldId != p->holdId) {
           startFullBlinkImmediate();
@@ -207,7 +184,6 @@ void onRx(const uint8_t* data, uint16_t len) {
         drawRingCarried(carried, maxCarry);
       }
 
-      // Throttled gauge render — GREEN shows rainbow automatically, YELLOW/RED override
       uint32_t now = millis();
       if ((int32_t)(now - nextGaugeDrawAtMs) >= 0 && canPaintGaugeNow()) {
         drawGaugeAuto(inv, cap);
@@ -217,6 +193,7 @@ void onRx(const uint8_t* data, uint16_t len) {
     }
 
     case MsgType::HOLD_END: {
+      if (mgActive) break;
       if (h->payloadLen != sizeof(HoldEndPayload)) break;
       const auto* p = (const HoldEndPayload*)(data + sizeof(MsgHeader));
       if (p->holdId != holdId) break;
@@ -226,11 +203,8 @@ void onRx(const uint8_t* data, uint16_t len) {
       holdActive = false;
       holdId     = 0;
 
-      // Do NOT stop audio if the spawn chime is playing
-      if (!g_audioOneShot && !g_chimeActive) {
-        stopAudio();
-      }
-      g_bonusAtTap = false;  // clear snapshot at end of hold
+      if (!g_audioOneShot && !g_chimeActive) stopAudio();
+      g_bonusAtTap = false;
 
       fullAnnounced = false;
 
@@ -238,23 +212,22 @@ void onRx(const uint8_t* data, uint16_t len) {
         if (!fullBlinkActive) startFullBlinkImmediate();
       } else {
         stopFullBlink();
-        fillRing(0x00FF0000 /*RED*/);
+        fillRing(Adafruit_NeoPixel::Color(255,0,0));
       }
       break;
     }
 
     case MsgType::STATION_UPDATE: {
-      if (h->payloadLen != sizeof(StationUpdatePayload)) break;
       const auto* p = (const StationUpdatePayload*)(data + sizeof(MsgHeader));
+      if (h->payloadLen != sizeof(StationUpdatePayload)) break;
       if (p->stationId != STATION_ID) break;
 
-      // Cache latest values
       inv = p->inventory;
       cap = p->capacity;
       stationInited = true;
 
-      // Don't repaint after GAME_OVER
       if (!gameActive) break;
+      if (mgSwallowRepaints()) break;
 
       if (!holdActive && !otaInProgress && canPaintGaugeNow()) {
         drawGaugeAuto(inv, cap);
@@ -263,27 +236,26 @@ void onRx(const uint8_t* data, uint16_t len) {
     }
 
     case MsgType::GAME_START: {
+      mgCancel();                     // cancel minigame immediately
       gameActive       = true;
       wasPaused        = false;
       fullBlinkActive  = false;
       fullAnnounced    = false;
 
-      stationInited    = false;      // wait for fresh inventory before painting
+      stationInited    = false;
       gaugeCacheValid  = false;
 
-      digitalWrite(PIN_MOSFET, HIGH);  // lamp ON for live round
+      digitalWrite(PIN_MOSFET, HIGH);
       stopFullBlink();
       stopEmptyBlink();
-      fillRing(0x00FF0000 /*RED*/);    // ring “awake” in RED
-
-      // Do NOT draw gauge here; wait for STATION_UPDATE
+      fillRing(Adafruit_NeoPixel::Color(255,0,0));
       Serial.println("[LOOT] GAME_START");
       break;
     }
 
     case MsgType::GAME_OVER: {
+      mgCancel();                     // cancel minigame immediately
       if (len < sizeof(MsgHeader) + 1) break;
-
       const GameOverPayload* gp =
           (const GameOverPayload*)(data + sizeof(MsgHeader));
 
@@ -291,26 +263,20 @@ void onRx(const uint8_t* data, uint16_t len) {
       const uint8_t blameSid = (h->payloadLen >= sizeof(GameOverPayload))
                               ? gp->blameSid : GAMEOVER_BLAME_ALL;
 
-      // Force safe post-game condition
       gameActive      = false;
       holdActive      = false;
       tagPresent      = false;
       fullBlinkActive = false;
 
-      // Leave bonus
       s_isBonusNow = false;
-
-      // Lock palette to RED; stop local blinkers & audio
       g_lightState = LightState::RED;
       stopYellowBlink();
       stopEmptyBlink();
       stopAudio();
 
-      // Gauge OFF immediately; ring steady RED (targeted blink still allowed)
       fillGauge(0);
-      if (!otaInProgress) fillRing(0x00FF0000 /*RED*/);
+      if (!otaInProgress) fillRing(Adafruit_NeoPixel::Color(255,0,0));
 
-      // Offender-based blink (RED_LOOT)
       const bool redViolation = (reason == 1);
       const bool offender     = redViolation &&
                                 (blameSid != GAMEOVER_BLAME_ALL) &&
@@ -324,11 +290,11 @@ void onRx(const uint8_t* data, uint16_t len) {
     }
 
     case MsgType::CONFIG_UPDATE: {
+      mgCancel();                     // OTA takes priority; cancel MG
       if (h->payloadLen != sizeof(ConfigUpdatePayload)) break;
       if (gameActive) { Serial.println("[OTA] Ignored (game active)"); break; }
       const auto* p = (const ConfigUpdatePayload*)(data + sizeof(MsgHeader));
 
-      // scope: LOOT + my id (or broadcast)
       bool typeMatch = (p->stationType == 0) || (p->stationType == (uint8_t)StationType::LOOT);
       bool idMatch   = (p->targetId == 0)    || (p->targetId == STATION_ID);
       if (!typeMatch || !idMatch) break;
@@ -336,7 +302,6 @@ void onRx(const uint8_t* data, uint16_t len) {
       if (otaInProgress) { Serial.println("[OTA] Already in progress"); break; }
       if (p->otaUrl[0] == 0) { Serial.println("[OTA] No URL"); break; }
 
-      // latch
       strncpy(otaUrl, p->otaUrl, sizeof(otaUrl)-1); otaUrl[sizeof(otaUrl)-1]=0;
       otaCampaignId  = p->campaignId;
       otaExpectMajor = p->expectMajor; otaExpectMinor = p->expectMinor;
@@ -348,29 +313,49 @@ void onRx(const uint8_t* data, uint16_t len) {
       break;
     }
 
+    // ---- Minigame messages ----
+    case MsgType::MG_START: {
+      if (h->payloadLen != sizeof(MgStartPayload)) break;
+      const auto* p = (const MgStartPayload*)(data + sizeof(MsgHeader));
+
+      MgParams mp;
+      mp.seed       = p->seed;
+      mp.timerMs    = p->timerMs;
+      mp.speedMinMs = p->speedMinMs;
+      mp.speedMaxMs = p->speedMaxMs;
+      mp.segMin     = p->segMin;
+      mp.segMax     = p->segMax;
+      mgStart(mp);
+      break;
+    }
+
+    case MsgType::MG_STOP: {
+      mgStop();
+      break;
+    }
+
     case MsgType::BONUS_UPDATE: {
-      if (h->payloadLen < 4) break;
       const uint8_t* pl = data + sizeof(MsgHeader);
+      if (h->payloadLen < 4) break;
       uint32_t mask = (uint32_t)pl[0]
                     | ((uint32_t)pl[1] << 8)
                     | ((uint32_t)pl[2] << 16)
                     | ((uint32_t)pl[3] << 24);
 
-      // --- Normal BONUS behavior (no R4.5 flag) ---
       bool wasBonus = s_isBonusNow;
       s_isBonusNow  = ((mask >> STATION_ID) & 0x1u) != 0;
 
+      if (mgActive) break; // swallow chime/paint during minigame
+
       if (!wasBonus && s_isBonusNow) {
-        // Entering bonus: chime + kill blinkers so nothing blanks the next frame
         playBonusSpawnChime();
         stopYellowBlink();
         stopEmptyBlink();
       }
 
-      // Paint immediately, bypassing yellow OFF gating so the frame can’t be blanked
       if (gameActive && stationInited && !otaInProgress) {
         gaugeCacheValid = false;
-        drawGaugeAuto(inv, cap);   // draws rainbow in GREEN when s_isBonusNow==true
+        drawGaugeAuto(inv, cap);
       }
       break;
     }

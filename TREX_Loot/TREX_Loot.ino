@@ -51,6 +51,7 @@
 #include "LootNet.h"
 #include "LootRx.h"
 #include "LootLeds.h"
+#include "LootMini.h"
 
 /* ---------- Wi-Fi (Maintenance / OTA HTTP) ---------- */
 const char* WIFI_SSID  = "GUD";
@@ -126,6 +127,10 @@ bool stationInited = false;
 
 bool s_isBonusNow = false;
 bool g_bonusAtTap = false;
+
+// Mini game
+volatile bool mgActive = false;   // minigame owns gauge when true
+bool mgTried = false;             // one attempt per station
 
 /* ── OTA campaign state ──────────────────────────────── */
 bool      otaInProgress     = false;
@@ -251,6 +256,23 @@ void loop() {
 
   // While OTA runs, keep spinner and skip the rest of the logic
   if (otaInProgress) { otaTickSpinner(); return; }
+
+  // While the minigame is active, it owns the gauge and input
+  if (mgActive) {
+    // Keep identity serial + maintenance checks (already above this)
+    mgLoop();
+
+    // Still service network + deferred OTA success report
+    Transport::loop();
+    if (transportReady && otaSuccessReportPending && millis() >= otaSuccessSendAt) {
+      sendOtaStatus(OtaPhase::SUCCESS, 0, 0, 0);
+      otaClearFile();
+      otaSuccessReportPending = false;
+    }
+
+    // Skip normal loot logic this tick
+    return;
+  }
 
   // Now normal networking
   Transport::loop();

@@ -11,7 +11,7 @@
 #define GAUGE_LEN gauge.numPixels()
 #endif
 #ifndef OTA_SPINNER_MS
-#define OTA_SPINNER_MS 100
+#define OTA_SPINNER_MS 60
 #endif
 #ifndef RING_STAGGER_MS
 #define RING_STAGGER_MS 0
@@ -36,6 +36,9 @@ extern LightState g_lightState;
 // Bonus state (lives with RX/audio; we only read)
 extern bool      s_isBonusNow;
 extern uint32_t  g_bonusExclusiveUntilMs;
+
+// Minigame
+extern volatile bool mgActive;
 
 // ===== color helpers (module-local) =====
 static inline uint32_t C_RGB(uint8_t r,uint8_t g,uint8_t b){ return Adafruit_NeoPixel::Color(r,g,b); }
@@ -265,6 +268,34 @@ void drawGaugeAuto(uint16_t inventory, uint16_t capacity) {
   }
 }
 
+void mgDrawFrame(uint8_t segStart, uint8_t segLen, int16_t cursorIdx, uint32_t cursorColor) {
+  const uint16_t N = gauge.numPixels();
+  if (segStart >= N) segStart = (uint8_t)(N ? N-1 : 0);
+  if (segLen == 0) segLen = 1;
+  if ((uint16_t)segStart + (uint16_t)segLen > N) segLen = (uint8_t)(N - segStart);
+
+  // Clear
+  for (uint16_t i=0;i<N;++i) gauge.setPixelColor(i, 0);
+
+  // Static rainbow segment
+  for (uint16_t k=0;k<segLen;++k) {
+    uint16_t i = (uint16_t)segStart + k;
+    // Hue across the segment
+    uint16_t hue = (uint16_t)((uint32_t)k * 65535u / (segLen ? segLen : 1));
+    uint32_t c = gauge.ColorHSV(hue, 255, 255);
+    gauge.setPixelColor(i, c);
+  }
+
+  // Cursor
+  if (N > 0) {
+    if (cursorIdx < 0) cursorIdx = 0;
+    if (cursorIdx >= (int16_t)N) cursorIdx = (int16_t)N - 1;
+    gauge.setPixelColor((uint16_t)cursorIdx, cursorColor);
+  }
+
+  gauge.show();
+}
+
 void tickBonusRainbow() {
   // Only animate when: game active, bonus on THIS station, we have inventory, and light is GREEN
   if (!(gameActive && s_isBonusNow && inv > 0 && g_lightState == LightState::GREEN)) return;
@@ -302,6 +333,7 @@ void fillGauge(uint32_t c) {
 
 // Gate gauge paints to avoid OTA/RED state thrash and YELLOW off-phase frames.
 bool canPaintGaugeNow() {
+  if (mgActive)         return false;   // MG owns the gauge
   if (otaInProgress)        return false;            // OTA visuals own the LEDs
   if (!gameActive)          return false;            // post-GAME_OVER stays dark
   // Skip during YELLOW blink "off" phase; drawGaugeInventory() will handle edges.
@@ -328,6 +360,7 @@ void startFullBlinkImmediate() {
 void stopFullBlink() { fullBlinkActive = false; fullBlinkOn = false; }
 void tickFullBlink() {
   if (!fullBlinkActive) return;
+  if (mgActive) return;
   uint32_t now = millis();
   if ((now - fullBlinkLastMs) >= FULL_BLINK_PERIOD_MS) {
     fullBlinkLastMs = now;
@@ -347,6 +380,7 @@ void startYellowBlinkImmediate() {
 }
 void stopYellowBlink() { yellowBlinkActive = false; yellowBlinkOn = false; }
 void tickYellowBlink() {
+  if (mgActive) return;
   // don’t blink the gauge while in a regular BONUS and light is GREEN
   if (s_isBonusNow && g_lightState == LightState::GREEN) return;
 
@@ -387,6 +421,7 @@ void stopEmptyBlink() {
 }
 void tickEmptyBlink() {
   if (!emptyBlinkActive) return;
+  if (mgActive) return;
   uint32_t now = millis();
   if ((now - emptyBlinkLastMs) >= EMPTY_BLINK_PERIOD_MS) {
     emptyBlinkLastMs = now;

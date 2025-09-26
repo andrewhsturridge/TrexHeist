@@ -74,3 +74,8 @@ void otaTickSpinner();
 void otaDrawProgress(uint32_t bytes, uint32_t total);
 void otaVisualSuccess();
 void otaVisualFail();
+
+// ---- Minigame drawing ----
+// Draws: black bar + static rainbow segment + a single cursor pixel in cursorColor.
+// (No gating here—minigame owns the gauge while active.)
+void mgDrawFrame(uint8_t segStart, uint8_t segLen, int16_t cursorIdx, uint32_t cursorColor);

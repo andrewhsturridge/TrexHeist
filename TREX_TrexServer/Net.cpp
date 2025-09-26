@@ -6,6 +6,7 @@
 #include "OtaCampaign.h"
 #include "GameAudio.h"
 #include "Bonus.h"
+#include "ServerMini.h"
 
 // Generic raw broadcast used by OTA
 void netBroadcastRaw(const uint8_t* data, uint16_t len) {
@@ -333,6 +334,13 @@ void onRx(const uint8_t* data, uint16_t len) {
 
       sendDropResult(G, dropped, p->readerIndex);
       bcastScore(G);
+      break;
+    }
+
+    case MsgType::MG_RESULT: {
+      if (h->payloadLen != sizeof(MgResultPayload)) break;
+      const auto* p = reinterpret_cast<const MgResultPayload*>(data + sizeof(MsgHeader));
+      MG_OnResult(g, *p, millis());
       break;
     }
 

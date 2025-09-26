@@ -1,6 +1,7 @@
 #pragma once
 #include <Arduino.h>
 #include <TrexProtocol.h>
+#include "ServerMini.h"
 
 constexpr uint8_t MAX_PLAYERS = 24;
 constexpr uint8_t MAX_HOLDS   = 8;
@@ -88,6 +89,9 @@ struct Game {
   uint32_t bonusEndsAt[MAX_STATIONS] = {0};     // per-station TTL end time (millis)
   uint32_t bonusNextSpawnAt = 0;                // scheduler next fire (millis)
   uint8_t  bonusSpawnsThisRound = 0;            // number of spawns so far in current round
+
+  //Minigame
+  MgState mg;
 
   // Grace + PIR
   uint32_t edgeGraceMs     = 300;

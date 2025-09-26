@@ -58,3 +58,13 @@ void sendHoldStop() {
   holdActive = false;
   holdId = 0;
 }
+
+void sendMgResult(const TrexUid& uid, uint8_t success) {
+  uint8_t buf[sizeof(MsgHeader)+sizeof(MgResultPayload)];
+  packHeader((uint8_t)MsgType::MG_RESULT, sizeof(MgResultPayload), buf);
+  auto* p = (MgResultPayload*)(buf + sizeof(MsgHeader));
+  p->uid        = uid;
+  p->stationId  = STATION_ID;
+  p->success    = success ? 1 : 0;
+  Transport::sendToServer(buf, sizeof(buf));
+}
