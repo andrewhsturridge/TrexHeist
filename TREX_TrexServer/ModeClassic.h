@@ -13,7 +13,6 @@ void tickBonusIntermission(Game& g, uint32_t now);
 // R3.5 bonus intermission: 1 station active; hops every hopMs; ends → Round 4
 void startBonusIntermission2(Game& g, uint16_t durationMs = 15000, uint16_t hopMs = 3000);
 void tickBonusIntermission2(Game& g, uint32_t now);
-// --- Round 5 hot-station API (called from .ino) ---
-void r5Start(Game& g, uint32_t now);
-void r5Tick(Game& g, uint32_t now);
+// Per-frame tick work while PLAYING (mechanics that run every loop).
+void modeClassicOnPlayingTick(Game& g, uint32_t now);
 

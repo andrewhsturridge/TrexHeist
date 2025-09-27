@@ -68,11 +68,10 @@ static void endAndClearHoldsAndCarried(Game& g) {
   }
 }
 
-// --- R5 helpers ---
+// -------- R5 internals (file-local) --------
 static inline uint32_t rr() { return esp_random(); }
 
 static void r5Shuffle(uint8_t a[5]) {
-  // Fisher–Yates
   for (int i=4;i>0;--i) {
     int j = rr() % (i+1);
     uint8_t t=a[i]; a[i]=a[j]; a[j]=t;
@@ -85,12 +84,12 @@ static bool r5AnyHoldOnSid(const Game& g, uint8_t sid) {
 }
 
 static void r5SetHot(Game &g, uint8_t sid, uint32_t now) {
-  // Lights locked to GREEN during R5
+  // For now keep Round 5 in GREEN only
   enterGreen(g);
 
-  // Zero all others; fill the hot one to 100%
+  // One-hot inventory: hot=100%, others=0
   for (uint8_t s=1; s<=5; ++s) {
-    uint16_t inv = (s==sid) ? g.stationCapacity[s] : 0;   // capacity→100%
+    uint16_t inv = (s==sid) ? g.stationCapacity[s] : 0;
     if (g.stationInventory[s] != inv) {
       g.stationInventory[s] = inv;
       bcastStation(g, s);
@@ -99,45 +98,42 @@ static void r5SetHot(Game &g, uint8_t sid, uint32_t now) {
 
   g.r5HotSid = sid;
 
-  // New random dwell in [min,max]
+  // Random dwell within window
   uint16_t span = (g.r5DwellMaxMs > g.r5DwellMinMs) ? (g.r5DwellMaxMs - g.r5DwellMinMs) : 0;
   uint16_t dwell = g.r5DwellMinMs + (span ? (rr() % (span+1)) : 0);
-  g.r5DwellEndAt = now + dwell;
-
-  // Start (or reset) idle deplete timer
+  g.r5DwellEndAt    = now + dwell;
   g.r5NextDepleteAt = now + g.r5DepleteStepMs;
 }
 
-void r5Start(Game &g, uint32_t now) {
+static void r5Start(Game &g, uint32_t now) {
   if (g.r5Active) return;
   g.r5Active = true;
 
-  // Prepare first shuffle set
+  // Start with a shuffle-bag cycle
   g.r5Order[0]=1; g.r5Order[1]=2; g.r5Order[2]=3; g.r5Order[3]=4; g.r5Order[4]=5;
   r5Shuffle(g.r5Order);
   g.r5Idx = 0;
 
-  r5SetHot(g, g.r5Order[g.r5Idx], now);
-
-  // While R5 runs: no RED; keep YELLOW disabled
+  // Lock cadence policy (future-friendly knobs)
   g.noRedThisRound = true;
   g.allowYellowThisRound = false;
+
+  r5SetHot(g, g.r5Order[g.r5Idx], now);
 }
 
 static void r5HopNext(Game &g, uint32_t now) {
-  // Advance through the 5; then reshuffle and restart
   if (++g.r5Idx >= 5) { r5Shuffle(g.r5Order); g.r5Idx = 0; }
   r5SetHot(g, g.r5Order[g.r5Idx], now);
 }
 
-// Call while R5 is active and roundIndex==5
-void r5Tick(Game &g, uint32_t now) {
-  // Dwell → hop
+// Call only when roundIndex==5 & PLAYING
+static void r5Tick(Game &g, uint32_t now) {
+  // Dwell expiry → hop
   if ((int32_t)(now - g.r5DwellEndAt) >= 0) {
     r5HopNext(g, now);
   }
 
-  // Idle deplete (only when no hold on the hot station)
+  // Idle deplete hot station (no active hold)
   const uint8_t sid = g.r5HotSid;
   if (!sid) return;
 
@@ -158,6 +154,12 @@ static void startRound(Game& g, uint8_t idx) {
   const uint32_t now = millis();
   g.roundIndex   = idx;
   g.roundStartAt = now;
+
+  // Reset any previous R5 state when (re)starting a round; r5Start() will arm it for idx==5.
+  g.r5Active        = false;
+  g.r5HotSid        = 0;
+  g.r5DwellEndAt    = 0;
+  g.r5NextDepleteAt = 0;
 
   gameAudioStop();
   if (idx > 1) gameAudioPlayOnce(TRK_TREX_WIN);
@@ -276,7 +278,7 @@ static void startRound(Game& g, uint8_t idx) {
 
     g.roundStartScore = g.teamScore;
     g.roundGoal       = g.roundStartScore + 40;
-    g.roundEndAt      = (g.gameEndAt > now) ? g.gameEndAt : now; // remainder
+    g.roundEndAt      = now + 120000UL;
 
     endAndClearHoldsAndCarried(g);
 
@@ -300,38 +302,36 @@ static void startRound(Game& g, uint8_t idx) {
     return;
   }
 
-  if (idx == 5) {
-    // ---------- ROUND 5 (dummy = same as ROUND 4) ----------
-    g.maxCarry = 10;
-    g.noRedThisRound       = false;
-    g.allowYellowThisRound = true;
+ if (idx == 5) {
+    // ---------- ROUND 5 ----------
+    // Keep GREEN; no bonus in this round (for now).
+    g.noRedThisRound       = true;
+    g.allowYellowThisRound = false;
+
+    // Same carry/loot cadence as Round 4
+    g.maxCarry    = 10;
     g.lootRateMs  = 1000;
     g.lootPerTick = 4;
 
+    // Same goal & timing model as Round 4
     g.roundStartScore = g.teamScore;
     g.roundGoal       = g.roundStartScore + 40;
-    g.roundEndAt      = now + 120000UL;  // or remainder of game if you prefer
+    g.roundEndAt      = now + 120000UL;
 
+    // Broadcast timers like other rounds
+    sendStateTick(g, (g.roundEndAt > now) ? (g.roundEndAt - now) : 0);
+
+    // Clear any rolls from previous round
     endAndClearHoldsAndCarried(g);
 
-    // RANDOM split of THIS ROUND'S total (same as R4)
-    const uint16_t roundTotal = (uint16_t)(g.roundGoal - g.roundStartScore);
-    splitInventoryRandom(g, roundTotal);
-
-    const uint32_t redMin  = (g.pirArmDelayMs > 6000) ? g.pirArmDelayMs : 6000;
-    g.redMsMin   = redMin;                 g.redMsMax   = (7000 > redMin) ? 7000 : redMin;
-    g.greenMsMin = 10000;                  g.greenMsMax = 14000;
-    g.yellowMsMin= 3000;                   g.yellowMsMax= 3000;
-
-    g.pending.nextStation = 1;
-    g.pending.needScore   = true;
-
-    bonusResetForRound(g, now);
+    // Enter GREEN and tell clients
     enterGreen(g);
     bcastRoundStatus(g);
+
+    // *** Start the R5 hop engine ***
+    r5Start(g, now);
     return;
   }
-
 }
 
 static const uint8_t ST_FIRST = 1;
@@ -584,74 +584,91 @@ static inline void endR35Now(Game& g) {
   g.allowYellowThisRound = true;
 }
 
-// Replace your function with this:
 void modeClassicNextRound(Game& g, bool playWin) {
-  // If we are currently in Round 2 and not yet in the intermission, go to R2.5.
+  // Finish R2 -> R2.5 path
   if (g.roundIndex == 2 && !g.bonusIntermission) {
     startBonusIntermission(g, /*durationMs=*/15000);
     return;
   }
 
-  // If we're *in* R2.5 and tester presses "next", finish early to R3 and clear bonus.
+  // If *in* R2.5 and tester presses "next", finish early to R3 and clear bonus.
   if (g.bonusIntermission) {
-    endR25Now(g);
+    if (g.bonusWarnTickStarted) { gameAudioStop(); g.bonusWarnTickStarted = false; }
+    g.bonusIntermission = false;
+    g.bonusActiveMask   = 0;
+    for (uint8_t sid = 1; sid <= MAX_STATIONS; ++sid) g.bonusEndsAt[sid] = 0;
+    bcastBonusUpdate(g);
+    g.noRedThisRound       = false;
+    g.allowYellowThisRound = true;
     startRound(g, /*idx=*/3);
     return;
   }
 
-  // If we are currently in Round 3 and not yet in the intermission, go to R3.5.
+  // Finish R3 -> R3.5 path
   if (g.roundIndex == 3 && !g.bonusIntermission2) {
     startBonusIntermission2(g, /*durationMs=*/15000, /*hopMs=*/3000);
     return;
   }
 
-  // If we're *in* R3.5 and tester presses "next", finish early to R4 and clear bonus.
+  // If *in* R3.5 and tester presses "next", finish early to R4 and clear bonus.
   if (g.bonusIntermission2) {
-    endR35Now(g);
+    if (g.bonusWarnTickStarted) { gameAudioStop(); g.bonusWarnTickStarted = false; }
+    g.bonusIntermission2 = false;
+    g.bonus2Sid          = 0;
+    g.bonusActiveMask    = 0;
+    for (uint8_t sid = 1; sid <= MAX_STATIONS; ++sid) g.bonusEndsAt[sid] = 0;
+    bcastBonusUpdate(g);
+    g.noRedThisRound       = false;
+    g.allowYellowThisRound = true;
     startRound(g, /*idx=*/4);
     return;
   }
 
-  // From R4, go to minigame
-  if (g.roundIndex == 4) {
-    // Arm minigame (top-level fields, consistent with your .ino)
-    g.mgActive          = true;
-    g.mgCfg.seed        = esp_random();
-    g.mgCfg.timerMs     = 60000;   // 1 minute
-    g.mgCfg.speedMinMs  = 20;
-    g.mgCfg.speedMaxMs  = 80;
-    g.mgCfg.segMin      = 6;
-    g.mgCfg.segMax      = 16;
-
-    g.mgStartedAt       = millis();
-    g.mgDeadline        = g.mgStartedAt + g.mgCfg.timerMs;
-    g.mgAllTriedAt      = 0;
-    g.mgTriedMask       = 0;
-    g.mgSuccessMask     = 0;
-    g.mgExpectedStations= 5;       // set to your actual number of Loot stations
-
-    bcastMgStart(g, g.mgCfg);      // broadcast MG_START to clients
-    return;                        // IMPORTANT: don't fall through to normal next-round logic yet
+  // If MG is currently running and tester presses "next", cancel MG and jump to Round 5.
+  if (g.mgActive) {
+    g.mgActive = false;
+    bcastMgStop(g);
+    modeClassicForceRound(g, 5, /*playWin=*/false);  // startRound(5) will arm R5 engine
+    return;
   }
 
-  // Otherwise behave like before: advance one round (but never beyond 4).
+  // From R4, pressing "next" starts the minigame (if not already running).
+  if (g.roundIndex == 4) {
+    g.mgActive     = true;
+    g.mgCfg.seed   = esp_random();
+    g.mgCfg.timerMs= 60000;
+    g.mgCfg.speedMinMs = 20;  g.mgCfg.speedMaxMs = 80;
+    g.mgCfg.segMin = 6;       g.mgCfg.segMax = 16;
+    g.mgStartedAt  = millis();
+    g.mgDeadline   = g.mgStartedAt + g.mgCfg.timerMs;
+    g.mgAllTriedAt = 0;
+    g.mgTriedMask  = 0;
+    g.mgSuccessMask= 0;
+    g.mgExpectedStations = MAX_STATIONS;    // set 5 if only 5 Loots
+    bcastMgStart(g, g.mgCfg);
+    g.noRedThisRound = true; g.allowYellowThisRound = false;
+    return;
+  }
+
+  // Otherwise: advance one round (cap at 5). startRound(5) will start the R5 hop engine.
   uint8_t next = (g.roundIndex >= 5) ? 5 : (g.roundIndex + 1);
 
-  if (g.roundIndex == 0 || g.phase == Phase::END) {
-    modeClassicForceRound(g, 1, /*playWin=*/false);
-  } else {
-    // Safety: if any bonus mask is somehow still set, clear it when skipping.
-    if (g.bonusActiveMask) {
-      for (uint8_t sid = 1; sid <= MAX_STATIONS; ++sid) g.bonusEndsAt[sid] = 0;
-      g.bonusActiveMask = 0;
-      g.bonusIntermission  = false;
-      g.bonusIntermission2 = false;
-      bcastBonusUpdate(g);
-      g.noRedThisRound       = false;
-      g.allowYellowThisRound = true;
-    }
-    modeClassicForceRound(g, next, playWin);
+  // Make sure we’re in active play and optionally play win sting
+  g.phase = Phase::PLAYING;
+  if (playWin && next > 1) gameAudioPlayOnce(TRK_TREX_WIN);
+
+  // Safety: if any bonus mask is still set, clear it when skipping.
+  if (g.bonusActiveMask) {
+    for (uint8_t sid = 1; sid <= MAX_STATIONS; ++sid) g.bonusEndsAt[sid] = 0;
+    g.bonusActiveMask = 0;
+    g.bonusIntermission  = false;
+    g.bonusIntermission2 = false;
+    bcastBonusUpdate(g);
+    g.noRedThisRound       = false;
+    g.allowYellowThisRound = true;
   }
+
+  startRound(g, next);
 }
 
 void modeClassicInit(Game& g) {
@@ -669,14 +686,15 @@ void modeClassicMaybeAdvance(Game& g) {
   // Do nothing while intermissions are running; their tickers advance them
   if (g.bonusIntermission || g.bonusIntermission2) return;
 
-  // CASE: round goal met
+  // ===== Goal met path =====
   if (g.teamScore >= g.roundGoal) {
     gameAudioStop();
+
     if      (g.roundIndex == 1) { startRound(g, 2); return; }
     else if (g.roundIndex == 2) { startBonusIntermission(g, /*durationMs=*/15000); return; }
     else if (g.roundIndex == 3) { startRound(g, 4); return; }
     else if (g.roundIndex == 4) {
-      // === START MINIGAME ===
+      // === START MINIGAME (between R4->R5) ===
       g.mgActive     = true;
       g.mgCfg.seed   = esp_random();
       g.mgCfg.timerMs= 60000;
@@ -689,21 +707,31 @@ void modeClassicMaybeAdvance(Game& g) {
       g.mgSuccessMask= 0;
       g.mgExpectedStations = MAX_STATIONS;    // set 5 if only 5 Loots
       bcastMgStart(g, g.mgCfg);
-      // Optional: freeze cadence to GREEN while MG runs
       g.noRedThisRound = true; g.allowYellowThisRound = false;
+      return;
+    }
+    else if (g.roundIndex == 5) {
+      // R5 goal reached -> end game (success)
+      bcastGameOver(g, /*GOAL_MET*/0, GAMEOVER_BLAME_ALL);
       return;
     }
   }
 
-  // CASE: round timeout path — do the same for R4 timeout
+  // ===== Timeout path =====
   if (now >= g.roundEndAt) {
-    if (g.teamScore < g.roundGoal) { bcastGameOver(g, /*GOAL_NOT_MET*/4); return; }
+    // If the team didn't meet the goal by timeout -> failure
+    if (g.teamScore < g.roundGoal) {
+      bcastGameOver(g, /*GOAL_NOT_MET*/4, GAMEOVER_BLAME_ALL);
+      return;
+    }
+
     gameAudioStop();
+
     if      (g.roundIndex == 1) { startRound(g, 2); return; }
     else if (g.roundIndex == 2) { startBonusIntermission(g, /*durationMs=*/15000); return; }
     else if (g.roundIndex == 3) { startRound(g, 4); return; }
     else if (g.roundIndex == 4) {
-      // Same MG start as above (timeout also enters MG)
+      // Timeout at R4 also enters the minigame
       g.mgActive     = true;
       g.mgCfg.seed   = esp_random();
       g.mgCfg.timerMs= 60000;
@@ -719,5 +747,21 @@ void modeClassicMaybeAdvance(Game& g) {
       g.noRedThisRound = true; g.allowYellowThisRound = false;
       return;
     }
+    else if (g.roundIndex == 5) {
+      // R5 timeout -> success if goal was met, otherwise failure
+      if (g.teamScore >= g.roundGoal) {
+        bcastGameOver(g, /*GOAL_MET*/0, GAMEOVER_BLAME_ALL);
+      } else {
+        bcastGameOver(g, /*GOAL_NOT_MET*/4, GAMEOVER_BLAME_ALL);
+      }
+      return;
+    }
+  }
+}
+
+void modeClassicOnPlayingTick(Game& g, uint32_t now) {
+  // Round 5 engine tick (mechanics that run every loop while PLAYING)
+  if (g.roundIndex == 5 && g.r5Active) {
+    r5Tick(g, now);
   }
 }

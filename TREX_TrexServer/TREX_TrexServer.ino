@@ -102,12 +102,6 @@ void loop() {
 
   uint32_t now = millis();
 
-  // --- Round 5: start + tick ---
-  if (g.phase == Phase::PLAYING && g.roundIndex == 5) {
-    if (!g.r5Active) r5Start(g, now);
-    r5Tick(g, now);
-  }
-
   // Maintenance shortcut via Serial
   while (Serial.available()) {
     int c = Serial.read();
@@ -284,6 +278,7 @@ void loop() {
 
   // Level progression (Classic mode)
   if (g.phase == Phase::PLAYING) {
+    modeClassicOnPlayingTick(g, now);
     modeClassicMaybeAdvance(g);
   }
 
