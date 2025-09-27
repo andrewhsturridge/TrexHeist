@@ -68,6 +68,92 @@ static void endAndClearHoldsAndCarried(Game& g) {
   }
 }
 
+// --- R5 helpers ---
+static inline uint32_t rr() { return esp_random(); }
+
+static void r5Shuffle(uint8_t a[5]) {
+  // Fisher–Yates
+  for (int i=4;i>0;--i) {
+    int j = rr() % (i+1);
+    uint8_t t=a[i]; a[i]=a[j]; a[j]=t;
+  }
+}
+
+static bool r5AnyHoldOnSid(const Game& g, uint8_t sid) {
+  for (const auto &h : g.holds) if (h.active && h.stationId == sid) return true;
+  return false;
+}
+
+static void r5SetHot(Game &g, uint8_t sid, uint32_t now) {
+  // Lights locked to GREEN during R5
+  enterGreen(g);
+
+  // Zero all others; fill the hot one to 100%
+  for (uint8_t s=1; s<=5; ++s) {
+    uint16_t inv = (s==sid) ? g.stationCapacity[s] : 0;   // capacity→100%
+    if (g.stationInventory[s] != inv) {
+      g.stationInventory[s] = inv;
+      bcastStation(g, s);
+    }
+  }
+
+  g.r5HotSid = sid;
+
+  // New random dwell in [min,max]
+  uint16_t span = (g.r5DwellMaxMs > g.r5DwellMinMs) ? (g.r5DwellMaxMs - g.r5DwellMinMs) : 0;
+  uint16_t dwell = g.r5DwellMinMs + (span ? (rr() % (span+1)) : 0);
+  g.r5DwellEndAt = now + dwell;
+
+  // Start (or reset) idle deplete timer
+  g.r5NextDepleteAt = now + g.r5DepleteStepMs;
+}
+
+void r5Start(Game &g, uint32_t now) {
+  if (g.r5Active) return;
+  g.r5Active = true;
+
+  // Prepare first shuffle set
+  g.r5Order[0]=1; g.r5Order[1]=2; g.r5Order[2]=3; g.r5Order[3]=4; g.r5Order[4]=5;
+  r5Shuffle(g.r5Order);
+  g.r5Idx = 0;
+
+  r5SetHot(g, g.r5Order[g.r5Idx], now);
+
+  // While R5 runs: no RED; keep YELLOW disabled
+  g.noRedThisRound = true;
+  g.allowYellowThisRound = false;
+}
+
+static void r5HopNext(Game &g, uint32_t now) {
+  // Advance through the 5; then reshuffle and restart
+  if (++g.r5Idx >= 5) { r5Shuffle(g.r5Order); g.r5Idx = 0; }
+  r5SetHot(g, g.r5Order[g.r5Idx], now);
+}
+
+// Call while R5 is active and roundIndex==5
+void r5Tick(Game &g, uint32_t now) {
+  // Dwell → hop
+  if ((int32_t)(now - g.r5DwellEndAt) >= 0) {
+    r5HopNext(g, now);
+  }
+
+  // Idle deplete (only when no hold on the hot station)
+  const uint8_t sid = g.r5HotSid;
+  if (!sid) return;
+
+  if (!r5AnyHoldOnSid(g, sid) &&
+      g.stationInventory[sid] > 0 &&
+      (int32_t)(now - g.r5NextDepleteAt) >= 0) {
+
+    uint16_t inv = g.stationInventory[sid];
+    uint16_t dec = g.r5DepletePerStep;
+    if (dec > inv) dec = inv;
+    g.stationInventory[sid] = (uint16_t)(inv - dec);
+    bcastStation(g, sid);
+    g.r5NextDepleteAt = now + g.r5DepleteStepMs;
+  }
+}
+
 static void startRound(Game& g, uint8_t idx) {
   const uint32_t now = millis();
   g.roundIndex   = idx;

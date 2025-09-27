@@ -259,18 +259,20 @@ void loop() {
 
   // While the minigame is active, it owns the gauge and input
   if (mgActive) {
-    // Keep identity serial + maintenance checks (already above this)
+    // MG logic + visuals
     mgLoop();
 
-    // Still service network + deferred OTA success report
+    // 🔊 keep audio flowing during the minigame
+    if (playing) handleAudio();
+    tickScheduledAudio();   // optional, safe
+
+    // keep transport/OTA drip
     Transport::loop();
     if (transportReady && otaSuccessReportPending && millis() >= otaSuccessSendAt) {
       sendOtaStatus(OtaPhase::SUCCESS, 0, 0, 0);
       otaClearFile();
       otaSuccessReportPending = false;
     }
-
-    // Skip normal loot logic this tick
     return;
   }
 

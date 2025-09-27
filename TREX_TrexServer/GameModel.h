@@ -107,6 +107,20 @@ struct Game {
   uint8_t  mgExpectedStations = MAX_STATIONS; // set to 5 if you only have 5 Loots
   MgConfig mgCfg{};
 
+  // ---- Round 5: Hot-station hop mechanic ----
+  bool     r5Active          = false;
+  uint8_t  r5HotSid          = 0;       // current “hot” station (1..5)
+  uint8_t  r5Order[5]        = {1,2,3,4,5}; // current shuffle order
+  uint8_t  r5Idx             = 0;       // index into r5Order
+  uint32_t r5DwellEndAt      = 0;       // hop when now >= this
+  uint32_t r5NextDepleteAt   = 0;       // throttle deplete steps
+
+  // Tunables (defaults; change at runtime if you like)
+  uint16_t r5DwellMinMs      = 4000;    // dwell window min (ms)
+  uint16_t r5DwellMaxMs      = 9000;    // dwell window max (ms)
+  uint16_t r5DepletePerStep  = 2;       // inventory units per deplete tick
+  uint16_t r5DepleteStepMs   = 250;     // deplete every N ms when idle
+
   // Grace + PIR
   uint32_t edgeGraceMs     = 300;
   uint32_t redHoldGraceMs  = 400;
