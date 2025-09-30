@@ -129,16 +129,32 @@ void mgStart(const MgParams& p) {
   mgDrawFrame(segStart, segLen, cursor, Adafruit_NeoPixel::Color(0,255,0)); // GREEN
 }
 
+// Replace your mgStop() with this:
 void mgStop() {
-  // Release ownership and clear visuals
+  // Release MG ownership
   st = MgState::Idle;
   mgActive = false;
-  // Leave whatever frame was last shown; normal paints will resume.
+
+  // Clear any lingering MG frame by forcing a normal repaint (if OTA isn’t active)
+  extern bool otaInProgress;
+  extern bool gaugeCacheValid;     // from LootLeds.cpp
+  if (!otaInProgress) {
+    gaugeCacheValid = false;
+    forceGaugeRepaint();           // draws drawGaugeAuto(inv, cap) with current light/bonus
+  }
 }
 
 void mgCancel() {
+  // Same as stop, but used when MG is preempted (e.g., GAME_START/OVER/OTA)
   st = MgState::Idle;
   mgActive = false;
+
+  extern bool otaInProgress;
+  extern bool gaugeCacheValid;
+  if (!otaInProgress) {
+    gaugeCacheValid = false;
+    forceGaugeRepaint();
+  }
 }
 
 void mgLoop() {

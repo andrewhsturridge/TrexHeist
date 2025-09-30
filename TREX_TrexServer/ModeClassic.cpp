@@ -760,7 +760,7 @@ void modeClassicMaybeAdvance(Game& g) {
 }
 
 void modeClassicOnPlayingTick(Game& g, uint32_t now) {
-  // Round 5 engine tick (mechanics that run every loop while PLAYING)
+  // Other per-frame mechanics while PLAYING (e.g., Round 5 hop/deplete)
   if (g.roundIndex == 5 && g.r5Active) {
     r5Tick(g, now);
   }

@@ -213,33 +213,18 @@ void onRx(const uint8_t* data, uint16_t len) {
         break;
       }
 
-      // Helper: validate station id (adjust if you have >5)
-      auto validSid = [](uint8_t sid){ return sid >= 1 && sid <= 5; };
-      // Prefer payload stationId; fall back to header srcStationId; else ALL
-      uint8_t offenderSid =
-          validSid(p->stationId)     ? p->stationId :
-          (validSid(h->srcStationId) ? h->srcStationId : GAMEOVER_BLAME_ALL);
-
       // --- RED handling only (YELLOW is allowed like GREEN) ---
       if (G.light == LightState::RED) {
-        if (now - G.lastFlipMs <= G.edgeGraceMs) {
-          // within grace: deny politely (no game over)
-          uint8_t buf[sizeof(MsgHeader)+sizeof(LootHoldAckPayload)];
-          packHeader(G, (uint8_t)MsgType::LOOT_HOLD_ACK, sizeof(LootHoldAckPayload), buf, h->seq);
-          auto* a=(LootHoldAckPayload*)(buf+sizeof(MsgHeader));
-          a->holdId=p->holdId; a->accepted=0; a->rateHz=rateHz; a->maxCarry=G.maxCarry;
-          a->carried=0;
-          a->inventory= validSid(p->stationId) ? G.stationInventory[p->stationId] : 0;
-          a->capacity = validSid(p->stationId) ? G.stationCapacity[p->stationId]  : 0;
-          a->denyReason=6; // EDGE_GRACE
-          Transport::broadcast(buf,sizeof(buf));
-          break;
-        }
-        // outside grace: end game - blame the offending station
-        uint8_t blame = validSid(offenderSid) ? offenderSid : GAMEOVER_BLAME_ALL;
-        Serial.printf("[RX] RED violation; ending game. blameSid=%u holdId=%lu\n",
-                      blame, (unsigned long)p->holdId);
-        bcastGameOver(G, /*RED_LOOT*/1, blame);
+        uint8_t buf[sizeof(MsgHeader)+sizeof(LootHoldAckPayload)];
+        packHeader(G, (uint8_t)MsgType::LOOT_HOLD_ACK, sizeof(LootHoldAckPayload), buf, h->seq);
+        auto* a=(LootHoldAckPayload*)(buf+sizeof(MsgHeader));
+        a->holdId=p->holdId; a->accepted=0; a->rateHz=rateHz; a->maxCarry=G.maxCarry;
+        a->carried=0;
+        a->inventory= G.stationInventory[p->stationId];
+        a->capacity = G.stationCapacity[p->stationId];
+        // Inside grace -> EDGE_GRACE(6); outside grace -> RED(2). Both non-punitive.
+        if (now - G.lastFlipMs <= G.edgeGraceMs) a->denyReason=6; else a->denyReason=2;
+        Transport::broadcast(buf,sizeof(buf));
         break;
       }
 
@@ -371,7 +356,7 @@ void onRx(const uint8_t* data, uint16_t len) {
         G.mgTriedMask |= bit;
         if (p->success) {
           G.mgSuccessMask |= bit;
-          G.teamScore += 1;            // +1 team point (swap to per-UID credit if you have it)
+          G.teamScore += 10;            
           bcastScore(G);
         }
         // Arm the 3s all-done window the moment the last station tries

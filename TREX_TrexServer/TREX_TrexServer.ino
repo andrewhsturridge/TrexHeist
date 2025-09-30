@@ -246,16 +246,28 @@ void loop() {
     }
   }
 
-  // Linger holds into RED? After grace, it's a violation.
-  if (g.phase == Phase::PLAYING && g.light == LightState::RED) {
-    if (now >= g.redGraceUntil) {
-      bool anyHold = false;
-      for (auto &h : g.holds) if (h.active) { anyHold = true; break; }
-      if (anyHold) {
-        bcastGameOver(g, /*RED_LOOT*/1, GAMEOVER_BLAME_ALL);
-        return;
+  // Stop any active holds the moment we enter RED (non-punitive).
+  static LightState lastLight = LightState::RED;  // pessimistic init
+  if (g.phase == Phase::PLAYING) {
+    // RED rising edge
+    if (g.light == LightState::RED && lastLight != LightState::RED) {
+      for (auto &h : g.holds) {
+        if (h.active) {
+          sendHoldEnd(g, h.holdId, /*RED*/2);
+          h.active = false;
+        }
       }
     }
+    // Safety net: after the configured grace window, make sure no hold lingers
+    if (g.light == LightState::RED && now >= g.redGraceUntil) {
+      for (auto &h : g.holds) {
+        if (h.active) {
+          sendHoldEnd(g, h.holdId, /*RED*/2);
+          h.active = false;
+        }
+      }
+    }
+    lastLight = g.light;
   }
 
   // PIR violation during RED (after arming delay)
