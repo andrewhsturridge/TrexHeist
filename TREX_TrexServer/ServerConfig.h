@@ -13,8 +13,8 @@ static int8_t PIN_PIR[4] = { 5, -1, -1, -1 };
 constexpr uint32_t PIR_DEBOUNCE_MS = 60;
 
 // Maintenance Wi-Fi
-#define WIFI_SSID   "GUD"
-#define WIFI_PASS   "EscapE66"
+#define WIFI_SSID   "AndrewiPhone"
+#define WIFI_PASS   "12345678"
 #define HOSTNAME    "Trex-Server"
 
 // Sprite serial pins / config

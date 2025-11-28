@@ -54,8 +54,8 @@
 #include "LootMini.h"
 
 /* ---------- Wi-Fi (Maintenance / OTA HTTP) ---------- */
-const char* WIFI_SSID  = "GUD";
-const char* WIFI_PASS  = "EscapE66";
+const char* WIFI_SSID  = "AndrewiPhone";
+const char* WIFI_PASS  = "12345678";
 uint8_t     WIFI_CHANNEL = 6;
 
 bool transportReady = false;
@@ -93,7 +93,7 @@ const uint32_t RED     = C_RGB(255,0,0);
 const uint32_t GREEN   = C_RGB(0,255,0);
 const uint32_t BLUE    = C_RGB(0,0,255);
 const uint32_t CYAN    = C_RGB(0,200,255);
-const uint32_t YELLOW    = C_RGB(255,180,0);
+const uint32_t YELLOW  = C_RGB(255,180,0);
 const uint32_t WHITE   = C_RGB(255,255,255);
 const uint32_t OFF     = 0;
 
@@ -106,7 +106,8 @@ uint32_t      absentStartMs   = 0;
 constexpr uint32_t BONUS_WARN_MS         = 3000;  // blink when msLeft <= this
 constexpr uint32_t BONUS_BLINK_PERIOD_MS = 220;   // ~4.5 Hz
 
-/* ── Game/hold state (server-auth) ───────────────────── */
+/* ── Game/h
+ state (server-auth) ───────────────────── */
 volatile bool gameActive = true;     // flipped by GAME_OVER/START in onRx()
 volatile bool holdActive = false;    // true only after accepted ACK
 bool      wasPaused  = false;        // local pause latch
@@ -140,10 +141,12 @@ uint8_t   otaExpectMajor    = 0, otaExpectMinor = 0;
 char      otaUrl[128]       = {0};
 
 // ── Soft staggering to avoid same-ms spikes ──────────────────────────────
-// Tweak these if you like; they just separate events in time a bit.
-constexpr uint16_t RING_STAGGER_MS   = 0;   // ring can stay at 0 (baseline)
-constexpr uint16_t EMPTY_STAGGER_MS  = 70;  // empty-gauge blink toggles 70ms after ring
-constexpr uint16_t AUDIO_STOP_STAGGER_MS = 12; // stop audio slightly after a FULL ring starts
+constexpr uint16_t RING_STAGGER_MS       = 0;
+constexpr uint16_t EMPTY_STAGGER_MS      = 70;
+constexpr uint16_t AUDIO_STOP_STAGGER_MS = 12;
+
+// NEW: maintenance flag (set by LootRx CONTROL_CMD handler)
+bool maintRequested = false;
 
 /* ── helpers ─────────────────────────────────────────── */
 bool isAnyCardPresent(MFRC522 &m) {
@@ -224,7 +227,7 @@ void loop() {
   // identity serial (non-blocking)
   processIdentitySerial();
 
-  // ---- Runtime Maintenance Mode (long-press BOOT ~1.5 s) ----
+  // ---- Runtime Maintenance Mode (long-press BOOT ~1.5 s OR network MAINT) ----
   static Maint::Config mcfg{WIFI_SSID, WIFI_PASS, HOSTNAME,
                             /*apFallback=*/true, /*apChannel=*/WIFI_CHANNEL,
                             /*apPass=*/"trexsetup", /*buttonPin=*/0, /*holdMs=*/1500};
@@ -233,16 +236,25 @@ void loop() {
   mcfg.stationId    = STATION_ID;
   mcfg.enableBeacon = true;
 
-  // Maintenance checks
-  if (Maint::checkRuntimeEntry(mcfg)) { fillRing(BLUE); fillGauge(BLUE); Maint::loop(); return; }
-  if (Maint::active)                  { Maint::loop(); return; }
+  bool justEntered = Maint::checkRuntimeEntry(mcfg);
+  if (!justEntered && maintRequested) {
+    Maint::begin(mcfg);
+    justEntered    = true;
+    maintRequested = false;
+  }
+  if (justEntered || Maint::active) {
+    // Simple visual cue: all blue while in maintenance
+    fillRing(BLUE);
+    fillGauge(BLUE);
+    Maint::loop();
+    return;
+  }
 
   // START OTA if requested (must come before any 'return' using otaInProgress)
   if (otaStartRequested) {
     otaStartRequested = false;
 
     otaVisualStart();                               // one-time cyan pulse
-    // (No ACK anymore)
 
     Serial.printf("[OTA] Starting: %s\n", otaUrl);
     doOtaFromUrlDetailed(otaUrl);                   // blocking Wi-Fi download/flash
@@ -259,14 +271,11 @@ void loop() {
 
   // While the minigame is active, it owns the gauge and input
   if (mgActive) {
-    // MG logic + visuals
     mgLoop();
 
-    // 🔊 keep audio flowing during the minigame
     if (playing) handleAudio();
-    tickScheduledAudio();   // optional, safe
+    tickScheduledAudio();
 
-    // keep transport/OTA drip
     Transport::loop();
     if (transportReady && otaSuccessReportPending && millis() >= otaSuccessSendAt) {
       sendOtaStatus(OtaPhase::SUCCESS, 0, 0, 0);
@@ -354,6 +363,5 @@ void loop() {
   tickYellowBlink();
   tickEmptyBlink();
   tickBonusRainbow();
-  tickScheduledAudio();   // run any deferred audio stop
-
+  tickScheduledAudio();
 }

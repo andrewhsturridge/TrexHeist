@@ -60,6 +60,9 @@ extern void scheduleAudioStop(uint16_t delayMs);
 extern volatile bool mgActive;
 static inline bool mgSwallowRepaints() { return mgActive && !otaInProgress; }
 
+// NEW: maintenance request flag from network
+extern bool maintRequested;
+
 void onRx(const uint8_t* data, uint16_t len) {
   if (len < sizeof(MsgHeader)) return;
   auto* h = (const MsgHeader*)data;
@@ -70,6 +73,27 @@ void onRx(const uint8_t* data, uint16_t len) {
   }
 
   switch ((MsgType)h->type) {
+    // --- NEW: targeted CONTROL_CMD for maintenance ---
+    case MsgType::CONTROL_CMD: {
+      if (h->payloadLen != sizeof(ControlCmdPayload)) break;
+      const auto* p = (const ControlCmdPayload*)(data + sizeof(MsgHeader));
+
+      const uint8_t myType = (uint8_t)StationType::LOOT;
+      const uint8_t myId   = STATION_ID;
+
+      bool typeMatch = (p->targetType == myType || p->targetType == 255);
+      bool idMatch   = (p->targetId   == myId   || p->targetId   == 255);
+      bool matches   = typeMatch && idMatch;
+
+      if (!matches) break;
+
+      if ((ControlOp)p->op == ControlOp::ENTER_MAINT) {
+        maintRequested = true;
+        Serial.printf("[LOOT %u] CONTROL_CMD ENTER_MAINT received\n", (unsigned)myId);
+      }
+      break;
+    }
+
     case MsgType::STATE_TICK: {
       if (h->payloadLen < 1) break;
       const StateTickPayload* p =

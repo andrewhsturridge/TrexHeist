@@ -10,7 +10,6 @@
 #include "Identity.h"     // STATION_ID
 #include <TrexVersion.h>  // TREX_FW_MAJOR / TREX_FW_MINOR
 #include "TrexTransport.h"   // Transport::sendToServer, packHeader(), etc.
-// ^ Adjust include paths if your shared headers live elsewhere.
 
 // ---- externs provided by the main sketch / other modules ----
 extern const char* WIFI_SSID;  // from TREX_Loot.ino
@@ -23,6 +22,11 @@ extern void otaTickSpinner();         // UI spinner during blocking OTA
 extern void otaDrawProgress(uint32_t got, uint32_t total); // progress bar
 extern void otaVisualFail();          // show failure visuals
 extern void otaVisualSuccess();       // show success visuals
+
+// ── Tunable timeouts for iPhone hotspot OTA ─────────────────
+static constexpr uint32_t OTA_WIFI_CONNECT_TIMEOUT_MS      = 60000; // was 15000
+static constexpr uint32_t OTA_HTTP_TIMEOUT_MS              = 30000; // was 15000
+static constexpr uint32_t OTA_STREAM_INACTIVITY_TIMEOUT_MS = 30000; // was 15000
 
 // WIFI_SSID / WIFI_PASS are expected to be defined in your build or config headers.
 
@@ -68,6 +72,20 @@ bool otaReadFile(uint32_t &campId, bool &successPending) {
 
 void otaClearFile() { LittleFS.remove("/ota.json"); }
 
+// Small helper: handle FAIL + reboot in one place
+static bool otaFailAndReboot(uint8_t errCode, uint32_t bytes, uint32_t total, const char* logMsg) {
+  if (logMsg && *logMsg) {
+    Serial.println(logMsg);
+  }
+  sendOtaStatus(OtaPhase::FAIL, errCode, bytes, total);
+  otaVisualFail();
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_OFF);
+  delay(200);
+  ESP.restart();
+  return false;  // not actually reached, but keeps compiler happy
+}
+
 // ── Do the OTA (blocking in STA) ──────────────────────
 bool doOtaFromUrlDetailed(const char* url) {
   Serial.printf("[OTA] URL: %s\n", url);
@@ -78,13 +96,8 @@ bool doOtaFromUrlDetailed(const char* url) {
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED) {
-    if (millis() - t0 > 15000) {
-      Serial.println("[OTA] WiFi connect timeout");
-      sendOtaStatus(OtaPhase::FAIL, 1, 0, 0);
-      otaVisualFail();
-      WiFi.disconnect(true,true);
-      WiFi.mode(WIFI_OFF);
-      return false;
+    if (millis() - t0 > OTA_WIFI_CONNECT_TIMEOUT_MS) {
+      return otaFailAndReboot(1, 0, 0, "[OTA] WiFi connect timeout");
     }
     otaTickSpinner();
     delay(100);
@@ -96,26 +109,19 @@ bool doOtaFromUrlDetailed(const char* url) {
   HTTPClient http;
   WiFiClient client;
   http.setReuse(false);       // force Connection: close
-  http.setTimeout(15000);     // 15s read timeout
+  http.setTimeout(OTA_HTTP_TIMEOUT_MS);     // longer HTTP timeout
 
   if (!http.begin(client, url)) {
-    Serial.println("[OTA] http.begin failed");
-    sendOtaStatus(OtaPhase::FAIL, 2, 0, 0);
-    otaVisualFail();
-    WiFi.disconnect(true,true);
-    WiFi.mode(WIFI_OFF);
-    return false;
+    http.end();
+    return otaFailAndReboot(2, 0, 0, "[OTA] http.begin failed");
   }
 
   int code = http.GET();
   if (code != 200) {
-    Serial.printf("[OTA] HTTP code %d\n", code);
-    sendOtaStatus(OtaPhase::FAIL, 2, 0, 0);
+    char msg[64];
+    snprintf(msg, sizeof(msg), "[OTA] HTTP code %d", code);
     http.end();
-    otaVisualFail();
-    WiFi.disconnect(true,true);
-    WiFi.mode(WIFI_OFF);
-    return false;
+    return otaFailAndReboot(2, 0, 0, msg);
   }
 
   int total = http.getSize();         // -1 if server didn’t send Content-Length
@@ -124,23 +130,17 @@ bool doOtaFromUrlDetailed(const char* url) {
   // ---- Begin flash ----
   if (total > 0) {
     if (!Update.begin(total)) {
-      Serial.printf("[OTA] Update.begin failed: %s (need %d)\n", Update.errorString(), total);
-      sendOtaStatus(OtaPhase::FAIL, 4, 0, total);
+      char msg[96];
+      snprintf(msg, sizeof(msg), "[OTA] Update.begin failed: %s (need %d)", Update.errorString(), total);
       http.end();
-      otaVisualFail();
-      WiFi.disconnect(true,true);
-      WiFi.mode(WIFI_OFF);
-      return false;
+      return otaFailAndReboot(4, 0, (uint32_t)total, msg);
     }
   } else {
     if (!Update.begin()) {
-      Serial.printf("[OTA] Update.begin failed (no len): %s\n", Update.errorString());
-      sendOtaStatus(OtaPhase::FAIL, 4, 0, 0);
+      char msg[96];
+      snprintf(msg, sizeof(msg), "[OTA] Update.begin failed (no len): %s", Update.errorString());
       http.end();
-      otaVisualFail();
-      WiFi.disconnect(true,true);
-      WiFi.mode(WIFI_OFF);
-      return false;
+      return otaFailAndReboot(4, 0, 0, msg);
     }
   }
 
@@ -161,14 +161,11 @@ bool doOtaFromUrlDetailed(const char* url) {
 
       size_t wrote = Update.write(buf, (size_t)read);
       if (wrote != (size_t)read) {
-        Serial.printf("[OTA] Write error: %s at %lu/%d\n",
-                      Update.errorString(), (unsigned long)got, total);
-        sendOtaStatus(OtaPhase::FAIL, 4, got, (uint32_t)(total>0?total:0));
+        char msg[96];
+        snprintf(msg, sizeof(msg), "[OTA] Write error: %s at %lu/%d",
+                 Update.errorString(), (unsigned long)got, total);
         http.end();
-        otaVisualFail();
-        WiFi.disconnect(true,true);
-        WiFi.mode(WIFI_OFF);
-        return false;
+        return otaFailAndReboot(4, got, (uint32_t)(total>0?total:0), msg);
       }
 
       got += wrote;
@@ -194,14 +191,9 @@ bool doOtaFromUrlDetailed(const char* url) {
       if (total < 0 && !stream->connected() && stream->available() == 0) break;
 
       // Inactivity timeout
-      if (millis() - lastActivity > 15000) {
-        Serial.println("[OTA] Stream timeout (no data for 15s)");
-        sendOtaStatus(OtaPhase::FAIL, 2, got, (uint32_t)(total>0?total:0));
+      if (millis() - lastActivity > OTA_STREAM_INACTIVITY_TIMEOUT_MS) {
         http.end();
-        otaVisualFail();
-        WiFi.disconnect(true,true);
-        WiFi.mode(WIFI_OFF);
-        return false;
+        return otaFailAndReboot(2, got, (uint32_t)(total>0?total:0), "[OTA] Stream timeout (no data)");
       }
     }
   }
@@ -211,13 +203,10 @@ bool doOtaFromUrlDetailed(const char* url) {
   http.end();
 
   if (!ok || !Update.isFinished()) {
-    Serial.printf("[OTA] End/verify error: %s (wrote %lu/%d)\n",
-                  Update.errorString(), (unsigned long)got, total);
-    sendOtaStatus(OtaPhase::FAIL, 5, got, (uint32_t)(total>0?total:0));
-    otaVisualFail();
-    WiFi.disconnect(true,true);
-    WiFi.mode(WIFI_OFF);
-    return false;
+    char msg[96];
+    snprintf(msg, sizeof(msg), "[OTA] End/verify error: %s (wrote %lu/%d)",
+             Update.errorString(), (unsigned long)got, total);
+    return otaFailAndReboot(5, got, (uint32_t)(total>0?total:0), msg);
   }
 
   // Success → persist flag and reboot; SUCCESS will be reported after ESPNOW is up

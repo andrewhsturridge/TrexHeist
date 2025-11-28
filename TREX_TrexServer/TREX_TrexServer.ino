@@ -15,17 +15,38 @@
 #include "Net.h"
 #include "Media.h"
 #include "MaintCommands.h"
-#include "TrexMaintenance.h"   // updated version with custom command hook
+#include "TrexMaintenance.h"
 #include "OtaCampaign.h"
 #include "GameAudio.h"
 #include "Bonus.h"
 
 // --- OTA defaults (edit these per release) ---
-#define DEFAULT_OTA_URL          "http://192.168.2.231:8000/TrexHeist/TREX_Loot/build/esp32.esp32.um_feathers3/TREX_Loot.ino.bin"
+#define DEFAULT_OTA_URL          "http://172.20.10.2:8000/TrexHeist/TREX_Loot/build/esp32.esp32.um_feathers3/TREX_Loot.ino.bin"
 #define DEFAULT_OTA_EXPECT_MAJOR TREX_FW_MAJOR
 #define DEFAULT_OTA_EXPECT_MINOR TREX_FW_MINOR
 
 Game g;
+
+void triggerLootOta(Game& g) {
+  // Ensure game is idle so Loots will accept OTA
+  bcastGameOver(g, /*MANUAL*/2, GAMEOVER_BLAME_ALL);
+  Serial.println("[OTA] GAME_OVER sent; broadcasting in 3s…");
+
+  // Simple grace period; keeps loops active while waiting
+  uint32_t t0 = millis();
+  while (millis() - t0 < 3000) {
+    OtaCampaign::loop();
+    Transport::loop();
+    delay(10);
+  }
+
+  // Fire the OTA broadcast
+  OtaCampaign::sendLootOtaToAll(
+      DEFAULT_OTA_URL,
+      DEFAULT_OTA_EXPECT_MAJOR,
+      DEFAULT_OTA_EXPECT_MINOR
+  );
+}
 
 /* ── Setup ────────────────────────────────────────────────── */
 void setup() {
@@ -39,23 +60,18 @@ void setup() {
 
   OtaCampaign::begin();
 
-  // PIR pins
-  for (int i=0;i<4;i++) {
+  // PIR pins, media, etc. (unchanged)
+  for (int i = 0; i < 4; i++) {
     g.pir[i].pin = PIN_PIR[i];
     if (g.pir[i].pin >= 0) {
       pinMode(g.pir[i].pin, INPUT_PULLUP);
-      bool initState = (digitalRead(g.pir[i].pin) == LOW); // active-LOW
-      g.pir[i].state = g.pir[i].last = initState;
       g.pir[i].lastChange = millis();
-      Serial.printf("[TREX] PIR%d on GPIO%d init=%s\n", i, g.pir[i].pin, initState?"TRIG":"IDLE");
     }
   }
 
-  mediaInit();  // Sprite serial etc.
+  mediaInit();
+  gameAudioInit();
 
-  gameAudioInit(/*rxPin=*/9, /*txPin=*/8, /*baud=*/9600, /*volume=*/25);
-
-  // Transport
   TransportConfig cfg{ /*maintenanceMode=*/false, /*wifiChannel=*/WIFI_CHANNEL };
   if (!Transport::init(cfg, onRx)) {
     Serial.println("[TREX] Transport init FAILED");
@@ -84,20 +100,33 @@ void loop() {
   // Track last LED state so we only write on transitions
   static bool maintLEDOn = false;
 
-  // Enter via BOOT long-press
+  // Enter via BOOT long-press or network request
   bool justEntered = Maint::checkRuntimeEntry(mcfg);
+  if (!justEntered && netConsumeEnterMaintRequest()) {
+    Maint::begin(mcfg);
+    justEntered = true;
+  }
   if (justEntered || Maint::active) {
     if (!maintLEDOn) { digitalWrite(BOARD_BLUE_LED, HIGH); maintLEDOn = true; }
     Maint::loop();
     return;
   } else if (maintLEDOn) {
-    // Only turn it off once when leaving maintenance (if you ever add an exit)
     digitalWrite(BOARD_BLUE_LED, LOW);
     maintLEDOn = false;
   }
 
-  OtaCampaign::loop();
+  // --- Network control commands (from CONTROL station) ---
+  if (netConsumeControlStartRequest()) {
+    startNewGame(g);
+  }
+  if (netConsumeControlStopRequest()) {
+    bcastGameOver(g, /*MANUAL*/2, GAMEOVER_BLAME_ALL);
+  }
+  if (netConsumeLootOtaRequest()) {
+    triggerLootOta(g);
+  }
 
+  OtaCampaign::loop();
   Transport::loop();
 
   uint32_t now = millis();
@@ -116,30 +145,13 @@ void loop() {
     }
     if (c=='r' || c=='R') enterRed(g);
     if (c=='x' || c=='X') bcastGameOver(g, /*MANUAL*/2, GAMEOVER_BLAME_ALL);
+
     // Update all Loot stations (press 'U')
     if (c == 'u' || c == 'U') {
-      // Ensure game is idle so Loots will accept OTA
-      bcastGameOver(g, /*MANUAL*/2, GAMEOVER_BLAME_ALL);
-      Serial.println("[OTA] GAME_OVER sent; broadcasting in 3s…");
-
-      // Simple grace period; keeps loops active while waiting
-      uint32_t t0 = millis();
-      while (millis() - t0 < 3000) {
-        OtaCampaign::loop();
-        Transport::loop();
-        delay(10);
-      }
-
-      // Fire the OTA broadcast
-      OtaCampaign::sendLootOtaToAll(
-          DEFAULT_OTA_URL,
-          DEFAULT_OTA_EXPECT_MAJOR,
-          DEFAULT_OTA_EXPECT_MINOR
-      );
+      triggerLootOta(g);
     }
     if (c=='b' || c=='B') { bonusForceSpawn(g, millis()); }
     if (c=='c' || c=='C') { bonusClearAll(g); }
-
 
     // ---------- NEW: Round controls ----------
     if (c=='1') { modeClassicForceRound(g, 1, /*playWin=*/false); } // jump to R1 silently
@@ -149,7 +161,7 @@ void loop() {
     if (c=='>' || c=='.') { modeClassicNextRound(g, /*playWin=*/true); }
   }
 
-  // Drip broadcast on new game start
+  // Drip broadcast on new game start (unchanged)
   static uint32_t lastSend = 0;
   if (now - lastSend >= 50) { // ~20 msgs/sec
     if (g.pending.needGameStart) {
@@ -174,12 +186,13 @@ void loop() {
       if      (g.bonusIntermission)  msLeft = (g.bonusInterEnd  > now)?(g.bonusInterEnd  - now):0;
       else if (g.bonusIntermission2) msLeft = (g.bonus2End      > now)?(g.bonus2End      - now):0;
       else                           msLeft = (g.roundEndAt     > now)?(g.roundEndAt     - now):0;
-      sendStateTick(g, msLeft);
+      sendStateTick(g, msLeft); 
+      bcastGameStatus(g);
     }
     g.lastTickSentMs = now;
   }
 
-    // === Minigame tick ===
+  // === Minigame tick ===
   if (g.mgActive) {
     const uint32_t now = millis();
 

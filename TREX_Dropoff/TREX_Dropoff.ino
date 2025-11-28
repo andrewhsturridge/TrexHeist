@@ -38,8 +38,8 @@
 #include "TrexMaintenance.h"
 
 // ---------- Wi-Fi for maintenance ----------
-#define WIFI_SSID   "GUD"
-#define WIFI_PASS   "EscapE66"
+#define WIFI_SSID   "AndrewiPhone"
+#define WIFI_PASS   "12345678"
 #define HOSTNAME    "Drop-off"    // unique per device
 
 /* ── IDs & radio ───────────────────────────────────────────── */
@@ -133,7 +133,6 @@ inline uint32_t roundTargetCount() {
   return (roundGoalAbs > roundStartScore) ? (roundGoalAbs - roundStartScore) : 100;
 }
 
-
 // --- Ring "hold-green" for 1s after a successful DROP_RESULT ---
 static uint32_t ringHoldUntil[4] = {0,0,0,0};
 static bool     ringHoldActive[4] = {false,false,false,false};
@@ -155,6 +154,10 @@ static uint32_t finalScoreSnapshot = 0;   // score to display during the blink
 
 /* misc */
 uint16_t g_seq = 1;
+
+// --- Maintenance flag for network-triggered entry ---
+static bool maintRequested = false;
+static bool maintLEDOn     = false;
 
 /* ── WAV header helpers ───────────────────────────────────── */
 static inline uint16_t rd16(const uint8_t* p){ return (uint16_t)p[0] | ((uint16_t)p[1]<<8); }
@@ -414,13 +417,32 @@ void onRx(const uint8_t* data, uint16_t len) {
   }
 
   switch ((MsgType)h->type) {
+    case MsgType::CONTROL_CMD: {
+      if (h->payloadLen != sizeof(ControlCmdPayload)) break;
+      auto* p = (const ControlCmdPayload*)(data + sizeof(MsgHeader));
+
+      const uint8_t myType = (uint8_t)StationType::DROP;
+      const uint8_t myId   = STATION_ID;  // 6 for your Drop-off
+
+      bool typeMatch = (p->targetType == myType || p->targetType == 255);
+      bool idMatch   = (p->targetId   == myId   || p->targetId   == 255);
+      bool matches   = typeMatch && idMatch;
+
+      if (!matches) break;
+
+      if ((ControlOp)p->op == ControlOp::ENTER_MAINT) {
+        maintRequested = true;
+        Serial.println("[DROP] CONTROL_CMD ENTER_MAINT (targeted) received");
+      }
+      break;
+    }
+
     case MsgType::ROUND_STATUS: {
       if (h->payloadLen != sizeof(RoundStatusPayload)) break;
       auto* p = (const RoundStatusPayload*)(data + sizeof(MsgHeader));
       roundIndex      = p->roundIndex;
       roundStartScore = p->roundStartScore;
       roundGoalAbs    = p->roundGoalAbs;
-      // Optional: you could use p->msLeftRound for UI later
 
       // Repaint immediately (unless audioExclusive)
       if (gameActive) {
@@ -429,6 +451,7 @@ void onRx(const uint8_t* data, uint16_t len) {
       }
       break;
     }
+
     case MsgType::STATE_TICK: {
       if (h->payloadLen != sizeof(StateTickPayload)) break;
       auto* p = (const StateTickPayload*)(data + sizeof(MsgHeader));
@@ -439,14 +462,9 @@ void onRx(const uint8_t* data, uint16_t len) {
     }
     
     case MsgType::DROP_RESULT: {
-      // Accept both old (6-byte) and new (7-byte) payloads.
-      // Old:  dropped(2) + teamScore(4)
-      // New:  dropped(2) + teamScore(4) + readerIndex(1)
       if (h->payloadLen < 6) break;
 
       const uint8_t* pl = data + sizeof(MsgHeader);
-
-      // Parse teamScore (we don't use 'dropped' in this UI path)
       uint32_t newTeamScore =  (uint32_t)pl[2]
                             | ((uint32_t)pl[3] << 8)
                             | ((uint32_t)pl[4] << 16)
@@ -455,10 +473,8 @@ void onRx(const uint8_t* data, uint16_t len) {
       uint32_t prev = teamScore;
       teamScore = newTeamScore;
 
-      // Always consume the head of the request→result FIFO to keep alignment.
       int8_t idxFromFifo = reqDequeue();
 
-      // Prefer readerIndex from payload when available & valid (0..3).
       int8_t idx = -1;
       if (h->payloadLen >= 7) {
         uint8_t readerIndex = pl[6];
@@ -466,7 +482,6 @@ void onRx(const uint8_t* data, uint16_t len) {
       }
       if (idx < 0) idx = idxFromFifo;
 
-      // Paint gauges now if safe, or defer while audio is exclusive
       if (!audioExclusive) {
         drawTeamGaugesRound(teamScore, roundTargetCount());
       } else {
@@ -474,10 +489,8 @@ void onRx(const uint8_t* data, uint16_t len) {
         gaugeDirty = true;
       }
 
-      // Successful bank => keep that reader GREEN for 1s
       if (teamScore > prev) {
         if (idx >= 0 && idx < 4) {
-          // Only one GREEN at a time: clear any previous holds
           for (uint8_t j = 0; j < 4; ++j) {
             if (j != idx && ringHoldActive[j]) {
               ringHoldActive[j] = false;
@@ -486,19 +499,15 @@ void onRx(const uint8_t* data, uint16_t len) {
           }
 
           ringHoldActive[idx] = true;
-          ringHoldUntil[idx]  = millis() + 1000;  // 1s celebration
+          ringHoldUntil[idx]  = millis() + 1000;
           fillRing((uint8_t)idx, GREEN);
 
-          // Keep scans blocked until the celebration ends
           scanLocked   = true;
           scanUnlockAt = ringHoldUntil[idx];
         }
-        // Short audio window to avoid LED/SPI contention during celebration
         startAudioExclusiveShort();
 
       } else {
-        // Reject / no score change:
-        // We already consumed the FIFO head above, so mapping stays aligned.
         if (idx >= 0 && idx < 4 && !ringHoldActive[idx] && !audioExclusive) {
           if (!tagPresent[idx]) fillRing((uint8_t)idx, RED);
         }
@@ -515,7 +524,7 @@ void onRx(const uint8_t* data, uint16_t len) {
         if (!audioExclusive) drawTeamGaugesRound(teamScore, roundTargetCount());
         else { pendingTeamScore = teamScore; gaugeDirty = true; }
       } else {
-        finalScoreSnapshot = teamScore; // update snapshot used by the blink
+        finalScoreSnapshot = teamScore;
       }
       break;
     }
@@ -524,10 +533,9 @@ void onRx(const uint8_t* data, uint16_t len) {
       gameActive = true;
       Serial.println("[DROP] GAME_START");
       stopFinalBlink();
-      scanLocked = false;                 // <— add this
+      scanLocked = false;
       stopAudioExclusive();
 
-      // Reset per-game transient state
       for (int i=0;i<4;i++) {
         ringHoldActive[i] = false;
         ringPendingShow[i] = false;
@@ -535,9 +543,9 @@ void onRx(const uint8_t* data, uint16_t len) {
         absentMs[i]   = 0;
         fillRing(i, RED);
       }
-      reqHead = reqTail = 0;    // clear the request→result mapping FIFO
+      reqHead = reqTail = 0;
 
-      drawTeamGaugesRound(teamScore, roundTargetCount()); // show in-game style immediately
+      drawTeamGaugesRound(teamScore, roundTargetCount());
       break;
     }
 
@@ -546,13 +554,10 @@ void onRx(const uint8_t* data, uint16_t len) {
       Serial.printf("[DROP] GAME_OVER  final score=%lu / %lu\n",
                     (unsigned long)teamScore, (unsigned long)TEAM_GOAL);
 
-      // Stop any one-shot playback and resume LED shows
-      stopAudioExclusive();                 // sets audioExclusive = false
+      stopAudioExclusive();
 
-      // Set rings to red and clear tap state
       for (int i=0;i<4;i++) { tagPresent[i]=false; absentMs[i]=0; fillRing(i, RED); }
 
-      // Freeze result: green collected, red remainder
       startFinalBlink(teamScore - roundStartScore, roundTargetCount());
       break;
     }
@@ -574,23 +579,19 @@ void setup() {
   else { Serial.printf("[DROP] WAV size: %u bytes\n", (unsigned)f.size()); f.close(); }
 #endif
 
-  // I2S audio (minimal config like your working test)
   i2sOut = new AudioOutputI2S(0, AudioOutputI2S::EXTERNAL_I2S);
   i2sOut->SetPinout(PIN_I2S_BCLK, PIN_I2S_LRCLK, PIN_I2S_DOUT);
   i2sOut->SetGain(1.0f);
-  i2sOut->SetRate(48000);   // prime; openChain() will override from header
+  i2sOut->SetRate(48000);
 
-  // SPI + readers
   SPI.begin(PIN_SCK, PIN_MISO, PIN_MOSI);
   for (auto &r : rfid) r.PCD_Init();
 
-  // LEDs
   for (uint8_t i=0; i<4; ++i) { ring[i].begin(); ring[i].setBrightness(RING_BRIGHTNESS); }
   for (auto &g : gauge)       { g.begin(); g.setBrightness(GAUGE_BRIGHTNESS); g.show(); }
   drawTeamGaugesRound(teamScore, roundTargetCount());
   for (uint8_t i=0; i<4; ++i) fillRing(i, RED);
 
-  // ESP-NOW transport (must match channel with T-Rex)
   TransportConfig cfg{ /*maintenanceMode=*/false, /*wifiChannel=*/WIFI_CHANNEL };
   if (!Transport::init(cfg, onRx)) {
     Serial.println("[DROP] Transport init FAILED");
@@ -601,7 +602,6 @@ void setup() {
 
 /* ── loop ────────────────────────────────────────────────── */
 void loop() {
-  // Maintenance: long-press BOOT at any time to switch modes
   static Maint::Config mcfg{WIFI_SSID, WIFI_PASS, HOSTNAME,
                             /*apFallback=*/true, /*apChannel=*/WIFI_CHANNEL,
                             /*apPass=*/"trexsetup", /*buttonPin=*/0, /*holdMs=*/1500};
@@ -609,62 +609,68 @@ void loop() {
   mcfg.stationId    = STATION_ID;
   mcfg.enableBeacon = true;
 
-  if (Maint::checkRuntimeEntry(mcfg)) {
-    const uint32_t BLUE = Adafruit_NeoPixel::Color(0,0,255);
-    for (uint8_t i=0;i<4;i++) fillRing(i, BLUE);
+  // BOOT long-press OR network MAINT request
+  bool justEntered = Maint::checkRuntimeEntry(mcfg);
+  if (!justEntered && maintRequested) {
+    Maint::begin(mcfg);
+    justEntered    = true;
+    maintRequested = false;
+  }
+  if (justEntered || Maint::active) {
+    if (!maintLEDOn) {
+      const uint32_t BLUE = Adafruit_NeoPixel::Color(0,0,255);
+      for (uint8_t i=0;i<4;i++) fillRing(i, BLUE);
+      maintLEDOn = true;
+      Serial.println("[DROP] Maintenance mode entered");
+    }
     Maint::loop();
     return;
+  } else if (maintLEDOn) {
+    // If we ever exit maintenance without reboot, restore base visuals
+    maintLEDOn = false;
+    for (uint8_t i=0;i<4;i++) fillRing(i, RED);
+    drawTeamGaugesRound(teamScore, roundTargetCount());
+    Serial.println("[DROP] Maintenance mode exited");
   }
-  if (Maint::active) { Maint::loop(); return; }
 
   Transport::loop();
 
-  // This guarantees "one RFID at a time".
   if (audioExclusive) {
     if (playing && decoder) {
-      if (!decoder->loop()) { stopAudioExclusive(); return; }  // clip ended early
+      if (!decoder->loop()) { stopAudioExclusive(); return; }
     }
-    if ((int32_t)(millis() - audioEndAt) >= 0) { stopAudioExclusive(); return; } // force-stop at 500ms
-    return;   // block RFID work while audio window is active
+    if ((int32_t)(millis() - audioEndAt) >= 0) { stopAudioExclusive(); return; }
+    return;
   }
 
-  // ---- PAUSED / GAME OVER: only listen for messages ----
   if (!gameActive) {
     if (!wasPaused) {
       wasPaused = true;
       for (int i=0;i<4;i++) { tagPresent[i]=false; absentMs[i]=0; fillRing(i, RED); }
       stopAudioExclusive();
     }
-    // Keep the post-game blink alive:
-    tickFinalBlink();                    // <-- add this
-    maintainRingHolds();                 // (no-op if nothing active)
+    tickFinalBlink();
+    maintainRingHolds();
     return;
   }
 
-  // ---- ACTIVE ----
   const uint32_t now = millis();
 
-  // One RFID at a time: clear lock by timeout, skip scan while locked
   if (scanLocked && (int32_t)(now - scanUnlockAt) >= 0) {
     scanLocked = false;
-    // Flush the pending request to avoid mis-mapping on a late result
     int8_t dropped = reqDequeue();
     if (dropped >= 0 && !ringHoldActive[dropped] && !audioExclusive) {
-      // If we had painted arrival GREEN earlier (we don't anymore), ensure RED
       if (!tagPresent[dropped]) fillRing((uint8_t)dropped, RED);
     }
   }
 
   if (!scanLocked) {
-    // Round-robin improves fairness
     for (uint8_t step = 0; step < 4; ++step) {
       const uint8_t i = (rrStart + step) & 3;
       MFRC522 &rd = rfid[i];
 
-      // Quick probe
       bool present = cardPresent(rd);
 
-      // If latched, watch for absence to re-arm
       if (tagPresent[i]) {
         if (!present) {
           if (absentMs[i] == 0) absentMs[i] = now;
@@ -684,15 +690,13 @@ void loop() {
       if (readUid(rd, uid)) {
         sendDropRequest(uid, i);
 
-        // Pending visual ONLY: WHITE on arrival. GREEN happens on success.
         fillRing(i, WHITE);
         tagPresent[i] = true;
         reqEnqueue(i);
 
-        // Lock further reads until we get DROP_RESULT (or timeout)
         scanLocked   = true;
         scanUnlockAt = now + SCAN_LOCK_TIMEOUT_MS;
-        break;  // only one per pass
+        break;
       }
 
       pumpAudio();
@@ -701,8 +705,6 @@ void loop() {
     rrStart = (rrStart + 1) & 3;
   }
 
-  // During game we keep gauges fresh; defer if audio is exclusive.
-  // After game, blink final bars (red 500ms on/off; green solid).
   if (gameActive) {
     if (audioExclusive) {
       pendingTeamScore = teamScore;

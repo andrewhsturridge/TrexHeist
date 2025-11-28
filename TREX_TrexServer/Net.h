@@ -13,6 +13,7 @@ void sendDropResult(Game& g, uint16_t dropped, uint8_t readerIndex = DROP_READER
 
 void bcastRoundStatus(Game& g);
 void bcastBonusUpdate(Game& g);
+void bcastGameStatus(const Game& g);
 
 // Minigame broadcasts
 void bcastMgStart(Game& g, const Game::MgConfig& cfg);
@@ -24,3 +25,12 @@ void sendLootTick(Game& g, uint32_t holdId, uint8_t carried, uint16_t stationInv
 
 // RX dispatcher
 void onRx(const uint8_t* data, uint16_t len);
+
+// Maintenance / control helpers
+bool netConsumeEnterMaintRequest();
+bool netConsumeControlStartRequest();
+bool netConsumeControlStopRequest();
+bool netConsumeLootOtaRequest();
+
+// Generic raw broadcast used by OTA
+void netBroadcastRaw(const uint8_t* data, uint16_t len);

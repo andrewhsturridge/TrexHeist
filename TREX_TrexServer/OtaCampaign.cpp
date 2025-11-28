@@ -1,6 +1,7 @@
 #include "OtaCampaign.h"
+#include <Arduino.h>
 #include <TrexProtocol.h>
-
+#include <esp_random.h>
 
 // Provided by Net.cpp (see shim above)
 extern void netBroadcastRaw(const uint8_t* data, uint16_t len);
@@ -12,8 +13,17 @@ static uint32_t     g_startedMs  = 0;
 static const uint32_t CAMPAIGN_TIMEOUT_MS = 120000; // 2 minutes
 static uint8_t      g_expectMajor = 0, g_expectMinor = 0;
 
+// StationState is defined in OtaCampaign.h, with fields:
+// phase, error, fwMajor, fwMinor, bytes, total
 static StationState g_state[6]; // index by stationId 0..5 (we use 1..5)
 static bool         g_active = false;
+
+// NEW: 0 = all loot, else specific STATION_ID
+static uint8_t g_lootTargetId = 0;
+
+void setLootTargetId(uint8_t targetId) {
+  g_lootTargetId = targetId;
+}
 
 void begin() {
   memset(g_state, 0, sizeof(g_state));
@@ -23,7 +33,11 @@ void begin() {
 
 void summary(const char* why) {
   Serial.println();
-  Serial.printf("[OTA] Summary (%s) campaign=%lu  expect=%u.%u\n", why, (unsigned long)g_campaignId, g_expectMajor, g_expectMinor);
+  Serial.printf("[OTA] Summary (%s) campaign=%lu  expect=%u.%u\n",
+                why,
+                (unsigned long)g_campaignId,
+                g_expectMajor,
+                g_expectMinor);
   for (int id=1; id<=5; ++id) {
     StationState &s = g_state[id];
     const char* ph = (s.phase==0)?"PENDING":
@@ -47,9 +61,15 @@ void loop() {
 }
 
 void sendLootOtaToAll(const char* url, uint8_t expectMajor, uint8_t expectMinor) {
-  g_campaignId = (uint32_t)esp_random();
-  g_expectMajor = expectMajor; g_expectMinor = expectMinor;
-  g_startedMs = millis();
+  if (!url || !*url) {
+    Serial.println("[OTA] sendLootOtaToAll: empty URL, aborting");
+    return;
+  }
+
+  g_campaignId  = (uint32_t)esp_random();
+  g_expectMajor = expectMajor;
+  g_expectMinor = expectMinor;
+  g_startedMs   = millis();
   memset(g_state, 0, sizeof(g_state));
   g_active = true;
 
@@ -57,15 +77,16 @@ void sendLootOtaToAll(const char* url, uint8_t expectMajor, uint8_t expectMinor)
   auto* h = (MsgHeader*)buf;
   auto* p = (ConfigUpdatePayload*)(buf + sizeof(MsgHeader));
 
-  h->version = TREX_PROTO_VERSION;
-  h->type    = (uint8_t)MsgType::CONFIG_UPDATE;
+  h->version      = TREX_PROTO_VERSION;
+  h->type         = (uint8_t)MsgType::CONFIG_UPDATE;
   h->srcStationId = 0;
-  h->flags = 0;
-  h->payloadLen = sizeof(ConfigUpdatePayload);
-  h->seq = 0;
+  h->flags        = 0;
+  h->payloadLen   = sizeof(ConfigUpdatePayload);
+  h->seq          = 0;
 
   p->stationType = (uint8_t)StationType::LOOT;
-  p->targetId    = 0; // all Loots
+  // *** KEY CHANGE: use g_lootTargetId instead of always targeting all ***
+  p->targetId    = g_lootTargetId; // 0 = all Loots, else specific STATION_ID
   memset(p->otaUrl, 0, sizeof(p->otaUrl));
   strlcpy(p->otaUrl, url, sizeof(p->otaUrl));
   p->campaignId  = g_campaignId;
@@ -73,8 +94,9 @@ void sendLootOtaToAll(const char* url, uint8_t expectMajor, uint8_t expectMinor)
   p->expectMinor = expectMinor;
 
   netBroadcastRaw(buf, sizeof(buf));
-  Serial.printf("[OTA] Broadcast campaign=%lu url=%s expect=%u.%u\n",
-    (unsigned long)g_campaignId, url, expectMajor, expectMinor);
+  Serial.printf("[OTA] Broadcast campaign=%lu url=%s expect=%u.%u targetId=%u\n",
+    (unsigned long)g_campaignId, url, expectMajor, expectMinor,
+    (unsigned)g_lootTargetId);
 }
 
 bool handle(const uint8_t* data, uint16_t len) {
@@ -131,7 +153,6 @@ bool handle(const uint8_t* data, uint16_t len) {
     bool majOK = (g_expectMajor == 0) || (p->fwMajor == g_expectMajor);
     bool minOK = (g_expectMinor == 0) || (p->fwMinor == g_expectMinor);
 
-    // Record the latest fw we see
     StationState &s = g_state[id];
     s.fwMajor = p->fwMajor;
     s.fwMinor = p->fwMinor;
@@ -146,9 +167,8 @@ bool handle(const uint8_t* data, uint16_t len) {
           if (g_state[i].phase != (uint8_t)OtaPhase::SUCCESS) { allDone=false; break; }
         if (allDone) { summary("complete"); g_active=false; }
       }
-      // We still return false so the rest of your app can also use HELLO normally
+      // return false so the rest of your app can also use HELLO normally
     } else {
-      // Version mismatch during campaign; leave state as-is (PENDING) and log once
       Serial.printf("[OTA] Loot-%u HELLO v=%u.%u (expected %u.%u) – not counting as success\n",
                     id, p->fwMajor, p->fwMinor, g_expectMajor, g_expectMinor);
     }
@@ -158,4 +178,4 @@ bool handle(const uint8_t* data, uint16_t len) {
   return false; // not an OTA-related message
 }
 
-} // namespace
+} // namespace OtaCampaign

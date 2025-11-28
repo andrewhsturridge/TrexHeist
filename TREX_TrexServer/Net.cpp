@@ -8,12 +8,42 @@
 #include "Bonus.h"
 #include "ServerMini.h"
 
+// From main server sketch
+extern void startNewGame(Game& g);
+
+// --- Maintenance / control request flags (CONTROL -> server) ---
+static bool sEnterMaintRequested   = false;
+static bool sControlStartRequested = false;
+static bool sControlStopRequested  = false;
+static bool sLootOtaRequested      = false;
+
+bool netConsumeEnterMaintRequest() {
+  bool v = sEnterMaintRequested;
+  sEnterMaintRequested = false;
+  return v;
+}
+
+bool netConsumeControlStartRequest() {
+  bool v = sControlStartRequested;
+  sControlStartRequested = false;
+  return v;
+}
+
+bool netConsumeControlStopRequest() {
+  bool v = sControlStopRequested;
+  sControlStopRequested = false;
+  return v;
+}
+
+bool netConsumeLootOtaRequest() {
+  bool v = sLootOtaRequested;
+  sLootOtaRequested = false;
+  return v;
+}
+
 // Generic raw broadcast used by OTA
 void netBroadcastRaw(const uint8_t* data, uint16_t len) {
-  // Use the same Transport call you already use in your bcast* helpers:
-  Transport::broadcast(data, len);        // ← keep this if you have 'broadcast(...)'
-  // Transport::sendToAll(data, len);     // ← OR keep this if your Transport uses 'sendToAll(...)'
-  // Transport::sendAll(data, len);       // ← OR whatever your project calls it
+  Transport::broadcast(data, len);
 }
 
 static void packHeader(Game& g, uint8_t type, uint16_t payLen, uint8_t* buf, uint16_t seqOverride=0) {
@@ -90,10 +120,6 @@ void bcastStation(Game& g, uint8_t stationId) {
   p->inventory = g.stationInventory[stationId];
   p->capacity  = g.stationCapacity[stationId];
   Transport::broadcast(buf,sizeof(buf));
-  // Serial.printf("[BCAST_STATION] sid=%u inv=%u cap=%u\n",
-  //               stationId,
-  //               g.stationInventory[stationId],
-  //               g.stationCapacity[stationId]);
 }
 
 void bcastRoundStatus(Game& g) {
@@ -103,8 +129,8 @@ void bcastRoundStatus(Game& g) {
   p->roundIndex     = g.roundIndex;
   p->reserved       = 0;
   p->_pad           = 0;
-  p->roundStartScore= g.roundStartScore;     // see ModeClassic patch below
-  p->roundGoalAbs   = g.roundGoal;          // absolute teamScore to hit
+  p->roundStartScore= g.roundStartScore;
+  p->roundGoalAbs   = g.roundGoal;
   const uint32_t now = millis();
   p->msLeftRound    = (g.roundEndAt > now) ? (g.roundEndAt - now) : 0;
   Transport::broadcast(buf, sizeof(buf));
@@ -115,6 +141,38 @@ void bcastBonusUpdate(Game& g) {
   packHeader(g, (uint8_t)MsgType::BONUS_UPDATE, sizeof(BonusUpdatePayload), buf);
   auto* p = (BonusUpdatePayload*)(buf + sizeof(MsgHeader));
   p->mask = g.bonusActiveMask;
+  Transport::broadcast(buf, sizeof(buf));
+}
+
+// --- Game status broadcast for Control station ---
+void bcastGameStatus(const Game& g) {
+  uint8_t buf[sizeof(MsgHeader) + sizeof(GameStatusPayload)];
+  Game& ng = const_cast<Game&>(g);
+  packHeader(ng, (uint8_t)MsgType::GAME_STATUS, sizeof(GameStatusPayload), buf);
+  auto* p = (GameStatusPayload*)(buf + sizeof(MsgHeader));
+
+  const uint32_t now = millis();
+
+  uint32_t msLeftGame = 0;
+  if (g.gameEndAt > 0 && g.gameEndAt > now) {
+    msLeftGame = g.gameEndAt - now;
+  }
+
+  uint32_t msLeftRound = 0;
+  if (g.phase == Phase::PLAYING) {
+    if      (g.bonusIntermission)  msLeftRound = (g.bonusInterEnd  > now) ? (g.bonusInterEnd  - now) : 0;
+    else if (g.bonusIntermission2) msLeftRound = (g.bonus2End      > now) ? (g.bonus2End      - now) : 0;
+    else                           msLeftRound = (g.roundEndAt     > now) ? (g.roundEndAt     - now) : 0;
+  }
+
+  p->teamScore    = g.teamScore;
+  p->msLeftGame   = msLeftGame;
+  p->msLeftRound  = msLeftRound;
+  p->roundIndex   = g.roundIndex;
+  p->phase        = (uint8_t)g.phase;
+  p->lightState   = (uint8_t)g.light;
+  p->_pad         = 0;
+
   Transport::broadcast(buf, sizeof(buf));
 }
 
@@ -175,11 +233,85 @@ void onRx(const uint8_t* data, uint16_t len) {
     return;
   }
 
+  // Debug: log *every* incoming message type
+  Serial.printf("[NET] RX type=%u len=%u from=%u\n",
+                (unsigned)h->type,
+                (unsigned)h->payloadLen,
+                (unsigned)h->srcStationId);
+
   if (OtaCampaign::handle(data, len)) return;
 
   switch ((MsgType)h->type) {
     case MsgType::HELLO: {
       Serial.printf("[TREX] HELLO from station %u\n", h->srcStationId);
+      break;
+    }
+
+    // CONTROL_CMD from Control station (START/STOP/MAINT/LOOT)
+    case MsgType::CONTROL_CMD: {
+      if (h->payloadLen != sizeof(ControlCmdPayload)) {
+        Serial.printf("[TREX] CONTROL_CMD bad len=%u (expected %u)\n",
+                      (unsigned)h->payloadLen,
+                      (unsigned)sizeof(ControlCmdPayload));
+        break;
+      }
+      auto* p = (const ControlCmdPayload*)(data + sizeof(MsgHeader));
+
+      extern Game g;
+      Game& G = g;
+
+      Serial.printf("[TREX] CONTROL_CMD op=%u targetType=%u targetId=%u from station %u\n",
+                    (unsigned)p->op,
+                    (unsigned)p->targetType,
+                    (unsigned)p->targetId,
+                    (unsigned)h->srcStationId);
+
+      // For START/STOP/ENTER_MAINT we only act if the command targets the TREX server.
+      const uint8_t myType = (uint8_t)StationType::TREX;
+      const uint8_t myId   = STATION_ID; // 0 for server
+
+      auto matchesTrex = [&](void) -> bool {
+        // 255 = wildcard for CONTROL_CMD (all types / all ids)
+        bool typeMatch = (p->targetType == myType || p->targetType == 255);
+        bool idMatch   = (p->targetId   == myId   || p->targetId   == 255);
+        return typeMatch && idMatch;
+      };
+
+      switch ((ControlOp)p->op) {
+        case ControlOp::START: {
+          if (matchesTrex()) {
+            sControlStartRequested = true;
+          }
+          break;
+        }
+
+        case ControlOp::STOP: {
+          if (matchesTrex()) {
+            sControlStopRequested = true;
+          }
+          break;
+        }
+
+        case ControlOp::ENTER_MAINT: {
+          if (matchesTrex()) {
+            sEnterMaintRequested = true;
+          }
+          break;
+        }
+
+        case ControlOp::LOOT_OTA: {
+          // Always orchestrated by the server; targetId says which Loot station(s) to OTA.
+          // 0 => all loot stations (OtaCampaign treats 0 as wildcard for ConfigUpdate targetId)
+          // N => only loot station with STATION_ID == N
+          OtaCampaign::setLootTargetId(p->targetId);
+          sLootOtaRequested = true;
+          break;
+        }
+
+        default:
+          Serial.printf("[TREX] CONTROL_CMD unknown op=%u\n", (unsigned)p->op);
+          break;
+      }
       break;
     }
 
@@ -222,7 +354,6 @@ void onRx(const uint8_t* data, uint16_t len) {
         a->carried=0;
         a->inventory= G.stationInventory[p->stationId];
         a->capacity = G.stationCapacity[p->stationId];
-        // Inside grace -> EDGE_GRACE(6); outside grace -> RED(2). Both non-punitive.
         if (now - G.lastFlipMs <= G.edgeGraceMs) a->denyReason=6; else a->denyReason=2;
         Transport::broadcast(buf,sizeof(buf));
         break;
@@ -293,19 +424,20 @@ void onRx(const uint8_t* data, uint16_t len) {
       G.holds[hi].playerIdx  = pi;
       G.holds[hi].nextTickAt = now + (G.lootRateMs ? G.lootRateMs : 250); // safe fallback
 
-      uint8_t buf[sizeof(MsgHeader)+sizeof(LootHoldAckPayload)];
-      packHeader(G, (uint8_t)MsgType::LOOT_HOLD_ACK, sizeof(LootHoldAckPayload), buf, h->seq);
-      auto* a=(LootHoldAckPayload*)(buf+sizeof(MsgHeader));
-      a->holdId=p->holdId; a->accepted=1; a->rateHz=rateHz; a->maxCarry=G.maxCarry;
-      a->carried=G.players[pi].carried;
-      a->inventory=G.stationInventory[p->stationId];
-      a->capacity =G.stationCapacity[p->stationId];
-      a->denyReason=0;
-      Transport::broadcast(buf,sizeof(buf));
+      {
+        uint8_t buf[sizeof(MsgHeader)+sizeof(LootHoldAckPayload)];
+        packHeader(G, (uint8_t)MsgType::LOOT_HOLD_ACK, sizeof(LootHoldAckPayload), buf, h->seq);
+        auto* a=(LootHoldAckPayload*)(buf+sizeof(MsgHeader));
+        a->holdId=p->holdId; a->accepted=1; a->rateHz=rateHz; a->maxCarry=G.maxCarry;
+        a->carried=G.players[pi].carried;
+        a->inventory=G.stationInventory[p->stationId];
+        a->capacity =G.stationCapacity[p->stationId];
+        a->denyReason=0;
+        Transport::broadcast(buf,sizeof(buf));
+      }
 
-      // === BONUS: instant-drain on hold start (no overflow discard) ===
       if (applyBonusOnHoldStart(G, G.holds[hi].playerIdx, G.holds[hi].stationId, G.holds[hi].holdId)) {
-        G.holds[hi].active = false;   // ended immediately (FULL or EMPTY)
+        G.holds[hi].active = false;
       }
       break;
     }
@@ -351,15 +483,13 @@ void onRx(const uint8_t* data, uint16_t len) {
 
       const uint32_t bit = (1u << p->stationId);
 
-      // Only the first report per station counts
       if (!(G.mgTriedMask & bit)) {
         G.mgTriedMask |= bit;
         if (p->success) {
           G.mgSuccessMask |= bit;
-          G.teamScore += 10;            
+          G.teamScore += 10;
           bcastScore(G);
         }
-        // Arm the 3s all-done window the moment the last station tries
         uint32_t allMask = 0; for (uint8_t sid=1; sid<=MAX_STATIONS; ++sid) allMask |= (1u<<sid);
         if ((G.mgTriedMask & allMask) == allMask && G.mgAllTriedAt == 0) {
           G.mgAllTriedAt = millis();
@@ -368,6 +498,7 @@ void onRx(const uint8_t* data, uint16_t len) {
       break;
     }
 
-    default: break;
+    default:
+      break;
   }
 }

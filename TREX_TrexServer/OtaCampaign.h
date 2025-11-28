@@ -20,6 +20,9 @@ void loop();  // handles timeouts & periodic summary
 // Broadcast to all LOOT stations
 void sendLootOtaToAll(const char* url, uint8_t expectMajor, uint8_t expectMinor);
 
+// store which loot station(s) should be targeted in the next campaign
+void setLootTargetId(uint8_t targetId);   // 0 = all loot, else specific STATION_ID
+
 // Call from your server onRx() early; returns true if message was handled
 bool handle(const uint8_t* data, uint16_t len);
 

@@ -717,6 +717,11 @@ void modeClassicMaybeAdvance(Game& g) {
     }
   }
 
+  // *** Guard: if no round end time is set yet, do not treat it as a timeout ***
+  if (g.roundEndAt == 0) {
+    return;
+  }
+
   // ===== Timeout path =====
   if (now >= g.roundEndAt) {
     // If the team didn't meet the goal by timeout -> failure
