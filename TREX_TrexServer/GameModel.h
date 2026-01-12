@@ -146,11 +146,7 @@ struct Game {
   bool      noRedThisRound  = true;     // Round 1 = true
 
   bool     pirEnforce      = true;
-  // How long after entering RED we start enforcing PIR penalties.
-  // NOTE: With the default RED duration (~6500ms), a 6000ms arm delay effectively disables PIR
-  // for most of the RED period. 600ms is a more practical default; tune at runtime via:
-  //   telnet -> `set pir_arm_ms <ms>`
-  uint32_t pirArmDelayMs   = 600;
+  uint32_t pirArmDelayMs   = 6000;
   uint32_t pirArmAt        = 0;
 
   // Drip broadcast

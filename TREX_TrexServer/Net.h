@@ -1,4 +1,5 @@
 #pragma once
+#include <TrexProtocol.h>
 #include "GameModel.h"
 #include "ServerConfig.h"
 
@@ -39,3 +40,9 @@ bool netConsumeLootOtaRequest();
 
 // Generic raw broadcast used by OTA
 void netBroadcastRaw(const uint8_t* data, uint16_t len);
+
+// Radio config broadcast (channel + wire mode)
+void bcastRadioCfg(Game& g, const RadioCfgPayload& cfg);
+
+// Radio config request (from CONTROL)
+bool netConsumeRadioCfgRequest(RadioCfgPayload& out);

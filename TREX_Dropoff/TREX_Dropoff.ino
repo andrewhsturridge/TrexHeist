@@ -35,6 +35,7 @@
 
 #include <TrexProtocol.h>
 #include <TrexTransport.h>
+#include <Preferences.h>
 #include "TrexMaintenance.h"
 
 // ---------- Wi-Fi for maintenance ----------
@@ -44,7 +45,59 @@
 
 /* ── IDs & radio ───────────────────────────────────────────── */
 constexpr uint8_t  STATION_ID    = 6;    // drop-off station id
-constexpr uint8_t  WIFI_CHANNEL  = 6;    // must match T-Rex
+static uint8_t     WIFI_CHANNEL  = 6;    // must match T-Rex (loaded from NVS)
+
+static bool TX_FRAMED        = false;  // false = legacy packets (no wire header)
+static bool RX_ACCEPT_LEGACY = true;   // true = accept packets without wire header
+
+static volatile bool   gRadioCfgPending = false;
+static RadioCfgPayload gRadioCfgMsg{};
+
+static void loadRadioConfig() {
+  Preferences p;
+  p.begin("trex", true);
+  uint8_t ch  = p.getUChar("chan", WIFI_CHANNEL);
+  uint8_t txf = p.getUChar("txf",  0);
+  uint8_t rxl = p.getUChar("rxl",  1);
+  p.end();
+
+  if (ch < 1 || ch > 13) ch = WIFI_CHANNEL;
+  WIFI_CHANNEL     = ch;
+  TX_FRAMED        = (txf != 0);
+  RX_ACCEPT_LEGACY = (rxl != 0);
+
+  Serial.printf("[RADIO] Loaded: chan=%u txFramed=%u rxLegacy=%u",
+                (unsigned)WIFI_CHANNEL,
+                (unsigned)(TX_FRAMED ? 1 : 0),
+                (unsigned)(RX_ACCEPT_LEGACY ? 1 : 0));
+}
+
+static void saveRadioConfig(uint8_t ch, bool txFramed, bool rxLegacy) {
+  Preferences p;
+  p.begin("trex", false);
+  p.putUChar("chan", ch);
+  p.putUChar("txf",  txFramed ? 1 : 0);
+  p.putUChar("rxl",  rxLegacy ? 1 : 0);
+  p.end();
+}
+
+static void applyRadioCfgAndReboot(const RadioCfgPayload& msg) {
+  uint8_t ch = msg.wifiChannel;
+  bool txf = (msg.txFramed != 0);
+  bool rxl = (msg.rxLegacy != 0);
+
+  if (ch < 1 || ch > 13) ch = WIFI_CHANNEL;
+
+  Serial.printf("[RADIO] Apply: chan=%u txFramed=%u rxLegacy=%u (rebooting)",
+                (unsigned)ch,
+                (unsigned)(txf ? 1 : 0),
+                (unsigned)(rxl ? 1 : 0));
+
+  saveRadioConfig(ch, txf, rxl);
+  delay(150);
+  ESP.restart();
+}
+
 
 /* ── LEDs / gauges ────────────────────────────────────────── */
 constexpr uint16_t GAUGE_LEN        = 61;
@@ -416,6 +469,20 @@ void onRx(const uint8_t* data, uint16_t len) {
     return;
   }
 
+  // RADIO_CFG from server: persist new radio settings and reboot
+  if ((MsgType)h->type == MsgType::RADIO_CFG) {
+    if (h->payloadLen == sizeof(RadioCfgPayload) && h->srcStationId == 0) {
+      const auto* p = (const RadioCfgPayload*)(data + sizeof(MsgHeader));
+      gRadioCfgMsg = *p;
+      gRadioCfgPending = true;
+      Serial.printf("[RADIO] RADIO_CFG received: chan=%u txFramed=%u rxLegacy=%u\n",
+                    (unsigned)p->wifiChannel,
+                    (unsigned)p->txFramed,
+                    (unsigned)p->rxLegacy);
+    }
+    return;
+  }
+
   switch ((MsgType)h->type) {
     case MsgType::CONTROL_CMD: {
       if (h->payloadLen != sizeof(ControlCmdPayload)) break;
@@ -570,6 +637,8 @@ void onRx(const uint8_t* data, uint16_t len) {
 void setup() {
   Serial.begin(115200);
   delay(50);
+
+  loadRadioConfig();
   Serial.println("\n[DROP] Boot");
 
 #if !TREX_AUDIO_PROGMEM
@@ -593,6 +662,8 @@ void setup() {
   for (uint8_t i=0; i<4; ++i) fillRing(i, RED);
 
   TransportConfig cfg{ /*maintenanceMode=*/false, /*wifiChannel=*/WIFI_CHANNEL };
+  cfg.txFramed = TX_FRAMED;
+  cfg.rxAcceptLegacy = RX_ACCEPT_LEGACY;
   if (!Transport::init(cfg, onRx)) {
     Serial.println("[DROP] Transport init FAILED");
     while (1) delay(1000);
@@ -602,6 +673,12 @@ void setup() {
 
 /* ── loop ────────────────────────────────────────────────── */
 void loop() {
+  if (gRadioCfgPending) {
+    gRadioCfgPending = false;
+    applyRadioCfgAndReboot(gRadioCfgMsg);
+    return;
+  }
+
   static Maint::Config mcfg{WIFI_SSID, WIFI_PASS, HOSTNAME,
                             /*apFallback=*/true, /*apChannel=*/WIFI_CHANNEL,
                             /*apPass=*/"trexsetup", /*buttonPin=*/0, /*holdMs=*/1500};

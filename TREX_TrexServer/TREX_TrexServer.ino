@@ -7,6 +7,7 @@
 #include <TrexProtocol.h>
 #include <TrexTransport.h>
 #include <TrexVersion.h>
+#include <Preferences.h>
 
 #include "ServerConfig.h"
 #include "GameModel.h"
@@ -26,6 +27,80 @@
 #define DEFAULT_OTA_EXPECT_MINOR TREX_FW_MINOR
 
 Game g;
+
+// --- Radio config (persisted in NVS) ------------------------------------
+// Keys live in Preferences namespace "trex":
+//   chan = Wi-Fi channel (1..13)
+//   txf  = TX framed (0/1)   (wire header / magic)
+//   rxl  = RX accept legacy (0/1)
+static uint8_t WIFI_CHANNEL     = DEFAULT_WIFI_CHANNEL;
+static bool    TX_FRAMED        = false;  // false = legacy packets (no wire header)
+static bool    RX_ACCEPT_LEGACY = true;   // true = accept packets without wire header
+
+static void loadRadioConfig() {
+  Preferences p;
+  p.begin("trex", true);
+  uint8_t ch  = p.getUChar("chan", DEFAULT_WIFI_CHANNEL);
+  uint8_t txf = p.getUChar("txf",  0);
+  uint8_t rxl = p.getUChar("rxl",  1);
+  p.end();
+
+  if (ch < 1 || ch > 13) ch = DEFAULT_WIFI_CHANNEL;
+  WIFI_CHANNEL     = ch;
+  TX_FRAMED        = (txf != 0);
+  RX_ACCEPT_LEGACY = (rxl != 0);
+
+  Serial.printf("[RADIO] Loaded: chan=%u txFramed=%u rxLegacy=%u",
+                (unsigned)WIFI_CHANNEL,
+                (unsigned)(TX_FRAMED ? 1 : 0),
+                (unsigned)(RX_ACCEPT_LEGACY ? 1 : 0));
+}
+
+static void saveRadioConfig(uint8_t ch, bool txFramed, bool rxLegacy) {
+  Preferences p;
+  p.begin("trex", false);
+  p.putUChar("chan", ch);
+  p.putUChar("txf",  txFramed ? 1 : 0);
+  p.putUChar("rxl",  rxLegacy ? 1 : 0);
+  p.end();
+}
+
+// Broadcast + persist + reboot into new settings.
+// Request format supports "no change":
+//   wifiChannel: 0 => keep current
+//   txFramed:   0/1 set, else keep current
+//   rxLegacy:   0/1 set, else keep current
+static void applyRadioCfgAndReboot(const RadioCfgPayload& req, const char* why) {
+  uint8_t ch = WIFI_CHANNEL;
+  bool txf = TX_FRAMED;
+  bool rxl = RX_ACCEPT_LEGACY;
+
+  if (req.wifiChannel >= 1 && req.wifiChannel <= 13) ch = req.wifiChannel;
+  if (req.txFramed == 0 || req.txFramed == 1) txf = (req.txFramed != 0);
+  if (req.rxLegacy == 0 || req.rxLegacy == 1) rxl = (req.rxLegacy != 0);
+
+  RadioCfgPayload out{};
+  out.wifiChannel = ch;
+  out.txFramed    = txf ? 1 : 0;
+  out.rxLegacy    = rxl ? 1 : 0;
+  out._pad        = 0;
+
+  Serial.printf("[RADIO] Apply (%s): chan=%u txFramed=%u rxLegacy=%u",
+                why ? why : "?",
+                (unsigned)out.wifiChannel,
+                (unsigned)out.txFramed,
+                (unsigned)out.rxLegacy);
+
+  // Tell everyone first (while we're still on the old channel/mode)
+  bcastRadioCfg(g, out);
+  delay(150);
+
+  // Persist + reboot (server is the source of truth)
+  saveRadioConfig(out.wifiChannel, out.txFramed != 0, out.rxLegacy != 0);
+  delay(150);
+  ESP.restart();
+}
+
 
 void triggerLootOta(Game& g) {
   // Ensure game is idle so Loots will accept OTA
@@ -58,6 +133,8 @@ void setup() {
 
   Serial.println("\n[TREX] Server boot");
 
+  loadRadioConfig();
+
   OtaCampaign::begin();
 
   // PIR pins, media, etc. (unchanged)
@@ -73,6 +150,8 @@ void setup() {
   gameAudioInit();
 
   TransportConfig cfg{ /*maintenanceMode=*/false, /*wifiChannel=*/WIFI_CHANNEL };
+  cfg.txFramed = TX_FRAMED;
+  cfg.rxAcceptLegacy = RX_ACCEPT_LEGACY;
   if (!Transport::init(cfg, onRx)) {
     Serial.println("[TREX] Transport init FAILED");
     while (1) delay(1000);
@@ -129,16 +208,31 @@ void loop() {
     triggerLootOta(g);
   }
 
+  // --- Radio config requests (from CONTROL station) ---
+  RadioCfgPayload rcReq{};
+  if (netConsumeRadioCfgRequest(rcReq)) {
+    applyRadioCfgAndReboot(rcReq, "CONTROL");
+    return;
+  }
+
   OtaCampaign::loop();
   Transport::loop();
 
   uint32_t now = millis();
 
-  // Maintenance shortcut via Serial
-  while (Serial.available()) {
-    int c = Serial.read();
-    if (c=='m' || c=='M') { Maint::begin(mcfg); digitalWrite(BOARD_BLUE_LED, HIGH); return; }
-    if (c=='n' || c=='N') { startNewGame(g); bcastLivesUpdate(g, /*reason=*/0, GAMEOVER_BLAME_ALL); }
+  // ---- Serial commands (line-based; keeps 1-char shortcuts) ----
+  // Examples:
+  //   m            (enter maintenance)
+  //   n            (start new game)
+  //   u            (loot OTA)
+  //   CHAN 11      (move whole game to channel 11, then reboot)
+  //   WIRE LEGACY  (txFramed=0 rxLegacy=1)
+  //   WIRE FRAMED  (txFramed=1 rxLegacy=1)
+  //   WIRE STRICT  (txFramed=1 rxLegacy=0)
+
+  auto handleChar = [&](char c) -> bool {
+    if (c=='m' || c=='M') { Maint::begin(mcfg); digitalWrite(BOARD_BLUE_LED, HIGH); return true; }
+    if (c=='n' || c=='N') { startNewGame(g); bcastLivesUpdate(g, /*reason=*/0, GAMEOVER_BLAME_ALL); return false; }
     if (c=='g' || c=='G') {
       if (g.roundIndex == 0 || g.phase == Phase::END) {
         startNewGame(g);          // full reset + Round 1 + drip
@@ -146,24 +240,109 @@ void loop() {
       } else {
         enterGreen(g);            // mid-game manual flip stays supported
       }
+      return false;
     }
-    if (c=='r' || c=='R') enterRed(g);
-    if (c=='x' || c=='X') bcastGameOver(g, /*MANUAL*/2, GAMEOVER_BLAME_ALL);
+    if (c=='r' || c=='R') { enterRed(g); return false; }
+    if (c=='x' || c=='X') { bcastGameOver(g, /*MANUAL*/2, GAMEOVER_BLAME_ALL); return false; }
 
-    // Update all Loot stations (press 'U')
-    if (c == 'u' || c == 'U') {
-      triggerLootOta(g);
+    if (c=='u' || c=='U') { triggerLootOta(g); return false; }
+    if (c=='b' || c=='B') { bonusForceSpawn(g, millis()); return false; }
+    if (c=='c' || c=='C') { bonusClearAll(g); return false; }
+
+    if (c=='1') { modeClassicForceRound(g, 1, /*playWin=*/false); return false; }
+    if (c=='2') { modeClassicForceRound(g, 2, /*playWin=*/true ); return false; }
+    if (c=='3') { modeClassicForceRound(g, 3, /*playWin=*/true ); return false; }
+    if (c=='4') { modeClassicForceRound(g, 4, /*playWin=*/true ); return false; }
+    if (c=='>' || c=='.') { modeClassicNextRound(g, /*playWin=*/true); return false; }
+
+    return false;
+  };
+
+  static char   lineBuf[96];
+  static size_t lineLen = 0;
+
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\r') continue;
+
+    if (c == '\n') {
+      lineBuf[lineLen] = 0;
+      String line(lineBuf);
+      line.trim();
+      lineLen = 0;
+
+      if (line.length() == 0) continue;
+
+      // 1-char shortcuts are still supported
+      if (line.length() == 1) {
+        if (handleChar(line[0])) return; // enter maint: exit loop()
+        continue;
+      }
+
+      String u = line;
+      u.trim();
+      u.toUpperCase();
+
+      if (u.startsWith("CHAN ")) {
+        int ch = u.substring(5).toInt();
+        if (ch >= 1 && ch <= 13) {
+          RadioCfgPayload req{};
+          req.wifiChannel = (uint8_t)ch;
+          req.txFramed    = 255; // keep
+          req.rxLegacy    = 255; // keep
+          req._pad        = 0;
+          applyRadioCfgAndReboot(req, "SERIAL CHAN");
+          return;
+        } else {
+          Serial.println("[RADIO] Usage: CHAN <1..13>");
+        }
+        continue;
+      }
+
+      if (u.startsWith("WIRE ")) {
+        String mode = u.substring(5);
+        mode.trim();
+
+        RadioCfgPayload req{};
+        req.wifiChannel = 0;   // keep
+        req._pad        = 0;
+
+        if (mode == "LEGACY") {
+          req.txFramed = 0; req.rxLegacy = 1;
+          applyRadioCfgAndReboot(req, "SERIAL WIRE LEGACY");
+          return;
+        }
+        if (mode == "FRAMED") {
+          req.txFramed = 1; req.rxLegacy = 1;
+          applyRadioCfgAndReboot(req, "SERIAL WIRE FRAMED");
+          return;
+        }
+        if (mode == "STRICT") {
+          req.txFramed = 1; req.rxLegacy = 0;
+          applyRadioCfgAndReboot(req, "SERIAL WIRE STRICT");
+          return;
+        }
+
+        Serial.println("[RADIO] Usage: WIRE LEGACY | WIRE FRAMED | WIRE STRICT");
+        continue;
+      }
+
+      if (u == "RADIO" || u == "RADIO?") {
+        Serial.printf("[RADIO] Current: chan=%u txFramed=%u rxLegacy=%u\n",
+                      (unsigned)WIFI_CHANNEL,
+                      (unsigned)(TX_FRAMED ? 1 : 0),
+                      (unsigned)(RX_ACCEPT_LEGACY ? 1 : 0));
+        continue;
+      }
+
+      Serial.println("[SERIAL] Unknown cmd. Try: CHAN <1..13> | WIRE LEGACY/FRAMED/STRICT | RADIO");
+      continue;
     }
-    if (c=='b' || c=='B') { bonusForceSpawn(g, millis()); }
-    if (c=='c' || c=='C') { bonusClearAll(g); }
 
-    // ---------- NEW: Round controls ----------
-    if (c=='1') { modeClassicForceRound(g, 1, /*playWin=*/false); } // jump to R1 silently
-    if (c=='2') { modeClassicForceRound(g, 2, /*playWin=*/true ); } // jump to R2 (play win sting)
-    if (c=='3') { modeClassicForceRound(g, 3, /*playWin=*/true ); } // jump to R3 (play win sting)
-    if (c=='4') { modeClassicForceRound(g, 4, /*playWin=*/true ); } // jump to R4 (play win sting)
-    if (c=='>' || c=='.') { modeClassicNextRound(g, /*playWin=*/true); }
+    if ((c == 8 || c == 127) && lineLen > 0) { lineLen--; continue; }
+    if (lineLen < sizeof(lineBuf)-1) lineBuf[lineLen++] = c;
   }
+
 
   // Drip broadcast on new game start (unchanged)
   static uint32_t lastSend = 0;
@@ -288,34 +467,45 @@ void loop() {
   }
 
   // PIR violation during RED (after arming delay)
-  // IMPORTANT: level-based (not rising-edge) so "PIR stays on" works as memory.
   if (g.phase == Phase::PLAYING && g.light == LightState::RED && g.pirEnforce) {
-    if (!g.pirLifeLostThisRed && now >= g.pirArmAt) {
-
-      bool anyTrig = false;
+    if (now >= g.pirArmAt) {
       for (int i = 0; i < 4; ++i) {
         int pin = g.pir[i].pin;
         if (pin >= 0) {
-          const bool trig = (digitalRead(pin) == LOW);  // active-LOW
+          bool trig = (digitalRead(pin) == LOW);  // active-LOW
+
+          // Track PIR state + edge for debouncing life loss
+          const bool prev = g.pir[i].last;
           g.pir[i].state = trig;
-          anyTrig |= trig;
-        }
-      }
+          if (trig != prev) {
+            g.pir[i].last = trig;
+            g.pir[i].lastChange = now;
+          }
 
-      if (anyTrig) {
-        const LifeLossResult r =
-          applyLifeLoss(g, /*RED_PIR*/3, GAMEOVER_BLAME_ALL, /*obeyLockout=*/true);
+          // On rising edge after arming delay, consume a life (up to 5)
+          if (trig && !prev) {
+            // NEW: Only allow ONE life loss per RED period (until the next time we enter RED)
+            if (g.pirLifeLostThisRed) {
+              continue; // ignore additional PIR trips during this same RED
+            }
 
-        if (r == LifeLossResult::GAME_OVER) {
-          return;
-        }
+            const LifeLossResult r = applyLifeLoss(g, /*RED_PIR*/3, GAMEOVER_BLAME_ALL, /*obeyLockout=*/true);
+            if (r == LifeLossResult::GAME_OVER) {
+              return;
+            }
 
-        if (r == LifeLossResult::LIFE_LOST) {
-          // Only one PIR life loss per RED period
-          g.pirLifeLostThisRed = true;
+            if (r == LifeLossResult::LIFE_LOST) {
+              // Mark that we've already consumed a life for PIR in this RED period.
+              g.pirLifeLostThisRed = true;
 
-          // Optional recovery behavior (only if you still want it):
-          // enterGreen(g);
+              // Give the team a recovery window and avoid rapid re-triggering
+              enterGreen(g);
+              return;
+            }
+
+            // IGNORED (lockout): keep running the loop normally.
+            continue;
+          }
         }
       }
     }

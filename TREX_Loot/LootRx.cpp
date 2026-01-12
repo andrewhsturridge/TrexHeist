@@ -63,6 +63,10 @@ static inline bool mgSwallowRepaints() { return mgActive && !otaInProgress; }
 // NEW: maintenance request flag from network
 extern bool maintRequested;
 
+// RADIO_CFG handoff (set in RX, applied in main loop)
+extern volatile bool   gRadioCfgPending;
+extern RadioCfgPayload gRadioCfgMsg;
+
 void onRx(const uint8_t* data, uint16_t len) {
   if (len < sizeof(MsgHeader)) return;
   auto* h = (const MsgHeader*)data;
@@ -73,6 +77,19 @@ void onRx(const uint8_t* data, uint16_t len) {
   }
 
   switch ((MsgType)h->type) {
+    case MsgType::RADIO_CFG: {
+      if (h->payloadLen != sizeof(RadioCfgPayload)) break;
+      if (h->srcStationId != 0) break; // only apply config from server
+      const auto* p = (const RadioCfgPayload*)(data + sizeof(MsgHeader));
+      gRadioCfgMsg = *p;
+      gRadioCfgPending = true;
+      Serial.printf("[RADIO] RADIO_CFG received: chan=%u txFramed=%u rxLegacy=%u\n",
+                    (unsigned)p->wifiChannel,
+                    (unsigned)p->txFramed,
+                    (unsigned)p->rxLegacy);
+      break;
+    }
+
     // --- NEW: targeted CONTROL_CMD for maintenance ---
     case MsgType::CONTROL_CMD: {
       if (h->payloadLen != sizeof(ControlCmdPayload)) break;

@@ -17,6 +17,10 @@ static bool sControlStartRequested = false;
 static bool sControlStopRequested  = false;
 static bool sLootOtaRequested      = false;
 
+// --- Radio config request (CONTROL -> server) ---
+static bool           sRadioCfgRequested = false;
+static RadioCfgPayload sRadioCfgReq{};
+
 bool netConsumeEnterMaintRequest() {
   bool v = sEnterMaintRequested;
   sEnterMaintRequested = false;
@@ -39,6 +43,13 @@ bool netConsumeLootOtaRequest() {
   bool v = sLootOtaRequested;
   sLootOtaRequested = false;
   return v;
+}
+
+bool netConsumeRadioCfgRequest(RadioCfgPayload& out) {
+  if (!sRadioCfgRequested) return false;
+  out = sRadioCfgReq;
+  sRadioCfgRequested = false;
+  return true;
 }
 
 // Generic raw broadcast used by OTA
@@ -145,6 +156,14 @@ void bcastBonusUpdate(Game& g) {
 }
 
 // --- Game status broadcast for Control station ---
+void bcastRadioCfg(Game& g, const RadioCfgPayload& cfgp) {
+  uint8_t buf[sizeof(MsgHeader) + sizeof(RadioCfgPayload)];
+  packHeader(g, (uint8_t)MsgType::RADIO_CFG, sizeof(RadioCfgPayload), buf);
+  auto* p = (RadioCfgPayload*)(buf + sizeof(MsgHeader));
+  *p = cfgp;
+  Transport::broadcast(buf, sizeof(buf));
+}
+
 void bcastGameStatus(const Game& g) {
   uint8_t buf[sizeof(MsgHeader) + sizeof(GameStatusPayload)];
   Game& ng = const_cast<Game&>(g);
@@ -296,6 +315,23 @@ void onRx(const uint8_t* data, uint16_t len) {
   switch ((MsgType)h->type) {
     case MsgType::HELLO: {
       Serial.printf("[TREX] HELLO from station %u\n", h->srcStationId);
+      break;
+    }
+
+    case MsgType::RADIO_CFG: {
+      if (h->payloadLen != sizeof(RadioCfgPayload)) break;
+      // Only accept RADIO_CFG requests from the CONTROL station
+      // (CONTROL uses a fixed STATION_ID; see TREX_Control sketch).
+      if (h->srcStationId != 7) break;
+
+      const auto* p = (const RadioCfgPayload*)(data + sizeof(MsgHeader));
+      sRadioCfgReq = *p;
+      sRadioCfgRequested = true;
+
+      Serial.printf("[TREX] RADIO_CFG request from CONTROL: chan=%u txFramed=%u rxLegacy=%u",
+                    (unsigned)p->wifiChannel,
+                    (unsigned)p->txFramed,
+                    (unsigned)p->rxLegacy);
       break;
     }
 

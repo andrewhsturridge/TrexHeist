@@ -2,7 +2,7 @@
 #include <stdint.h>
 
 // Radio / identity
-constexpr uint8_t  WIFI_CHANNEL = 6;
+constexpr uint8_t  DEFAULT_WIFI_CHANNEL = 6;
 constexpr uint8_t  STATION_ID   = 0;   // server is always 0
 
 // Board blue user LED on UM FeatherS3 (active-HIGH)

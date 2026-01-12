@@ -58,6 +58,58 @@ const char* WIFI_SSID  = "AndrewiPhone";
 const char* WIFI_PASS  = "12345678";
 uint8_t     WIFI_CHANNEL = 6;
 
+static bool TX_FRAMED        = false;  // false = legacy packets (no wire header)
+static bool RX_ACCEPT_LEGACY = true;   // true = accept packets without wire header
+
+volatile bool    gRadioCfgPending = false;
+RadioCfgPayload  gRadioCfgMsg{};
+
+static void loadRadioConfig() {
+  Preferences p;
+  p.begin("trex", true);
+  uint8_t ch  = p.getUChar("chan", WIFI_CHANNEL);
+  uint8_t txf = p.getUChar("txf",  0);
+  uint8_t rxl = p.getUChar("rxl",  1);
+  p.end();
+
+  if (ch < 1 || ch > 13) ch = WIFI_CHANNEL;
+  WIFI_CHANNEL     = ch;
+  TX_FRAMED        = (txf != 0);
+  RX_ACCEPT_LEGACY = (rxl != 0);
+
+  Serial.printf("[RADIO] Loaded: chan=%u txFramed=%u rxLegacy=%u",
+                (unsigned)WIFI_CHANNEL,
+                (unsigned)(TX_FRAMED ? 1 : 0),
+                (unsigned)(RX_ACCEPT_LEGACY ? 1 : 0));
+}
+
+static void saveRadioConfig(uint8_t ch, bool txFramed, bool rxLegacy) {
+  Preferences p;
+  p.begin("trex", false);
+  p.putUChar("chan", ch);
+  p.putUChar("txf",  txFramed ? 1 : 0);
+  p.putUChar("rxl",  rxLegacy ? 1 : 0);
+  p.end();
+}
+
+static void applyRadioCfgAndReboot(const RadioCfgPayload& msg) {
+  uint8_t ch = msg.wifiChannel;
+  bool txf = (msg.txFramed != 0);
+  bool rxl = (msg.rxLegacy != 0);
+
+  if (ch < 1 || ch > 13) ch = WIFI_CHANNEL;
+
+  Serial.printf("[RADIO] Apply: chan=%u txFramed=%u rxLegacy=%u (rebooting)",
+                (unsigned)ch,
+                (unsigned)(txf ? 1 : 0),
+                (unsigned)(rxl ? 1 : 0));
+
+  saveRadioConfig(ch, txf, rxl);
+  delay(150);
+  ESP.restart();
+}
+
+
 bool transportReady = false;
 bool otaSuccessReportPending = false;   // set if we find /ota.json=success at boot
 uint32_t otaSuccessSendAt = 0;
@@ -178,6 +230,8 @@ void setup() {
   // Provision identity (NVS); prints what it set/loaded
   ensureIdentity();
 
+  loadRadioConfig();
+
   // Always mount FS (for /ota.json even if audio is PROGMEM)
   if (!LittleFS.begin()) { LittleFS.begin(true); }
 
@@ -211,6 +265,8 @@ void setup() {
   #endif
 
   TransportConfig cfg{ /*maintenanceMode=*/false, /*wifiChannel=*/WIFI_CHANNEL };
+  cfg.txFramed = TX_FRAMED;
+  cfg.rxAcceptLegacy = RX_ACCEPT_LEGACY;
   if (!Transport::init(cfg, onRx)) {
     Serial.println("[LOOT] Transport init FAILED");
     while (1) { delay(1000); }
@@ -226,6 +282,12 @@ void setup() {
 void loop() {
   // identity serial (non-blocking)
   processIdentitySerial();
+
+  if (gRadioCfgPending) {
+    gRadioCfgPending = false;
+    applyRadioCfgAndReboot(gRadioCfgMsg);
+    return;
+  }
 
   // ---- Runtime Maintenance Mode (long-press BOOT ~1.5 s OR network MAINT) ----
   static Maint::Config mcfg{WIFI_SSID, WIFI_PASS, HOSTNAME,
