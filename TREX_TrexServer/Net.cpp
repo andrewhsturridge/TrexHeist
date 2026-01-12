@@ -176,6 +176,58 @@ void bcastGameStatus(const Game& g) {
   Transport::broadcast(buf, sizeof(buf));
 }
 
+
+// --- Lives system ------------------------------------------------------
+
+void bcastLivesUpdate(Game& g, uint8_t reason /*=0*/, uint8_t blameSid /*=GAMEOVER_BLAME_ALL*/) {
+  uint8_t buf[sizeof(MsgHeader) + sizeof(LivesUpdatePayload)];
+  packHeader(g, (uint8_t)MsgType::LIVES_UPDATE, sizeof(LivesUpdatePayload), buf);
+  auto* p = (LivesUpdatePayload*)(buf + sizeof(MsgHeader));
+  p->livesRemaining = g.livesRemaining;
+  p->livesMax       = g.livesMax;
+  p->reason         = reason;
+  p->blameSid       = blameSid;
+  Transport::broadcast(buf, sizeof(buf));
+}
+
+LifeLossResult applyLifeLoss(Game& g, uint8_t reason, uint8_t blameSid /*=GAMEOVER_BLAME_ALL*/, bool obeyLockout /*=true*/) {
+  if (g.phase != Phase::PLAYING) {
+    return LifeLossResult::IGNORED;
+  }
+
+  const uint32_t now = millis();
+
+  if (obeyLockout && (int32_t)(now - g.lifeLossLockoutUntil) < 0) {
+    return LifeLossResult::IGNORED;
+  }
+
+  if (g.livesRemaining == 0) {
+    // Safety: if we're somehow still PLAYING with 0 lives, end now.
+    bcastLivesUpdate(g, reason, blameSid);
+    bcastGameOver(g, reason, blameSid);
+    return LifeLossResult::GAME_OVER;
+  }
+
+  // Consume a life
+  g.livesRemaining = (uint8_t)(g.livesRemaining - 1);
+  g.lastLifeLossReason   = reason;
+  g.lastLifeLossBlameSid = blameSid;
+  g.lifeLossLockoutUntil = now + g.lifeLossCooldownMs;
+
+  Serial.printf("[TREX] LIFE LOST reason=%u blameSid=%u lives=%u/%u\n",
+                (unsigned)reason, (unsigned)blameSid,
+                (unsigned)g.livesRemaining, (unsigned)g.livesMax);
+
+  bcastLivesUpdate(g, reason, blameSid);
+
+  if (g.livesRemaining == 0) {
+    bcastGameOver(g, reason, blameSid);
+    return LifeLossResult::GAME_OVER;
+  }
+
+  return LifeLossResult::LIFE_LOST;
+}
+
 void bcastMgStart(Game& g, const Game::MgConfig& c) {
   uint8_t buf[sizeof(MsgHeader) + sizeof(MgStartPayload)];
   packHeader(g, (uint8_t)MsgType::MG_START, sizeof(MgStartPayload), buf);

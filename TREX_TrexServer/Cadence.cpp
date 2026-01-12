@@ -72,6 +72,8 @@ void enterRed(Game& g) {
   g.lastFlipMs  = millis();
   g.redGraceUntil = g.lastFlipMs + g.redHoldGraceMs;
   g.pirArmAt      = g.lastFlipMs + g.pirArmDelayMs;
+  // New RED period begins: allow at most one PIR-in-RED life loss this RED
+  g.pirLifeLostThisRed = false;
   spritePlay(CLIP_LOOKING);
   Serial.println("[TREX] -> RED");
   gameAudioPlayOnce(TRK_PLAYERS_STAY_STILL);

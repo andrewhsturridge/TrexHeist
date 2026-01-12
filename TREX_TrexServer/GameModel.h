@@ -46,6 +46,17 @@ struct Game {
   uint16_t    seq        = 1;
   uint32_t    teamScore  = 0;
 
+  // Lives system ("5 lives")
+  uint8_t   livesMax             = 5;    // configured max lives
+  uint8_t   livesRemaining       = 5;    // decremented on failures
+  uint16_t  lifeLossCooldownMs   = 1500; // throttle repeated losses (ms)
+  uint32_t  lifeLossLockoutUntil = 0;    // millis() time; ignore losses until then
+  uint8_t   lastLifeLossReason   = 0;    // last reason that consumed a life (for UI/debug)
+  uint8_t   lastLifeLossBlameSid = GAMEOVER_BLAME_ALL;
+
+  // PIR-in-RED: allow at most one life loss per RED period
+  bool      pirLifeLostThisRed   = false;
+
   // Tunables (Telnet/maint will edit these)
   uint32_t greenMs = 15000;
   uint32_t redMs   = 6500;
@@ -135,7 +146,11 @@ struct Game {
   bool      noRedThisRound  = true;     // Round 1 = true
 
   bool     pirEnforce      = true;
-  uint32_t pirArmDelayMs   = 6000;
+  // How long after entering RED we start enforcing PIR penalties.
+  // NOTE: With the default RED duration (~6500ms), a 6000ms arm delay effectively disables PIR
+  // for most of the RED period. 600ms is a more practical default; tune at runtime via:
+  //   telnet -> `set pir_arm_ms <ms>`
+  uint32_t pirArmDelayMs   = 600;
   uint32_t pirArmAt        = 0;
 
   // Drip broadcast

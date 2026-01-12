@@ -16,6 +16,15 @@ static inline bool uidEq(const TrexUid& a, const TrexUid& b) {
 void resetGame(Game& g) {
   g.phase = Phase::PLAYING;       // ensure we're in play mode
   g.teamScore = 0;
+
+  // Lives reset
+  g.livesMax             = 5;
+  g.livesRemaining       = g.livesMax;
+  g.lifeLossCooldownMs   = 1500;
+  g.lifeLossLockoutUntil = 0;
+  g.lastLifeLossReason   = 0;
+  g.lastLifeLossBlameSid = GAMEOVER_BLAME_ALL;
+  g.pirLifeLostThisRed   = false;
   g.roundIndex = 0;
 
   g.gameStartAt  = 0;

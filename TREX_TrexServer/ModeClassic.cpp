@@ -334,6 +334,173 @@ static void startRound(Game& g, uint8_t idx) {
   }
 }
 
+// Retry the current round after a GOAL_NOT_MET failure (consumes a life elsewhere).
+// This keeps the *same* absolute goal (g.roundGoal) and teamScore, but resets the
+// round timer and refills station inventory for the remaining points needed.
+static void retryCurrentRoundAfterGoalFail(Game& g) {
+  const uint8_t idx = g.roundIndex;
+  const uint32_t now = millis();
+
+  Serial.printf("[TREX] RETRY round=%u score=%lu goal=%lu remaining=%lu lives=%u/%u\n",
+                (unsigned)idx,
+                (unsigned long)g.teamScore,
+                (unsigned long)g.roundGoal,
+                (unsigned long)((g.roundGoal > g.teamScore) ? (g.roundGoal - g.teamScore) : 0),
+                (unsigned)g.livesRemaining,
+                (unsigned)g.livesMax);
+
+  // Stop any holds / carried so nothing "sneaks" past a failed timer.
+  endAndClearHoldsAndCarried(g);
+
+  // Cancel any bonus/intermission visuals and reset bonus schedule for this round.
+  g.bonusIntermission  = false;
+  g.bonusIntermission2 = false;
+  g.bonusActiveMask    = 0;
+  for (uint8_t sid = 1; sid <= MAX_STATIONS; ++sid) g.bonusEndsAt[sid] = 0;
+  bcastBonusUpdate(g);
+
+  // Reset any R5 hop engine state (will be re-armed below if idx==5).
+  g.r5Active        = false;
+  g.r5HotSid        = 0;
+  g.r5DwellEndAt    = 0;
+  g.r5NextDepleteAt = 0;
+
+  // Reset the round timer (keep overall gameStartAt/gameEndAt untouched).
+  g.roundStartAt = now;
+  g.roundEndAt   = now + 120000UL;
+  sendStateTick(g, (g.roundEndAt > now) ? (g.roundEndAt - now) : 0);
+
+  // Remaining points needed to hit the existing absolute goal.
+  const uint16_t remaining = (g.roundGoal > g.teamScore)
+    ? (uint16_t)(g.roundGoal - g.teamScore)
+    : 0;
+
+  // Round-specific knobs + inventory refill style.
+  if (idx == 1) {
+    g.maxCarry = 20;
+    g.noRedThisRound       = true;
+    g.allowYellowThisRound = false;
+    g.lootPerTick          = 4;
+    g.lootRateMs           = 1000;
+
+    // EVEN split of remaining
+    uint16_t base = remaining / 5, rem = remaining % 5;
+    for (uint8_t sid = 1; sid <= 5; ++sid) {
+      uint16_t x = base + (rem ? 1 : 0); if (rem) rem--;
+      if (x > 56) x = 56;
+      g.stationCapacity[sid]  = 56;
+      g.stationInventory[sid] = x;
+    }
+
+    bonusResetForRound(g, now);
+    enterGreen(g);
+    bcastRoundStatus(g);
+
+    g.pending.nextStation = 1;
+    g.pending.needScore   = true;
+    return;
+  }
+
+  if (idx == 2) {
+    g.maxCarry = 20;
+    g.noRedThisRound       = false;
+    g.allowYellowThisRound = true;
+    g.lootRateMs           = 1000;
+    g.lootPerTick          = 4;
+
+    // EVEN split of remaining
+    uint16_t base = remaining / 5, rem = remaining % 5;
+    for (uint8_t sid = 1; sid <= 5; ++sid) {
+      uint16_t x = base + (rem ? 1 : 0); if (rem) rem--;
+      if (x > 56) x = 56;
+      g.stationCapacity[sid]  = 56;
+      g.stationInventory[sid] = x;
+    }
+
+    bonusResetForRound(g, now);
+    enterGreen(g);
+    bcastRoundStatus(g);
+
+    g.pending.nextStation = 1;
+    g.pending.needScore   = true;
+    return;
+  }
+
+  if (idx == 3) {
+    g.maxCarry = 10;
+    g.noRedThisRound       = false;
+    g.allowYellowThisRound = true;
+    g.lootRateMs           = 1000;
+    g.lootPerTick          = 4;
+
+    // RANDOM split of remaining
+    splitInventoryRandom(g, remaining);
+
+    // Restore the intended Round 3 cadence feel
+    g.greenMsMin = 14000;  g.greenMsMax = 18000;
+    g.redMsMin   = 6500;   g.redMsMax   = 8000;
+    g.yellowMsMin= g.yellowMs; g.yellowMsMax = g.yellowMs;
+
+    bonusResetForRound(g, now);
+    enterGreen(g);
+    bcastRoundStatus(g);
+
+    g.pending.nextStation = 1;
+    g.pending.needScore   = true;
+    return;
+  }
+
+  if (idx == 4) {
+    g.maxCarry = 10;
+    g.noRedThisRound       = false;
+    g.allowYellowThisRound = true;
+    g.lootRateMs           = 1000;
+    g.lootPerTick          = 4;
+
+    // RANDOM split of remaining
+    splitInventoryRandom(g, remaining);
+
+    // Restore Round 4 cadence windowing
+    const uint32_t redMin  = (g.pirArmDelayMs > 6000) ? g.pirArmDelayMs : 6000;
+    g.redMsMin   = redMin;                 g.redMsMax   = (7000 > redMin) ? 7000 : redMin;
+    g.greenMsMin = 10000;                  g.greenMsMax = 14000;
+    g.yellowMsMin= 3000;                   g.yellowMsMax = 3000;
+
+    bonusResetForRound(g, now);
+    enterGreen(g);
+    bcastRoundStatus(g);
+
+    g.pending.nextStation = 1;
+    g.pending.needScore   = true;
+    return;
+  }
+
+  // idx >= 5: Round 5 retry
+  {
+    g.noRedThisRound       = true;
+    g.allowYellowThisRound = false;
+
+    g.maxCarry   = 10;
+    g.lootRateMs = 1000;
+    g.lootPerTick= 4;
+
+    // Ensure sane capacities for the hop engine
+    for (uint8_t sid = 1; sid <= 5; ++sid) {
+      if (g.stationCapacity[sid] == 0) g.stationCapacity[sid] = 56;
+      g.stationInventory[sid] = 0;
+    }
+
+    enterGreen(g);
+    bcastRoundStatus(g);
+
+    // Restart the R5 hop engine
+    r5Start(g, now);
+
+    g.pending.nextStation = 1;
+    g.pending.needScore   = true;
+  }
+}
+
 static const uint8_t ST_FIRST = 1;
 static const uint8_t ST_LAST  = MAX_STATIONS;
 
@@ -726,7 +893,10 @@ void modeClassicMaybeAdvance(Game& g) {
   if (now >= g.roundEndAt) {
     // If the team didn't meet the goal by timeout -> failure
     if (g.teamScore < g.roundGoal) {
-      bcastGameOver(g, /*GOAL_NOT_MET*/4, GAMEOVER_BLAME_ALL);
+      // Goal failure costs a life (up to 5), then retry the same round until out of lives.
+      const LifeLossResult r = applyLifeLoss(g, /*GOAL_NOT_MET*/4, GAMEOVER_BLAME_ALL, /*obeyLockout=*/false);
+      if (r == LifeLossResult::GAME_OVER) return;
+      retryCurrentRoundAfterGoalFail(g);
       return;
     }
 
@@ -757,7 +927,10 @@ void modeClassicMaybeAdvance(Game& g) {
       if (g.teamScore >= g.roundGoal) {
         bcastGameOver(g, /*GOAL_MET*/0, GAMEOVER_BLAME_ALL);
       } else {
-        bcastGameOver(g, /*GOAL_NOT_MET*/4, GAMEOVER_BLAME_ALL);
+        // Round 5 goal failure also costs a life; retry R5 until lives run out.
+        const LifeLossResult r = applyLifeLoss(g, /*GOAL_NOT_MET*/4, GAMEOVER_BLAME_ALL, /*obeyLockout=*/false);
+        if (r == LifeLossResult::GAME_OVER) return;
+        retryCurrentRoundAfterGoalFail(g);
       }
       return;
     }

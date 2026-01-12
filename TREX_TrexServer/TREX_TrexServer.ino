@@ -21,7 +21,7 @@
 #include "Bonus.h"
 
 // --- OTA defaults (edit these per release) ---
-#define DEFAULT_OTA_URL          "http://172.20.10.2:8000/TrexHeist/TREX_Loot/build/esp32.esp32.um_feathers3/TREX_Loot.ino.bin"
+#define DEFAULT_OTA_URL          "http://172.20.10.3:8000/TrexHeist/TREX_Loot/build/esp32.esp32.um_feathers3/TREX_Loot.ino.bin"
 #define DEFAULT_OTA_EXPECT_MAJOR TREX_FW_MAJOR
 #define DEFAULT_OTA_EXPECT_MINOR TREX_FW_MINOR
 
@@ -82,6 +82,8 @@ void setup() {
   // Game + Mode
   resetGame(g);
   modeClassicInit(g);   // Warmup enabled here
+  // Broadcast initial lives to Control/UI
+  bcastLivesUpdate(g, /*reason=*/0, GAMEOVER_BLAME_ALL);
 
   // Register server-specific Telnet commands (used only in maintenance)
   maintRegisterServerCommands(g);
@@ -118,6 +120,7 @@ void loop() {
   // --- Network control commands (from CONTROL station) ---
   if (netConsumeControlStartRequest()) {
     startNewGame(g);
+    bcastLivesUpdate(g, /*reason=*/0, GAMEOVER_BLAME_ALL);
   }
   if (netConsumeControlStopRequest()) {
     bcastGameOver(g, /*MANUAL*/2, GAMEOVER_BLAME_ALL);
@@ -135,10 +138,11 @@ void loop() {
   while (Serial.available()) {
     int c = Serial.read();
     if (c=='m' || c=='M') { Maint::begin(mcfg); digitalWrite(BOARD_BLUE_LED, HIGH); return; }
-    if (c=='n' || c=='N') { startNewGame(g); }
+    if (c=='n' || c=='N') { startNewGame(g); bcastLivesUpdate(g, /*reason=*/0, GAMEOVER_BLAME_ALL); }
     if (c=='g' || c=='G') {
       if (g.roundIndex == 0 || g.phase == Phase::END) {
         startNewGame(g);          // full reset + Round 1 + drip
+        bcastLivesUpdate(g, /*reason=*/0, GAMEOVER_BLAME_ALL);
       } else {
         enterGreen(g);            // mid-game manual flip stays supported
       }
@@ -284,18 +288,34 @@ void loop() {
   }
 
   // PIR violation during RED (after arming delay)
+  // IMPORTANT: level-based (not rising-edge) so "PIR stays on" works as memory.
   if (g.phase == Phase::PLAYING && g.light == LightState::RED && g.pirEnforce) {
-    if (now >= g.pirArmAt) {
+    if (!g.pirLifeLostThisRed && now >= g.pirArmAt) {
+
+      bool anyTrig = false;
       for (int i = 0; i < 4; ++i) {
         int pin = g.pir[i].pin;
         if (pin >= 0) {
-          bool trig = (digitalRead(pin) == LOW);  // active-LOW
-          // optional: track state/time
+          const bool trig = (digitalRead(pin) == LOW);  // active-LOW
           g.pir[i].state = trig;
-          if (trig) {
-            bcastGameOver(g, /*RED_PIR*/3, GAMEOVER_BLAME_ALL);
-            return;
-          }
+          anyTrig |= trig;
+        }
+      }
+
+      if (anyTrig) {
+        const LifeLossResult r =
+          applyLifeLoss(g, /*RED_PIR*/3, GAMEOVER_BLAME_ALL, /*obeyLockout=*/true);
+
+        if (r == LifeLossResult::GAME_OVER) {
+          return;
+        }
+
+        if (r == LifeLossResult::LIFE_LOST) {
+          // Only one PIR life loss per RED period
+          g.pirLifeLostThisRed = true;
+
+          // Optional recovery behavior (only if you still want it):
+          // enterGreen(g);
         }
       }
     }

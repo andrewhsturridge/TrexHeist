@@ -15,6 +15,11 @@ void bcastRoundStatus(Game& g);
 void bcastBonusUpdate(Game& g);
 void bcastGameStatus(const Game& g);
 
+// Lives system
+enum class LifeLossResult : uint8_t { IGNORED=0, LIFE_LOST=1, GAME_OVER=2 };
+void bcastLivesUpdate(Game& g, uint8_t reason = 0, uint8_t blameSid = GAMEOVER_BLAME_ALL);
+LifeLossResult applyLifeLoss(Game& g, uint8_t reason, uint8_t blameSid = GAMEOVER_BLAME_ALL, bool obeyLockout = true);
+
 // Minigame broadcasts
 void bcastMgStart(Game& g, const Game::MgConfig& cfg);
 void bcastMgStop(Game& g);

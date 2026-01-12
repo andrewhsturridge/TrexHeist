@@ -25,6 +25,8 @@ struct GameStatusSnapshot {
   uint8_t  roundIndex    = 0;
   uint8_t  phase         = 0;   // Phase enum: 1=PLAYING, 2=END
   uint8_t  lightState    = 0;   // LightState: 0=GREEN,1=RED,2=YELLOW
+  uint8_t  livesRemaining= 0;
+  uint8_t  livesMax      = 0;
   uint32_t lastUpdateMs  = 0;
 };
 
@@ -117,6 +119,26 @@ void onRx(const uint8_t* data, uint16_t len) {
       gStatus.lightState   = p->lightState;
       gStatus.lastUpdateMs = millis();
       gServerInMaint       = false;   // fresh status => server back from maint
+      break;
+    }
+
+    case MsgType::LIVES_UPDATE: {
+      if (h->payloadLen != sizeof(LivesUpdatePayload)) break;
+      auto* p = (const LivesUpdatePayload*)payload;
+      gStatus.livesRemaining = p->livesRemaining;
+      gStatus.livesMax       = p->livesMax;
+      gStatus.hasStatus      = true;
+      gStatus.lastUpdateMs   = millis();
+      gServerInMaint         = false;
+
+      // Only emit an event when this update corresponds to an actual failure
+      if (p->reason != 0) {
+        Serial.printf("EVENT LIFE_LOST reason=%u blameSid=%u lives=%u/%u\n",
+                      (unsigned)p->reason,
+                      (unsigned)p->blameSid,
+                      (unsigned)p->livesRemaining,
+                      (unsigned)p->livesMax);
+      }
       break;
     }
 
@@ -348,13 +370,15 @@ void handleCommand(const String& raw) {
     } else if (!gStatus.hasStatus) {
       Serial.println("STATUS phase=UNKNOWN score=0");
     } else {
-      Serial.printf("STATUS phase=%s round=%u score=%lu msGame=%lu msRound=%lu light=%s\n",
+      Serial.printf("STATUS phase=%s round=%u score=%lu msGame=%lu msRound=%lu light=%s lives=%u/%u\n",
                     phaseToStr(gStatus.phase),
                     (unsigned)gStatus.roundIndex,
                     (unsigned long)gStatus.teamScore,
                     (unsigned long)gStatus.msLeftGame,
                     (unsigned long)gStatus.msLeftRound,
-                    lightToStr(gStatus.lightState));
+                    lightToStr(gStatus.lightState),
+                    (unsigned)gStatus.livesRemaining,
+                    (unsigned)gStatus.livesMax);
     }
   } else if (cmd == "HELP") {
     printHelp();
@@ -372,13 +396,15 @@ void printPeriodicStatus() {
   if (!gStatus.hasStatus) return;
   if (gStatus.phase != 1) return; // only while PLAYING
 
-  Serial.printf("STATUS phase=%s round=%u score=%lu msGame=%lu msRound=%lu light=%s\n",
+  Serial.printf("STATUS phase=%s round=%u score=%lu msGame=%lu msRound=%lu light=%s lives=%u/%u\n",
                 phaseToStr(gStatus.phase),
                 (unsigned)gStatus.roundIndex,
                 (unsigned long)gStatus.teamScore,
                 (unsigned long)gStatus.msLeftGame,
                 (unsigned long)gStatus.msLeftRound,
-                lightToStr(gStatus.lightState));
+                lightToStr(gStatus.lightState),
+                    (unsigned)gStatus.livesRemaining,
+                    (unsigned)gStatus.livesMax);
 }
 
 // --- Arduino setup/loop -----------------------------------------------
