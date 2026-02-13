@@ -361,6 +361,11 @@ void loop() {
     }
   }
 
+  // --- ROUND_STATUS redundancy (helps DROP gauges reset reliably on round transitions) ---
+  static uint8_t  lastRoundIdxForBcast      = 0;
+  static uint32_t lastRoundStatusSentMs     = 0;
+  static uint32_t roundStatusBurstUntilMs   = 0;
+
   // STATE_TICK @ tickHz (only while PLAYING; use current phase timer)
   const uint32_t tickMs = max<uint32_t>(10, 1000 / g.tickHz);
   if (now - g.lastTickSentMs >= tickMs) {
@@ -371,6 +376,20 @@ void loop() {
       else                           msLeft = (g.roundEndAt     > now)?(g.roundEndAt     - now):0;
       sendStateTick(g, msLeft); 
       bcastGameStatus(g);
+
+      // Keep ROUND_STATUS reliable (ESP-NOW broadcasts can drop).
+      // Burst at tickHz for ~1.5s after a round change, then keep-alive once per second.
+      if (g.roundIndex != lastRoundIdxForBcast) {
+        lastRoundIdxForBcast    = g.roundIndex;
+        roundStatusBurstUntilMs = now + 1500;
+        lastRoundStatusSentMs   = 0; // force an immediate send
+      }
+
+      const uint32_t roundStatusIntervalMs = (now < roundStatusBurstUntilMs) ? tickMs : 1000;
+      if (now - lastRoundStatusSentMs >= roundStatusIntervalMs) {
+        bcastRoundStatus(g);
+        lastRoundStatusSentMs = now;
+      }
     }
     g.lastTickSentMs = now;
   }
