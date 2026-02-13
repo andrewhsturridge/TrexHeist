@@ -14,12 +14,13 @@
 //
 //   Control -> PMS:
 //     !PMS PONG v=1 game=trex role=control
-//     !PMS STATUS v=1 state=arming|playing level=1 score=.. lives=.. tleft_ms=.. last_reason=..
+//     !PMS STATUS v=1 state=arming|playing level=1 score=.. lives=.. tleft_ms=.. last_reason=.. light=green|yellow|red
 //       (STATUS is NOT emitted while idle)
 //     !PMS EVENT v=1 name=game_start level=1
 //     !PMS EVENT v=1 name=game_end reason=timeup|no_lives|stopped score=.. lives=..
 //     !PMS EVENT v=1 name=score delta=.. total=.. bonus=0|1
 //     !PMS EVENT v=1 name=life delta=-1 lives=..
+//     !PMS EVENT v=1 name=light light=green|yellow|red
 //
 // Build toggles (compile-time):
 //   - PMS_STD_ENABLED: enable/disable PMS protocol support
@@ -168,6 +169,11 @@ static bool     gPmsLastWasStale    = true;
 static uint8_t  gPmsLastStateKind   = 0;     // 0=idle,1=arming,2=playing
 static uint32_t gPmsLastScore       = 0;
 static uint8_t  gPmsLastLives       = 0;
+static uint8_t  gPmsLastLight       = 0;     // LightState: 0=GREEN,1=RED,2=YELLOW
+
+// Immediate PMS light-change event (flushed from loop for safety)
+static bool     gPmsLightEventPending  = false;
+static uint8_t  gPmsPendingLightState  = 0;
 
 static uint8_t pmsStateKind(bool statusValid, uint8_t phase, uint32_t msLeftGame) {
   // We only emit STATUS while the game is actually active.
@@ -189,10 +195,21 @@ static const char* pmsStateStr(uint8_t kind) {
   }
 }
 
-static const char* pmsLastReasonStr(bool stale, bool stateChanged, int32_t scoreDelta, int32_t livesDelta) {
+static const char* pmsLightStr(uint8_t ls) {
+  switch (ls) {
+    case (uint8_t)LightState::GREEN:  return "green";
+    case (uint8_t)LightState::RED:    return "red";
+    case (uint8_t)LightState::YELLOW: return "yellow";
+    default:                          return "unknown";
+  }
+}
+
+
+static const char* pmsLastReasonStr(bool stale, bool stateChanged, bool lightChanged, int32_t scoreDelta, int32_t livesDelta) {
   if (stale) return "stale";
   if (livesDelta < 0) return "life";
   if (scoreDelta > 0) return "score";
+  if (lightChanged)   return "light";
   if (stateChanged)   return "state";
   return "none";
 }
@@ -210,7 +227,8 @@ static void pmsPrintStatus(const char* state,
                            uint32_t score,
                            uint8_t lives,
                            uint32_t tleftMs,
-                           const char* lastReason) {
+                           const char* lastReason,
+                           const char* light) {
 #if PMS_STD_ENABLED
   Serial.print(F("!PMS STATUS v=1 state="));
   Serial.print(state);
@@ -223,7 +241,9 @@ static void pmsPrintStatus(const char* state,
   Serial.print(F(" tleft_ms="));
   Serial.print((unsigned long)tleftMs);
   Serial.print(F(" last_reason="));
-  Serial.println(lastReason);
+  Serial.print(lastReason);
+  Serial.print(F(" light="));
+  Serial.println(light);
 #endif
 }
 
@@ -264,6 +284,14 @@ static void pmsPrintEventLife(int32_t delta, uint8_t lives) {
   Serial.println((unsigned)lives);
 #endif
 }
+
+static void pmsPrintEventLight(const char* light) {
+#if PMS_STD_ENABLED
+  Serial.print(F("!PMS EVENT v=1 name=light light="));
+  Serial.println(light);
+#endif
+}
+
 
 // --- PMS input parsing -------------------------------------------------
 
@@ -359,6 +387,25 @@ static void handleSerialLine(const String& rawLine) {
 
 // --- PMS STATUS tick + derived EVENTS ---------------------------------
 
+static void pmsFlushImmediateEvents() {
+#if PMS_STD_ENABLED
+  if (!gPmsLightEventPending) return;
+  gPmsLightEventPending = false;
+
+  const uint32_t now = millis();
+  const bool statusValid = (!gServerInMaint && gStatus.hasStatus);
+  if (!statusValid) return;
+
+  const bool stale = (now - gStatus.lastUpdateMs) > (uint32_t)PMS_STALE_MS;
+  if (stale) return;
+
+  // Only emit while the game is PLAYING. (RED/YELLOW/GREEN are substates inside PLAYING.)
+  if (gStatus.phase != 1) return;
+
+  pmsPrintEventLight(pmsLightStr(gPmsPendingLightState));
+#endif
+}
+
 static void pmsTick() {
 #if PMS_STD_ENABLED
   uint32_t now = millis();
@@ -381,6 +428,8 @@ static void pmsTick() {
   const uint8_t level = 1; // accepted on START for standardization; currently ignored by TREX
   uint32_t score = statusValid ? gStatus.teamScore : 0;
   uint8_t  lives = statusValid ? gStatus.livesRemaining : 0;
+  uint8_t  light = statusValid ? gStatus.lightState : 255;
+  const char* lightStr = pmsLightStr(light);
   uint32_t tleft = msLeftGame;
 
   // Initialize baseline without emitting spurious events.
@@ -391,16 +440,19 @@ static void pmsTick() {
     gPmsLastStateKind   = curKind;
     gPmsLastScore       = score;
     gPmsLastLives       = lives;
+    gPmsLastLight       = light;
 
     // Only print STATUS when active (arming/playing). No STATUS while idle.
     if (curKind != 0) {
       const char* lr = stale ? "stale" : "none";
-      pmsPrintStatus(curStateStr, level, score, lives, tleft, lr);
+      pmsPrintStatus(curStateStr, level, score, lives, tleft, lr, lightStr);
     }
     return;
   }
 
   bool stateChanged = (curKind != gPmsLastStateKind);
+
+  bool lightChanged = (statusValid && gPmsLastStatusValid && (light != gPmsLastLight));
 
   int32_t scoreDelta = (int32_t)score - (int32_t)gPmsLastScore;
   int32_t livesDelta = (int32_t)lives - (int32_t)gPmsLastLives;
@@ -442,8 +494,8 @@ static void pmsTick() {
 
   // STATUS (only while active; no STATUS while idle)
   if (curKind != 0) {
-    const char* lastReason = pmsLastReasonStr(stale, stateChanged, scoreDelta, livesDelta);
-    pmsPrintStatus(curStateStr, level, score, lives, tleft, lastReason);
+    const char* lastReason = pmsLastReasonStr(stale, stateChanged, lightChanged, scoreDelta, livesDelta);
+    pmsPrintStatus(curStateStr, level, score, lives, tleft, lastReason, lightStr);
   }
 
   // Update baseline
@@ -452,6 +504,7 @@ static void pmsTick() {
   gPmsLastStateKind   = curKind;
   gPmsLastScore       = score;
   gPmsLastLives       = lives;
+  gPmsLastLight       = light;
 #endif
 }
 
@@ -564,6 +617,11 @@ void onRx(const uint8_t* data, uint16_t len) {
     case MsgType::GAME_STATUS: {
       if (h->payloadLen != sizeof(GameStatusPayload)) break;
       auto* p = (const GameStatusPayload*)payload;
+
+      const bool    hadStatus = gStatus.hasStatus;
+      const uint8_t prevLight = gStatus.lightState;
+      const uint8_t prevPhase = gStatus.phase;
+
       gStatus.hasStatus    = true;
       gStatus.teamScore    = p->teamScore;
       gStatus.msLeftGame   = p->msLeftGame;
@@ -573,6 +631,16 @@ void onRx(const uint8_t* data, uint16_t len) {
       gStatus.lightState   = p->lightState;
       gStatus.lastUpdateMs = millis();
       gServerInMaint       = false;   // fresh status => server back from maint
+
+      // Queue an immediate PMS EVENT when the light changes (minimizes latency for RED/YELLOW).
+      // Flushed from loop() (not directly from the ESPNOW RX callback).
+      if (hadStatus &&
+          prevPhase == 1 &&
+          p->phase == 1 &&
+          prevLight != p->lightState) {
+        gPmsLightEventPending = true;
+        gPmsPendingLightState = p->lightState;
+      }
       break;
     }
 
@@ -973,6 +1041,8 @@ void loop() {
       if (line.length() < 64) line += c;
     }
   }
+
+  pmsFlushImmediateEvents();
 
   pmsTick();
 

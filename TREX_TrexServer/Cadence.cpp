@@ -30,6 +30,7 @@ void enterGreen(Game& g) {
   if (toRoundEnd < msLeft) msLeft = toRoundEnd;
   if (toGameEnd  < msLeft) msLeft = toGameEnd;
   sendStateTick(g, msLeft);
+  bcastGameStatus(g);
 }
 
 void enterYellow(Game& g) {
@@ -64,6 +65,7 @@ void enterYellow(Game& g) {
   if (toRoundEnd < msLeft) msLeft = toRoundEnd;
   if (toGameEnd  < msLeft) msLeft = toGameEnd;
   sendStateTick(g, msLeft);
+  bcastGameStatus(g);
 }
 
 void enterRed(Game& g) {
@@ -84,6 +86,7 @@ void enterRed(Game& g) {
   if (toRoundEnd < msLeft) msLeft = toRoundEnd;
   if (toGameEnd  < msLeft) msLeft = toGameEnd;
   sendStateTick(g, msLeft);
+  bcastGameStatus(g);
 }
 
 void tickCadence(Game& g, uint32_t now) {
