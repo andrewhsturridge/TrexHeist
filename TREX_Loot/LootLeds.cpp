@@ -40,6 +40,11 @@ extern uint32_t  g_bonusExclusiveUntilMs;
 // Minigame
 extern volatile bool mgActive;
 
+// Audio state (to avoid LED work while audio is active)
+extern bool      playing;
+extern bool      g_chimeActive;
+
+
 // ===== color helpers (module-local) =====
 static inline uint32_t C_RGB(uint8_t r,uint8_t g,uint8_t b){ return Adafruit_NeoPixel::Color(r,g,b); }
 static const uint32_t RED   = C_RGB(255,  0,  0);
@@ -91,6 +96,13 @@ static uint16_t g_rainbowPhase = 0;
 static bool     otaSpinnerActive = false;
 static uint16_t otaSpinnerIdx    = 0;
 static uint32_t otaSpinnerLastMs = 0;
+
+// Idle RFID ring blink (attractor)
+static bool     idleRfidBlinkActive = false;
+static bool     idleRfidBlinkOn     = false;
+static uint32_t idleRfidBlinkLastMs = 0;
+static LightState idleRfidLastLight = LightState::GREEN;
+static constexpr uint16_t IDLE_RFID_BLINK_PERIOD_MS = 650;
 
 // ===== LED drawing (moved verbatim) =====
 uint32_t gaugeColor() {
@@ -309,6 +321,76 @@ void tickBonusRainbow() {
   // Pick frame spacing: gentle during the exclusive window, then normal
   const uint16_t frameMs = (millis() < g_bonusExclusiveUntilMs) ? 60 : RAINBOW_FRAME_MS;
   nextGaugeDrawAtMs = now + frameMs;
+}
+
+// ===== Idle RFID ring blink (attractor) =====
+void stopIdleRfidBlink() {
+  idleRfidBlinkActive = false;
+  idleRfidBlinkOn     = false;
+}
+
+void tickIdleRfidBlink() {
+  // Requirements:
+  // - Game active
+  // - Not scanning a tag
+  // - Not holding
+  // - Not playing any audio (LED work can interfere with audio timing)
+  // - Not during RED
+  if (!gameActive || otaInProgress || mgActive) {
+    stopIdleRfidBlink();
+    return;
+  }
+
+  // Track light changes so we can force a one-time repaint on the edge into RED.
+  const bool lightChanged = (g_lightState != idleRfidLastLight);
+  if (lightChanged) idleRfidLastLight = g_lightState;
+
+  // Never blink during RED; show solid RED (at least on the transition into RED).
+  if (g_lightState == LightState::RED) {
+    if (lightChanged || idleRfidBlinkActive) {
+      stopIdleRfidBlink();
+      // If we were mid-blink (or just entered RED), force back to solid RED for clarity.
+      if (!tagPresent && !holdActive && !fullBlinkActive && !otaInProgress) {
+        fillRing(RED);
+      }
+    } else {
+      stopIdleRfidBlink();
+    }
+    return;
+  }
+
+  // Only when fully idle (no tag, no hold, no other ring animation).
+  if (tagPresent || holdActive || fullBlinkActive) {
+    if (idleRfidBlinkActive) {
+      stopIdleRfidBlink();
+      // Restore base ring colour when leaving idle-blink mode
+      fillRing(RED);
+    }
+    return;
+  }
+
+  // Audio guard: do not update LEDs while audio is active.
+  if (playing || g_chimeActive) {
+    // Freeze: do not toggle/show while audio is running
+    stopIdleRfidBlink();
+    return;
+  }
+
+  const uint32_t now = millis();
+
+  if (!idleRfidBlinkActive) {
+    idleRfidBlinkActive = true;
+    idleRfidBlinkOn     = true;
+    idleRfidBlinkLastMs = now;
+    fillRing(CYAN);
+    return;
+  }
+
+  if ((now - idleRfidBlinkLastMs) >= IDLE_RFID_BLINK_PERIOD_MS) {
+    idleRfidBlinkLastMs = now;
+    idleRfidBlinkOn = !idleRfidBlinkOn;
+    fillRing(idleRfidBlinkOn ? CYAN : BLUE);
+  }
 }
 
 void fillRing(uint32_t c) {

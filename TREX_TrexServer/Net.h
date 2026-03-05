@@ -38,6 +38,9 @@ bool netConsumeControlStartRequest();
 bool netConsumeControlStopRequest();
 bool netConsumeLootOtaRequest();
 
+// RED gameplay: attempting to loot during RED costs a life
+bool netConsumeRedLootAttempt(uint8_t& outStationId);
+
 // Generic raw broadcast used by OTA
 void netBroadcastRaw(const uint8_t* data, uint16_t len);
 

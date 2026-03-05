@@ -425,5 +425,6 @@ void loop() {
   tickYellowBlink();
   tickEmptyBlink();
   tickBonusRainbow();
+  tickIdleRfidBlink();
   tickScheduledAudio();
 }

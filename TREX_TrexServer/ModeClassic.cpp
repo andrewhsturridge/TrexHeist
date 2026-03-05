@@ -170,8 +170,10 @@ static void startRound(Game& g, uint8_t idx) {
     g.noRedThisRound       = true;
     g.allowYellowThisRound = false;
 
-    g.gameStartAt = now;
-    g.gameEndAt   = now + 300000UL;  // 5:00 total
+    // Only set the overall game timer when starting a *new* game.
+    // (Avoids surprise timer resets if Round 1 is re-entered via FORCE/NEXT paths.)
+    if (g.gameStartAt == 0) g.gameStartAt = now;
+    if (g.gameEndAt == 0)   g.gameEndAt   = now + 300000UL;  // 5:00 (legacy/placeholder)
     g.roundEndAt  = now + 120000UL;  // 2:00
 
     sendStateTick(g, (g.roundEndAt > now) ? (g.roundEndAt - now) : 0);
@@ -348,6 +350,13 @@ static void retryCurrentRoundAfterGoalFail(Game& g) {
                 (unsigned long)((g.roundGoal > g.teamScore) ? (g.roundGoal - g.teamScore) : 0),
                 (unsigned)g.livesRemaining,
                 (unsigned)g.livesMax);
+
+  // HARD restart: roll back any progress made during this round.
+  // (Players must complete the full round objective again after a timeout.)
+  if (g.teamScore != g.roundStartScore) {
+    g.teamScore = g.roundStartScore;
+    g.pending.needScore = true; // broadcast the rollback score
+  }
 
   // Stop any holds / carried so nothing "sneaks" past a failed timer.
   endAndClearHoldsAndCarried(g);
@@ -850,6 +859,10 @@ void modeClassicInit(Game& g) {
 void modeClassicMaybeAdvance(Game& g) {
   const uint32_t now = millis();
 
+  // If a life was just lost (e.g., PIR during RED), avoid a "double" life loss
+  // from an immediate round timeout. This keeps the game feeling fair.
+  static const uint32_t GOAL_TIMEOUT_DOUBLELOSS_GUARD_MS = 2500;
+
   // Do nothing while intermissions are running; their tickers advance them
   if (g.bonusIntermission || g.bonusIntermission2) return;
 
@@ -875,6 +888,10 @@ void modeClassicMaybeAdvance(Game& g) {
       g.mgExpectedStations = MAX_STATIONS;    // set 5 if only 5 Loots
       bcastMgStart(g, g.mgCfg);
       g.noRedThisRound = true; g.allowYellowThisRound = false;
+
+      // Stage timer should reflect the minigame countdown.
+      sendStateTick(g, (g.mgDeadline > now) ? (g.mgDeadline - now) : 0);
+      bcastGameStatus(g);
       return;
     }
     else if (g.roundIndex == 5) {
@@ -894,8 +911,23 @@ void modeClassicMaybeAdvance(Game& g) {
     // If the team didn't meet the goal by timeout -> failure
     if (g.teamScore < g.roundGoal) {
       // Goal failure costs a life (up to 5), then retry the same round until out of lives.
-      const LifeLossResult r = applyLifeLoss(g, /*GOAL_NOT_MET*/4, GAMEOVER_BLAME_ALL, /*obeyLockout=*/false);
-      if (r == LifeLossResult::GAME_OVER) return;
+      // But if we just consumed a life moments ago (e.g., RED PIR), don't double-penalize.
+      bool skipLife = false;
+      if (g.lifeLossLockoutUntil) {
+        const uint32_t lastLossAt = (g.lifeLossLockoutUntil >= g.lifeLossCooldownMs)
+          ? (g.lifeLossLockoutUntil - g.lifeLossCooldownMs)
+          : 0;
+        if (lastLossAt && (uint32_t)(now - lastLossAt) < GOAL_TIMEOUT_DOUBLELOSS_GUARD_MS) {
+          skipLife = true;
+        }
+      }
+
+      if (!skipLife) {
+        const LifeLossResult r = applyLifeLoss(g, /*GOAL_NOT_MET*/4, GAMEOVER_BLAME_ALL, /*obeyLockout=*/false);
+        if (r == LifeLossResult::GAME_OVER) return;
+      } else {
+        Serial.println("[TREX] Timeout immediately after life loss: restarting round without extra life.");
+      }
       retryCurrentRoundAfterGoalFail(g);
       return;
     }
@@ -920,6 +952,10 @@ void modeClassicMaybeAdvance(Game& g) {
       g.mgExpectedStations = MAX_STATIONS;
       bcastMgStart(g, g.mgCfg);
       g.noRedThisRound = true; g.allowYellowThisRound = false;
+
+      // Stage timer should reflect the minigame countdown.
+      sendStateTick(g, (g.mgDeadline > now) ? (g.mgDeadline - now) : 0);
+      bcastGameStatus(g);
       return;
     }
     else if (g.roundIndex == 5) {
@@ -928,8 +964,21 @@ void modeClassicMaybeAdvance(Game& g) {
         bcastGameOver(g, /*GOAL_MET*/0, GAMEOVER_BLAME_ALL);
       } else {
         // Round 5 goal failure also costs a life; retry R5 until lives run out.
-        const LifeLossResult r = applyLifeLoss(g, /*GOAL_NOT_MET*/4, GAMEOVER_BLAME_ALL, /*obeyLockout=*/false);
-        if (r == LifeLossResult::GAME_OVER) return;
+        bool skipLife = false;
+        if (g.lifeLossLockoutUntil) {
+          const uint32_t lastLossAt = (g.lifeLossLockoutUntil >= g.lifeLossCooldownMs)
+            ? (g.lifeLossLockoutUntil - g.lifeLossCooldownMs)
+            : 0;
+          if (lastLossAt && (uint32_t)(now - lastLossAt) < GOAL_TIMEOUT_DOUBLELOSS_GUARD_MS) {
+            skipLife = true;
+          }
+        }
+        if (!skipLife) {
+          const LifeLossResult r = applyLifeLoss(g, /*GOAL_NOT_MET*/4, GAMEOVER_BLAME_ALL, /*obeyLockout=*/false);
+          if (r == LifeLossResult::GAME_OVER) return;
+        } else {
+          Serial.println("[TREX] Timeout immediately after life loss (R5): restarting without extra life.");
+        }
         retryCurrentRoundAfterGoalFail(g);
       }
       return;

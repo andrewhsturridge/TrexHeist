@@ -44,6 +44,10 @@ void drawGaugeAuto(uint16_t inventory, uint16_t capacity);
 // Bonus rainbow animation tick (call from loop)
 void tickBonusRainbow();
 
+// Idle attractor blink on the RFID ring (only when not scanning and no audio)
+void tickIdleRfidBlink();
+void stopIdleRfidBlink();
+
 // Full indicator (ring) blink
 void startFullBlinkImmediate();
 void stopFullBlink();

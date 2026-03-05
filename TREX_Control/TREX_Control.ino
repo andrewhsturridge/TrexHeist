@@ -425,12 +425,15 @@ static void pmsTick() {
   const char* curStateStr = pmsStateStr(curKind);
 
   // Protocol fields
-  const uint8_t level = 1; // accepted on START for standardization; currently ignored by TREX
+  // Use the server-reported roundIndex as "level" for operator visibility.
+  const uint8_t level = statusValid ? gStatus.roundIndex : 1;
   uint32_t score = statusValid ? gStatus.teamScore : 0;
   uint8_t  lives = statusValid ? gStatus.livesRemaining : 0;
   uint8_t  light = statusValid ? gStatus.lightState : 255;
   const char* lightStr = pmsLightStr(light);
-  uint32_t tleft = msLeftGame;
+  // Stage timer: while PLAYING, expose the current stage countdown (round/intermission/minigame).
+  // Otherwise, fall back to the legacy msLeftGame field.
+  uint32_t tleft = (curKind == 2) ? (statusValid ? gStatus.msLeftRound : 0) : msLeftGame;
 
   // Initialize baseline without emitting spurious events.
   if (!gPmsBaselineValid) {

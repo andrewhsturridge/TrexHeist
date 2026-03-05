@@ -318,7 +318,7 @@ void onRx(const uint8_t* data, uint16_t len) {
       fillGauge(0);
       if (!otaInProgress) fillRing(Adafruit_NeoPixel::Color(255,0,0));
 
-      const bool redViolation = (reason == 1);
+      const bool redViolation = (reason == 3); // 3 = RED_VIOLATION (PIR / loot-in-red)
       const bool offender     = redViolation &&
                                 (blameSid != GAMEOVER_BLAME_ALL) &&
                                 (blameSid == STATION_ID);

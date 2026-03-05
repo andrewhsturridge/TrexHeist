@@ -97,7 +97,9 @@ struct Game {
 
   // --- Bonus runtime state (cleared at round start) ---
   uint32_t bonusActiveMask = 0;                 // bit i => station i is bonus-active
-  uint32_t bonusEndsAt[MAX_STATIONS] = {0};     // per-station TTL end time (millis)
+  // Stations are addressed 1..MAX_STATIONS throughout the codebase.
+  // Index 0 is unused, so size must be MAX_STATIONS+1 to avoid out-of-bounds writes.
+  uint32_t bonusEndsAt[MAX_STATIONS + 1] = {0}; // per-station TTL end time (millis)
   uint32_t bonusNextSpawnAt = 0;                // scheduler next fire (millis)
   uint8_t  bonusSpawnsThisRound = 0;            // number of spawns so far in current round
 
@@ -134,7 +136,9 @@ struct Game {
 
   // Grace + PIR
   uint32_t edgeGraceMs     = 300;
-  uint32_t redHoldGraceMs  = 400;
+  // Grace window after RED edge to allow stations already looting to disengage
+  // before we apply a "looting in RED" life loss.
+  uint32_t redHoldGraceMs  = 800;
   uint32_t lastFlipMs      = 0;
   uint32_t redGraceUntil   = 0;
 
@@ -146,8 +150,16 @@ struct Game {
   bool      noRedThisRound  = true;     // Round 1 = true
 
   bool     pirEnforce      = true;
-  uint32_t pirArmDelayMs   = 6000;
+  // PIR arming delay from RED edge before violations count.
+  // Tuned "less harsh" by default: give players ~5s to freeze.
+  // (Maintenance can raise this, but server enforces a minimum of 5000ms.)
+  uint32_t pirArmDelayMs   = 5000;
   uint32_t pirArmAt        = 0;
+
+  // During RED, Loot stations can auto-retry HOLD_START when a hold is force-ended.
+  // Suppress penalty for a short window per station to avoid double life-loss.
+  // Index 0 unused; stations are 1..MAX_STATIONS.
+  uint32_t redLootSuppressUntil[MAX_STATIONS + 1] = {0};
 
   // Drip broadcast
   PendingStart pending{};

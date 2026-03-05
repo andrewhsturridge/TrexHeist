@@ -17,6 +17,11 @@ void resetGame(Game& g) {
   g.phase = Phase::PLAYING;       // ensure we're in play mode
   g.teamScore = 0;
 
+  // Reset sequence / drip broadcast scheduler
+  g.seq = 1;
+  g.pending = PendingStart{};
+  g.lastTickSentMs = 0;
+
   // Lives reset
   g.livesMax             = 5;
   g.livesRemaining       = g.livesMax;
@@ -33,10 +38,43 @@ void resetGame(Game& g) {
   g.roundEndAt   = 0;
   g.roundStartScore = 0;
 
+  // Clear all stage/auxiliary modes
+  g.bonusIntermission   = false;
+  g.bonusIntermission2  = false;
+  g.bonusInterStart     = 0;
+  g.bonusInterEnd       = 0;
+  g.bonusWarnTickStarted= false;
+
+  g.bonus2Start     = 0;
+  g.bonus2End       = 0;
+  g.bonus2Sid       = 0;
+  g.bonus2NextHopAt = 0;
+  g.bonus2Idx       = 0;
+
+  g.mgActive        = false;
+  g.mgStartedAt     = 0;
+  g.mgDeadline      = 0;
+  g.mgAllTriedAt    = 0;
+  g.mgTriedMask     = 0;
+  g.mgSuccessMask   = 0;
+  g.mgExpectedStations = MAX_STATIONS;
+  g.mgCfg           = Game::MgConfig{};
+
+  g.r5Active        = false;
+  g.r5HotSid        = 0;
+  g.r5DwellEndAt    = 0;
+  g.r5NextDepleteAt = 0;
+
   g.light = LightState::GREEN;
   g.nextSwitch = 0;
   g.lastFlipMs = 0;
   g.redGraceUntil = 0;
+  g.pirArmAt = 0;
+
+  // Clear per-station RED suppression window
+  for (uint8_t sid = 0; sid <= MAX_STATIONS; ++sid) {
+    g.redLootSuppressUntil[sid] = 0;
+  }
 
   g.noRedThisRound       = false;
   g.allowYellowThisRound = true;
@@ -46,12 +84,13 @@ void resetGame(Game& g) {
 
   // Bonus reset
   g.bonusActiveMask = 0;
-  for (int i = 0; i < MAX_STATIONS; ++i) g.bonusEndsAt[i] = 0;
+  // Index 0 is unused; clear 0..MAX_STATIONS for safety.
+  for (int i = 0; i <= MAX_STATIONS; ++i) g.bonusEndsAt[i] = 0;
   g.bonusNextSpawnAt = 0;
   g.bonusSpawnsThisRound = 0;
 
   // Clear station state; Round 1 will set inventory=20 later
-  for (uint8_t sid = 1; sid < MAX_STATIONS; ++sid) {
+  for (uint8_t sid = 1; sid <= MAX_STATIONS; ++sid) {
     g.stationCapacity[sid]  = 56;  // keep your physical gauge size
     g.stationInventory[sid] = 0;   // start empty; filled in startRound()
   }
@@ -63,6 +102,11 @@ void resetGame(Game& g) {
   // (Optional) clear any per-player holds/carry if you track them here
   for (int i=0;i<MAX_PLAYERS;i++) {
     g.players[i] = PlayerRec{}; // zero/clear
+  }
+
+  // Clear any holds explicitly (safety)
+  for (int i=0;i<MAX_HOLDS;i++) {
+    g.holds[i] = HoldRec{};
   }
 }
 

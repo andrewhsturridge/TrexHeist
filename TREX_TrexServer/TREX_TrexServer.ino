@@ -198,8 +198,14 @@ void loop() {
 
   // --- Network control commands (from CONTROL station) ---
   if (netConsumeControlStartRequest()) {
-    startNewGame(g);
-    bcastLivesUpdate(g, /*reason=*/0, GAMEOVER_BLAME_ALL);
+    // Treat START as idempotent: only start a new game from idle/end.
+    // (Prevents duplicate START packets from resetting timers mid-game.)
+    if (g.roundIndex == 0 || g.phase == Phase::END) {
+      startNewGame(g);
+      bcastLivesUpdate(g, /*reason=*/0, GAMEOVER_BLAME_ALL);
+    } else {
+      Serial.println("[TREX] START ignored (game already active). Use STOP then START to restart.");
+    }
   }
   if (netConsumeControlStopRequest()) {
     bcastGameOver(g, /*MANUAL*/2, GAMEOVER_BLAME_ALL);
@@ -367,11 +373,15 @@ void loop() {
   static uint32_t roundStatusBurstUntilMs   = 0;
 
   // STATE_TICK @ tickHz (only while PLAYING; use current phase timer)
-  const uint32_t tickMs = max<uint32_t>(10, 1000 / g.tickHz);
+  // Guard against accidental 0 Hz (bad config / memory corruption)
+  const uint8_t hz = (g.tickHz == 0) ? 1 : g.tickHz;
+  const uint32_t tickMs = max<uint32_t>(10, 1000 / hz);
   if (now - g.lastTickSentMs >= tickMs) {
     if (g.phase == Phase::PLAYING) {
       uint32_t msLeft = 0;
-      if      (g.bonusIntermission)  msLeft = (g.bonusInterEnd  > now)?(g.bonusInterEnd  - now):0;
+      // Stage timer: minigame / intermissions / round.
+      if      (g.mgActive)           msLeft = (g.mgDeadline     > now)?(g.mgDeadline     - now):0;
+      else if (g.bonusIntermission)  msLeft = (g.bonusInterEnd  > now)?(g.bonusInterEnd  - now):0;
       else if (g.bonusIntermission2) msLeft = (g.bonus2End      > now)?(g.bonus2End      - now):0;
       else                           msLeft = (g.roundEndAt     > now)?(g.roundEndAt     - now):0;
       sendStateTick(g, msLeft); 
@@ -461,28 +471,102 @@ void loop() {
     }
   }
 
-  // Stop any active holds the moment we enter RED (non-punitive).
+  // --- RED loot grace + penalty ---
+  // Desired gameplay:
+  // - If a station is already looting when RED begins, give a short grace window to disengage.
+  // - If they are STILL looting after the grace window, they lose a life.
+  // - Holds are then force-ended (no looting during RED), but we suppress immediate auto-retry
+  //   HOLD_START messages from that same station to avoid a second penalty.
   static LightState lastLight = LightState::RED;  // pessimistic init
+  static bool redHoldGraceHandled = false;
+
+  // If we're not in RED, clear any pending "loot attempt in red" requests so they can't
+  // spill into a future RED period.
+  if (g.phase == Phase::PLAYING && g.light != LightState::RED) {
+    uint8_t dummy = 0;
+    (void)netConsumeRedLootAttempt(dummy);
+  }
+
   if (g.phase == Phase::PLAYING) {
-    // RED rising edge
+    // RED rising edge: start grace window (configured via g.redHoldGraceMs)
     if (g.light == LightState::RED && lastLight != LightState::RED) {
-      for (auto &h : g.holds) {
+      redHoldGraceHandled = false;
+    }
+
+    // Leaving RED: reset handler
+    if (g.light != LightState::RED && lastLight == LightState::RED) {
+      redHoldGraceHandled = false;
+    }
+
+    // After grace: if any hold is still active, apply a life loss (once per RED), then end holds.
+    if (g.light == LightState::RED && !redHoldGraceHandled && now >= g.redGraceUntil) {
+      bool any = false;
+      uint8_t blameSid = GAMEOVER_BLAME_ALL;
+
+      for (const auto &h : g.holds) {
         if (h.active) {
-          sendHoldEnd(g, h.holdId, /*RED*/2);
-          h.active = false;
+          any = true;
+          if (h.stationId >= 1 && h.stationId <= 5) blameSid = h.stationId;
+          break;
         }
       }
-    }
-    // Safety net: after the configured grace window, make sure no hold lingers
-    if (g.light == LightState::RED && now >= g.redGraceUntil) {
-      for (auto &h : g.holds) {
-        if (h.active) {
+
+      if (any) {
+        // Penalty (shared with PIR): allow at most one life loss per RED period.
+        if (!g.pirLifeLostThisRed) {
+          const LifeLossResult r = applyLifeLoss(g, /*RED_VIOLATION*/3, blameSid, /*obeyLockout=*/true);
+          if (r == LifeLossResult::GAME_OVER) {
+            return;
+          }
+          if (r == LifeLossResult::LIFE_LOST) {
+            g.pirLifeLostThisRed = true;
+          }
+        }
+
+        // Force-end any lingering holds (no looting during RED).
+        // Also suppress auto-retry HOLD_START from those stations briefly.
+        constexpr uint32_t SUPPRESS_MS = 1200;
+        for (auto &h : g.holds) {
+          if (!h.active) continue;
+          const uint8_t sid = h.stationId;
           sendHoldEnd(g, h.holdId, /*RED*/2);
           h.active = false;
+          if (sid >= 1 && sid <= 5) {
+            g.redLootSuppressUntil[sid] = now + SUPPRESS_MS;
+          }
+        }
+
+        // If we actually consumed a life for this violation, end RED early (same as PIR).
+        if (g.pirLifeLostThisRed) {
+          enterGreen(g);
+          return;
         }
       }
+
+      redHoldGraceHandled = true;
     }
+
     lastLight = g.light;
+  }
+
+  // Loot attempt during RED (gameplay penalty)
+  if (g.phase == Phase::PLAYING && g.light == LightState::RED) {
+    uint8_t sid = 0;
+    if (netConsumeRedLootAttempt(sid)) {
+      // Only one life loss per RED period (shared with PIR enforcement)
+      if (!g.pirLifeLostThisRed) {
+        const LifeLossResult r = applyLifeLoss(g, /*RED_VIOLATION*/3, sid, /*obeyLockout=*/true);
+        if (r == LifeLossResult::GAME_OVER) {
+          return;
+        }
+        if (r == LifeLossResult::LIFE_LOST) {
+          g.pirLifeLostThisRed = true;
+          // Same recovery behaviour as a PIR violation: end RED early
+          enterGreen(g);
+          return;
+        }
+      }
+    }
   }
 
   // PIR violation during RED (after arming delay)
@@ -501,8 +585,10 @@ void loop() {
             g.pir[i].lastChange = now;
           }
 
-          // On rising edge after arming delay, consume a life (up to 5)
-          if (trig && !prev) {
+          // Stop-by-yellow + strict RED:
+          // After arming delay, ANY PIR trigger (even if already held "ON") costs a life.
+          // This avoids missed penalties due to PIR "hold" behavior and stale edge state.
+          if (trig) {
             // NEW: Only allow ONE life loss per RED period (until the next time we enter RED)
             if (g.pirLifeLostThisRed) {
               continue; // ignore additional PIR trips during this same RED

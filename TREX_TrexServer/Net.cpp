@@ -17,6 +17,10 @@ static bool sControlStartRequested = false;
 static bool sControlStopRequested  = false;
 static bool sLootOtaRequested      = false;
 
+// RED gameplay: stations may attempt to loot during RED; server applies a life loss once per RED.
+static bool    sRedLootAttemptRequested  = false;
+static uint8_t sRedLootAttemptStationId = 0;
+
 // --- Radio config request (CONTROL -> server) ---
 static bool           sRadioCfgRequested = false;
 static RadioCfgPayload sRadioCfgReq{};
@@ -44,6 +48,15 @@ bool netConsumeLootOtaRequest() {
   sLootOtaRequested = false;
   return v;
 }
+
+bool netConsumeRedLootAttempt(uint8_t& outStationId) {
+  if (!sRedLootAttemptRequested) return false;
+  outStationId = sRedLootAttemptStationId;
+  sRedLootAttemptRequested = false;
+  sRedLootAttemptStationId = 0;
+  return true;
+}
+
 
 bool netConsumeRadioCfgRequest(RadioCfgPayload& out) {
   if (!sRadioCfgRequested) return false;
@@ -143,7 +156,11 @@ void bcastRoundStatus(Game& g) {
   p->roundStartScore= g.roundStartScore;
   p->roundGoalAbs   = g.roundGoal;
   const uint32_t now = millis();
-  p->msLeftRound    = (g.roundEndAt > now) ? (g.roundEndAt - now) : 0;
+  // "msLeftRound" is treated as a stage timer: round / intermission / minigame.
+  if      (g.mgActive)          p->msLeftRound = (g.mgDeadline   > now) ? (g.mgDeadline   - now) : 0;
+  else if (g.bonusIntermission) p->msLeftRound = (g.bonusInterEnd> now) ? (g.bonusInterEnd- now) : 0;
+  else if (g.bonusIntermission2)p->msLeftRound = (g.bonus2End    > now) ? (g.bonus2End    - now) : 0;
+  else                          p->msLeftRound = (g.roundEndAt   > now) ? (g.roundEndAt   - now) : 0;
   Transport::broadcast(buf, sizeof(buf));
 }
 
@@ -179,7 +196,9 @@ void bcastGameStatus(const Game& g) {
 
   uint32_t msLeftRound = 0;
   if (g.phase == Phase::PLAYING) {
-    if      (g.bonusIntermission)  msLeftRound = (g.bonusInterEnd  > now) ? (g.bonusInterEnd  - now) : 0;
+    // "msLeftRound" is treated as a stage timer: round / intermission / minigame.
+    if      (g.mgActive)          msLeftRound = (g.mgDeadline   > now) ? (g.mgDeadline   - now) : 0;
+    else if (g.bonusIntermission)  msLeftRound = (g.bonusInterEnd  > now) ? (g.bonusInterEnd  - now) : 0;
     else if (g.bonusIntermission2) msLeftRound = (g.bonus2End      > now) ? (g.bonus2End      - now) : 0;
     else                           msLeftRound = (g.roundEndAt     > now) ? (g.roundEndAt     - now) : 0;
   }
@@ -199,14 +218,18 @@ void bcastGameStatus(const Game& g) {
 // --- Lives system ------------------------------------------------------
 
 void bcastLivesUpdate(Game& g, uint8_t reason /*=0*/, uint8_t blameSid /*=GAMEOVER_BLAME_ALL*/) {
-  uint8_t buf[sizeof(MsgHeader) + sizeof(LivesUpdatePayload)];
-  packHeader(g, (uint8_t)MsgType::LIVES_UPDATE, sizeof(LivesUpdatePayload), buf);
-  auto* p = (LivesUpdatePayload*)(buf + sizeof(MsgHeader));
-  p->livesRemaining = g.livesRemaining;
-  p->livesMax       = g.livesMax;
-  p->reason         = reason;
-  p->blameSid       = blameSid;
-  Transport::broadcast(buf, sizeof(buf));
+  // Broadcast in a short burst to reduce ESP-NOW drop issues.
+  // (Receivers treat these as idempotent updates; duplicates are OK.)
+  for (uint8_t n = 0; n < 3; ++n) {
+    uint8_t buf[sizeof(MsgHeader) + sizeof(LivesUpdatePayload)];
+    packHeader(g, (uint8_t)MsgType::LIVES_UPDATE, sizeof(LivesUpdatePayload), buf);
+    auto* p = (LivesUpdatePayload*)(buf + sizeof(MsgHeader));
+    p->livesRemaining = g.livesRemaining;
+    p->livesMax       = g.livesMax;
+    p->reason         = reason;
+    p->blameSid       = blameSid;
+    Transport::broadcast(buf, sizeof(buf));
+  }
 }
 
 LifeLossResult applyLifeLoss(Game& g, uint8_t reason, uint8_t blameSid /*=GAMEOVER_BLAME_ALL*/, bool obeyLockout /*=true*/) {
@@ -345,6 +368,14 @@ void onRx(const uint8_t* data, uint16_t len) {
       }
       auto* p = (const ControlCmdPayload*)(data + sizeof(MsgHeader));
 
+      // Only accept CONTROL_CMD from the CONTROL station.
+      // (Prevents stray/foreign packets from restarting or stopping games.)
+      if (h->srcStationId != 7) {
+        Serial.printf("[TREX] Ignoring CONTROL_CMD from non-CONTROL station %u\n",
+                      (unsigned)h->srcStationId);
+        break;
+      }
+
       extern Game g;
       Game& G = g;
 
@@ -435,6 +466,21 @@ void onRx(const uint8_t* data, uint16_t len) {
 
       // --- RED handling only (YELLOW is allowed like GREEN) ---
       if (G.light == LightState::RED) {
+        // Gameplay: attempting to loot during RED costs a life (once per RED period).
+        // We ignore a short grace window right after RED begins (g.redHoldGraceMs)
+        // to avoid penalizing in-flight packets from the YELLOW→RED edge.
+        const bool inRedGrace = (now < G.redGraceUntil);
+
+        // If we just force-ended a hold on this station due to RED, the station firmware
+        // may auto-retry HOLD_START while the tag is still present. Suppress penalties
+        // briefly so we don't double-punish.
+        const bool suppressed = (now < G.redLootSuppressUntil[p->stationId]);
+
+        if (!inRedGrace && !suppressed &&
+            !sRedLootAttemptRequested && !G.pirLifeLostThisRed) {
+          sRedLootAttemptRequested  = true;
+          sRedLootAttemptStationId  = p->stationId;
+        }
         uint8_t buf[sizeof(MsgHeader)+sizeof(LootHoldAckPayload)];
         packHeader(G, (uint8_t)MsgType::LOOT_HOLD_ACK, sizeof(LootHoldAckPayload), buf, h->seq);
         auto* a=(LootHoldAckPayload*)(buf+sizeof(MsgHeader));
@@ -442,7 +488,7 @@ void onRx(const uint8_t* data, uint16_t len) {
         a->carried=0;
         a->inventory= G.stationInventory[p->stationId];
         a->capacity = G.stationCapacity[p->stationId];
-        if (now - G.lastFlipMs <= G.edgeGraceMs) a->denyReason=6; else a->denyReason=2;
+        if (inRedGrace || suppressed) a->denyReason=6; else a->denyReason=2;
         Transport::broadcast(buf,sizeof(buf));
         break;
       }

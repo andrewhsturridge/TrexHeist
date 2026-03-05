@@ -163,6 +163,8 @@ const uint32_t RED   = C(255,0,0);
 const uint32_t GREEN = C(0,255,0);
 const uint32_t GOLD  = C(255, 180, 0);
 const uint32_t WHITE = C(255,255,255);
+const uint32_t TAP_CYAN = C(0,200,255);
+const uint32_t TAP_BLUE = C(0,0,255);
 const uint32_t OFF   = 0;
 
 /* tag tracking — edge-trigger (tap) */
@@ -185,6 +187,12 @@ volatile uint32_t   roundGoalAbs      = 100;
 inline uint32_t roundTargetCount() {
   return (roundGoalAbs > roundStartScore) ? (roundGoalAbs - roundStartScore) : 100;
 }
+
+// --- Idle RFID ring attractor blink (only when not scanning, no audio) ---
+static bool     idleBlinkOn      = false;
+static uint32_t idleBlinkLastMs  = 0;
+static LightState idleBlinkLastLight = LightState::GREEN;
+constexpr uint32_t IDLE_RFID_BLINK_MS = 650;
 
 // --- Ring "hold-green" for 1s after a successful DROP_RESULT ---
 static uint32_t ringHoldUntil[4] = {0,0,0,0};
@@ -320,6 +328,40 @@ void maintainRingHolds() {
     }
   }
 }
+
+void updateIdleRfidAttractor(uint32_t now) {
+  // Never blink during RED; idle rings show solid RED.
+  if (g_lightState == LightState::RED) {
+    // Only repaint on the edge into RED to avoid spamming LED updates.
+    if (idleBlinkLastLight != LightState::RED) {
+      idleBlinkLastLight = g_lightState;
+      for (uint8_t i=0; i<4; ++i) {
+        if (!ringHoldActive[i] && !tagPresent[i]) {
+          fillRing(i, RED);
+        }
+      }
+    }
+    return;
+  }
+
+  // If the light just changed away from RED, force an immediate repaint
+  if (g_lightState != idleBlinkLastLight) {
+    idleBlinkLastLight = g_lightState;
+    idleBlinkLastMs = 0;
+  }
+
+  if ((now - idleBlinkLastMs) < IDLE_RFID_BLINK_MS) return;
+  idleBlinkLastMs = now;
+  idleBlinkOn = !idleBlinkOn;
+
+  const uint32_t c = idleBlinkOn ? TAP_CYAN : TAP_BLUE;
+  for (uint8_t i=0; i<4; ++i) {
+    if (!ringHoldActive[i] && !tagPresent[i]) {
+      fillRing(i, c);
+    }
+  }
+}
+
 
 /* ── helpers ─────────────────────────────────────────────── */
 bool cardPresent(MFRC522 &m) {
@@ -792,6 +834,8 @@ void loop() {
   } else {
     tickFinalBlink();
   }
+
+  updateIdleRfidAttractor(now);
 
   maintainRingHolds();
 }

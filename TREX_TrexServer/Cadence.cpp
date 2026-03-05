@@ -70,16 +70,31 @@ void enterYellow(Game& g) {
 
 void enterRed(Game& g) {
   g.light  = LightState::RED;
-  g.nextSwitch  = millis() + pickDur(g.redMs, g.redMsMin, g.redMsMax);
-  g.lastFlipMs  = millis();
-  g.redGraceUntil = g.lastFlipMs + g.redHoldGraceMs;
-  g.pirArmAt      = g.lastFlipMs + g.pirArmDelayMs;
+  const uint32_t now = millis();
+
+  // Gameplay clamps:
+  // - RED must be at least 6 seconds.
+  // - PIR arming delay must be at least 5 seconds (less harsh).
+  constexpr uint32_t MIN_RED_MS     = 6000;
+  constexpr uint32_t MIN_PIR_ARM_MS = 5000;
+
+  uint32_t dur = pickDur(g.redMs, g.redMsMin, g.redMsMax);
+  if (dur < MIN_RED_MS) dur = MIN_RED_MS;
+
+  const uint32_t pirDelay = (g.pirArmDelayMs < MIN_PIR_ARM_MS)
+                          ? MIN_PIR_ARM_MS
+                          : g.pirArmDelayMs;
+
+  g.nextSwitch     = now + dur;
+  g.lastFlipMs     = now;
+  g.redGraceUntil  = now + g.redHoldGraceMs;
+  g.pirArmAt       = now + pirDelay;
   // New RED period begins: allow at most one PIR-in-RED life loss this RED
   g.pirLifeLostThisRed = false;
   spritePlay(CLIP_LOOKING);
   Serial.println("[TREX] -> RED");
   gameAudioPlayOnce(TRK_PLAYERS_STAY_STILL);
-  uint32_t now = millis();
+  // (reuse 'now' from above)
   uint32_t msLeft = (g.nextSwitch > now) ? (g.nextSwitch - now) : 0;
   uint32_t toRoundEnd = (g.roundEndAt > now) ? (g.roundEndAt - now) : 0xFFFFFFFFUL;
   uint32_t toGameEnd  = (g.gameEndAt  > now) ? (g.gameEndAt  - now) : 0xFFFFFFFFUL;
