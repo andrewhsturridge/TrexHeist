@@ -54,7 +54,7 @@ struct Game {
   uint8_t   lastLifeLossReason   = 0;    // last reason that consumed a life (for UI/debug)
   uint8_t   lastLifeLossBlameSid = GAMEOVER_BLAME_ALL;
 
-  // PIR-in-RED: allow at most one life loss per RED period
+  // Motion-input-in-RED: allow at most one life loss per RED period
   bool      pirLifeLostThisRed   = false;
 
   // Tunables (Telnet/maint will edit these)
@@ -97,9 +97,7 @@ struct Game {
 
   // --- Bonus runtime state (cleared at round start) ---
   uint32_t bonusActiveMask = 0;                 // bit i => station i is bonus-active
-  // Stations are addressed 1..MAX_STATIONS throughout the codebase.
-  // Index 0 is unused, so size must be MAX_STATIONS+1 to avoid out-of-bounds writes.
-  uint32_t bonusEndsAt[MAX_STATIONS + 1] = {0}; // per-station TTL end time (millis)
+  uint32_t bonusEndsAt[MAX_STATIONS] = {0};     // per-station TTL end time (millis)
   uint32_t bonusNextSpawnAt = 0;                // scheduler next fire (millis)
   uint8_t  bonusSpawnsThisRound = 0;            // number of spawns so far in current round
 
@@ -134,11 +132,9 @@ struct Game {
   uint16_t r5DepletePerStep  = 2;       // inventory units per deplete tick
   uint16_t r5DepleteStepMs   = 250;     // deplete every N ms when idle
 
-  // Grace + PIR
+  // Grace + motion input (re-uses the existing PIR line on the Feather)
   uint32_t edgeGraceMs     = 300;
-  // Grace window after RED edge to allow stations already looting to disengage
-  // before we apply a "looting in RED" life loss.
-  uint32_t redHoldGraceMs  = 800;
+  uint32_t redHoldGraceMs  = 400;
   uint32_t lastFlipMs      = 0;
   uint32_t redGraceUntil   = 0;
 
@@ -150,16 +146,8 @@ struct Game {
   bool      noRedThisRound  = true;     // Round 1 = true
 
   bool     pirEnforce      = true;
-  // PIR arming delay from RED edge before violations count.
-  // Tuned "less harsh" by default: give players ~5s to freeze.
-  // (Maintenance can raise this, but server enforces a minimum of 5000ms.)
-  uint32_t pirArmDelayMs   = 5000;
+  uint32_t pirArmDelayMs   = 400;   // camera motion input arms quickly; increase if light changes cause false trips
   uint32_t pirArmAt        = 0;
-
-  // During RED, Loot stations can auto-retry HOLD_START when a hold is force-ended.
-  // Suppress penalty for a short window per station to avoid double life-loss.
-  // Index 0 unused; stations are 1..MAX_STATIONS.
-  uint32_t redLootSuppressUntil[MAX_STATIONS + 1] = {0};
 
   // Drip broadcast
   PendingStart pending{};
@@ -169,6 +157,9 @@ struct Game {
   PlayerRec players[MAX_PLAYERS];
   HoldRec   holds[MAX_HOLDS];
   PirRec    pir[4];
+  // Per-station suppression window used by newer Net.cpp/GameModel.cpp logic.
+  // Indexed by stationId (0 and 6 unused, stations are 1..5).
+  uint32_t  redLootSuppressUntil[7] = {0, 0,0,0,0,0, 0};
   uint16_t  stationCapacity[7]  = {0, 56,56,56,56,56, 0}; // index 0,6 unused
   uint16_t  stationInventory[7] = {0, 56,56,56,56,56, 0};
 };

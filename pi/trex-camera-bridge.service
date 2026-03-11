@@ -1,0 +1,14 @@
+[Unit]
+Description=TREX camera-to-Feather GPIO bridge
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/trex-camera/trex_camera_gpio_bridge.py --gpio-pin 17 --motion-json /opt/trex-camera/motion_detect.json --lens-position 0.0 --framerate 15 --lores-width 960 --lores-height 540 --startup-ignore-ms 3000
+Restart=always
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
