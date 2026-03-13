@@ -1,0 +1,224 @@
+Raspberry Pi Golden Backup + Reliability Setup Guide
+
+(TREX Camera Pi / embedded installations)
+
+This guide summarizes the full workflow used to make a reliable
+Raspberry Pi installation with: • A tested spare SD card • A compressed
+backup image stored on Google Drive • A read-only overlay filesystem to
+prevent SD corruption
+
+------------------------------------------------------------------------
+
+1.  Finish configuring the Raspberry Pi
+
+Boot the Pi normally and complete all setup first.
+
+Typical configuration: - Hostname - WiFi networks and priority list -
+Camera configuration - Installed packages - Startup services (example:
+TREX camera bridge) - GPIO / scripts / automation
+
+Then update and clean the system:
+
+sudo apt update sudo apt full-upgrade sudo apt clean sudo reboot
+
+Make sure everything works before proceeding.
+
+------------------------------------------------------------------------
+
+2.  Create a physical spare SD card (Pi SD Copier)
+
+On the Raspberry Pi:
+
+1.  Open SD Card Copier
+2.  Source = current SD card
+3.  Destination = blank SD card
+4.  Start copy
+
+This creates a ready-to-use spare card.
+
+Label them:
+
+TREX Camera SD (MAIN) TREX Camera SD (SPARE)
+
+Test the spare card by booting the Pi from it.
+
+------------------------------------------------------------------------
+
+3.  Enable Overlay Filesystem (corruption protection)
+
+This makes the root filesystem read-only so sudden power loss cannot
+corrupt the card.
+
+Run:
+
+sudo raspi-config
+
+Navigate to:
+
+Performance Options → Overlay File System
+
+Enable: ✔ Overlay filesystem ✔ Write-protect boot partition
+
+Reboot when prompted.
+
+------------------------------------------------------------------------
+
+4.  Verify overlay filesystem is active
+
+Run:
+
+mount | grep ” / ”
+
+You should see something referencing:
+
+overlay
+
+You can also check:
+
+raspi-config nonint get_overlayfs
+
+Expected output:
+
+0
+
+Meaning overlay filesystem is enabled.
+
+------------------------------------------------------------------------
+
+5.  Shut down Pi before imaging
+
+Once everything is confirmed working:
+
+sudo shutdown -h now
+
+Remove the SD card and insert it into your Mac.
+
+------------------------------------------------------------------------
+
+6.  Create compressed image backup on Mac
+
+Open Terminal.
+
+Find the SD card:
+
+diskutil list
+
+Example result:
+
+/dev/disk4
+
+Unmount it:
+
+diskutil unmountDisk /dev/disk4
+
+Create the compressed image:
+
+sudo dd if=/dev/disk4 bs=1m | gzip > ~/trex-camera-pi-YYYY-MM-DD.img.gz
+
+This may take several minutes.
+
+------------------------------------------------------------------------
+
+7.  How to check that the backup command is working
+
+The dd command normally shows no output, so the terminal may appear
+stuck.
+
+You can check progress several ways.
+
+A)  Press this in the same terminal:
+
+CTRL + T
+
+macOS will print progress like:
+
+12492800 bytes transferred in 8.1 secs
+
+You can press CTRL+T multiple times to check progress.
+
+B)  Open another terminal and run:
+
+ps aux | grep dd
+
+If dd appears in the process list, the backup is still running.
+
+C)  Check if the file is growing:
+
+ls -lh ~/trex-camera-pi*
+
+The file size should increase over time.
+
+When dd finishes you will see something like:
+
+30535680 bytes transferred in 132 secs
+
+and your terminal prompt returns.
+
+------------------------------------------------------------------------
+
+8.  Store the image safely
+
+Upload the .img.gz file to Google Drive.
+
+Example naming:
+
+trex-camera-pi-2026-03-13.img.gz
+
+This is your golden image backup.
+
+------------------------------------------------------------------------
+
+9.  Restore the image later (if SD card fails)
+
+Insert a new SD card and run:
+
+diskutil list diskutil unmountDisk /dev/diskX
+
+gunzip -c trex-camera-pi-YYYY-MM-DD.img.gz | sudo dd of=/dev/diskX bs=1m
+
+Replace diskX with the new card’s disk number.
+
+After flashing, insert the card into the Pi and boot.
+
+------------------------------------------------------------------------
+
+10. How to disable read-only mode if changes are needed
+
+If overlay filesystem is enabled and you want to install software or
+change configuration:
+
+Run:
+
+sudo raspi-config
+
+Navigate to:
+
+Performance Options → Overlay File System
+
+Disable overlay filesystem.
+
+Reboot the Pi.
+
+Now the system will be writable again.
+
+Make any changes you need.
+
+After finishing, re-enable overlay filesystem using the same menu and
+reboot.
+
+------------------------------------------------------------------------
+
+Final Reliability Setup
+
+You now have:
+
+✔ Overlay filesystem (prevents corruption) ✔ Spare SD card ready to swap
+✔ Golden compressed image stored on Google Drive
+
+If the SD card ever fails:
+
+1.  Power off Pi
+2.  Insert spare card
+3.  Power on
+
+Downtime: about 30 seconds.
