@@ -71,11 +71,6 @@ void resetGame(Game& g) {
   g.redGraceUntil = 0;
   g.pirArmAt = 0;
 
-  // Clear per-station RED suppression window
-  for (uint8_t sid = 0; sid <= MAX_STATIONS; ++sid) {
-    g.redLootSuppressUntil[sid] = 0;
-  }
-
   g.noRedThisRound       = false;
   g.allowYellowThisRound = true;
 

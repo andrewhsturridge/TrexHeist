@@ -27,8 +27,10 @@ static void printStatus(WiFiClient& out, Game& g) {
              (unsigned)g.greenMs, (unsigned)g.redMs, (unsigned)g.lootRateMs,
              (unsigned)g.maxCarry, (unsigned)g.tickHz,
              (unsigned)g.pirEnforce, (unsigned)g.pirArmDelayMs);
-  out.printf("edgeGrace=%u redHoldGrace=%u\n",
-             (unsigned)g.edgeGraceMs, (unsigned)g.redHoldGraceMs);
+  out.printf("edgeGrace=%u redHoldGrace=%u redLoot=%s\n",
+             (unsigned)g.edgeGraceMs,
+             (unsigned)g.redHoldGraceMs,
+             g.redLootPenaltyAfterGrace ? "strict" : "drop");
 
   // holds summary
   int active=0; for (auto &h : g.holds) if (h.active) active++;
@@ -68,7 +70,8 @@ static bool handleCmd(const String& raw, WiFiClient& out) {
     else if (key=="max_carry"){ g.maxCarry = (uint8_t)u; }
     else if (key=="edge_grace_ms") g.edgeGraceMs = u;
     else if (key=="red_hold_grace_ms") g.redHoldGraceMs = u;
-    else if (key=="pir_arm_ms") g.pirArmDelayMs = max<uint32_t>(u, 5000U);
+    else if (key=="pir_arm_ms") g.pirArmDelayMs = u;
+    else if (key=="red_loot_penalty") g.redLootPenaltyAfterGrace = (u != 0);
     else if (key=="tick_hz")  { g.tickHz = (uint8_t)max<uint32_t>(1,u); }
     else { out.print("unknown key\n"); return true; }
 

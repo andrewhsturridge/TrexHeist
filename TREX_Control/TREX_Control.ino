@@ -574,6 +574,24 @@ void sendControl(ControlOp op, uint8_t targetType, uint8_t targetId) {
   Transport::broadcast(buf, sizeof(buf));
 }
 
+void sendServerCmd(ServerCmdOp op, uint8_t arg8, uint16_t value16) {
+  uint8_t buf[sizeof(MsgHeader) + sizeof(ServerCmdPayload)];
+  auto* h = (MsgHeader*)buf;
+  h->version      = TREX_PROTO_VERSION;
+  h->type         = (uint8_t)MsgType::SERVER_CMD;
+  h->srcStationId = STATION_ID;
+  h->flags        = 0;
+  h->payloadLen   = sizeof(ServerCmdPayload);
+  h->seq          = gSeq++;
+
+  auto* p = (ServerCmdPayload*)(buf + sizeof(MsgHeader));
+  p->op      = (uint8_t)op;
+  p->arg8    = arg8;
+  p->value16 = value16;
+
+  Transport::broadcast(buf, sizeof(buf));
+}
+
 // RADIO_CFG request (CONTROL -> server). Stations will ignore because srcStationId != 0.
 void sendRadioCfgRequest(uint8_t wifiChannel, int8_t txFramed = -1, int8_t rxLegacy = -1) {
   uint8_t buf[sizeof(MsgHeader) + sizeof(RadioCfgPayload)];
@@ -856,6 +874,13 @@ void printHelp() {
   DBG_PRINTLN("  STOP              - End the current game (manual GAME_OVER)");
   DBG_PRINTLN();
 
+  DBG_PRINTLN("Round / camera test commands:");
+  DBG_PRINTLN("  TEST R<1..5>      - Start a new game and jump straight to that round");
+  DBG_PRINTLN("  PIRARM <ms>       - Set camera arm delay after RED starts");
+  DBG_PRINTLN("  REDLOOT DROP      - End holds on RED, never life-loss for loot-in-red");
+  DBG_PRINTLN("  REDLOOT STRICT    - Grace window, then continued/new loot in RED loses a life");
+  DBG_PRINTLN();
+
   DBG_PRINTLN("Radio / network (persisted in NVS; applied by server and causes reboot):");
   DBG_PRINTLN("  RADIO             - Print local radio settings (chan/txFramed/rxLegacy)");
   DBG_PRINTLN("  CHAN <1..13>      - Request network channel change (server broadcasts + all reboot)");
@@ -887,6 +912,9 @@ void printHelp() {
   DBG_PRINTLN();
 
   DBG_PRINTLN("Examples:");
+  DBG_PRINTLN("  TEST R2           -> new game and jump straight to Round 2");
+  DBG_PRINTLN("  PIRARM 600        -> set camera arm delay to 600 ms");
+  DBG_PRINTLN("  REDLOOT STRICT    -> grace window, then loot-in-red loses a life");
   DBG_PRINTLN("  CHAN 11           -> switch the whole T-Rex network to channel 11");
   DBG_PRINTLN("  WIRE FRAMED       -> enable TRex wire header (still accepts legacy)");
   DBG_PRINTLN("  WIRE STRICT       -> TRex-only framing (ignores other games completely)");
@@ -922,6 +950,43 @@ void handleCommand(const String& raw) {
     handleMaintCommand(cmd);
   } else if (cmd.startsWith("LOOT")) {
     handleLootCommand(cmd);
+  } else if (cmd.startsWith("TEST ")) {
+    String rest = cmd.substring(5);
+    rest.trim();
+    if (rest.startsWith("R")) rest = rest.substring(1);
+
+    int round = rest.toInt();
+    if (round >= 1 && round <= 5) {
+      sendServerCmd(ServerCmdOp::START_TEST_ROUND, (uint8_t)round, 0);
+      gServerInMaint  = false;
+      gEndHintStopped = false;
+      DBG_PRINTF("OK TEST R%d\n", round);
+    } else {
+      DBG_PRINTLN("ERR TEST expects R1..R5");
+    }
+  } else if (cmd.startsWith("PIRARM ")) {
+    String rest = cmd.substring(6);
+    rest.trim();
+    long ms = rest.toInt();
+    if (ms >= 0 && ms <= 65535L) {
+      sendServerCmd(ServerCmdOp::SET_PIR_ARM_MS, 0, (uint16_t)ms);
+      DBG_PRINTF("OK PIRARM %ld\n", ms);
+    } else {
+      DBG_PRINTLN("ERR PIRARM expects 0..65535");
+    }
+  } else if (cmd.startsWith("REDLOOT ")) {
+    String rest = cmd.substring(7);
+    rest.trim();
+
+    if (rest == "DROP" || rest == "DROPONLY" || rest == "OFF") {
+      sendServerCmd(ServerCmdOp::SET_RED_LOOT_MODE, (uint8_t)RedLootMode::DROP_ONLY, 0);
+      DBG_PRINTLN("OK REDLOOT DROP");
+    } else if (rest == "STRICT" || rest == "PENALTY" || rest == "ON") {
+      sendServerCmd(ServerCmdOp::SET_RED_LOOT_MODE, (uint8_t)RedLootMode::PENALIZE_AFTER_GRACE, 0);
+      DBG_PRINTLN("OK REDLOOT STRICT");
+    } else {
+      DBG_PRINTLN("ERR REDLOOT expects DROP | STRICT");
+    }
   } else if (cmd.startsWith("CHAN")) {
     // CHAN N  (1..13)
     String rest = cmd.substring(4);

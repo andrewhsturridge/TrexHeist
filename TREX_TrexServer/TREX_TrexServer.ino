@@ -208,6 +208,45 @@ void loop() {
     triggerLootOta(g);
   }
 
+  ServerCmdPayload serverCmd{};
+  if (netConsumeServerCmdRequest(serverCmd)) {
+    switch ((ServerCmdOp)serverCmd.op) {
+      case ServerCmdOp::START_TEST_ROUND: {
+        uint8_t round = serverCmd.arg8;
+        if (round < 1) round = 1;
+        if (round > 5) round = 5;
+
+        startNewGame(g);
+        bcastLivesUpdate(g, /*reason=*/0, GAMEOVER_BLAME_ALL);
+        if (round != 1) {
+          modeClassicForceRound(g, round, /*playWin=*/false);
+        }
+        Serial.printf("[TEST] Started new game at round %u\n", (unsigned)round);
+        break;
+      }
+
+      case ServerCmdOp::SET_PIR_ARM_MS: {
+        g.pirArmDelayMs = (uint32_t)serverCmd.value16;
+        if (g.phase == Phase::PLAYING && g.light == LightState::RED) {
+          g.pirArmAt = g.lastFlipMs + g.pirArmDelayMs;
+        }
+        Serial.printf("[TEST] pirArmDelayMs=%u\n", (unsigned)g.pirArmDelayMs);
+        break;
+      }
+
+      case ServerCmdOp::SET_RED_LOOT_MODE: {
+        g.redLootPenaltyAfterGrace = (serverCmd.arg8 == (uint8_t)RedLootMode::PENALIZE_AFTER_GRACE);
+        Serial.printf("[TEST] redLootMode=%s\n",
+                      g.redLootPenaltyAfterGrace ? "STRICT" : "DROP");
+        break;
+      }
+
+      default:
+        Serial.printf("[TEST] Unknown server cmd op=%u\n", (unsigned)serverCmd.op);
+        break;
+    }
+  }
+
   // --- Radio config requests (from CONTROL station) ---
   RadioCfgPayload rcReq{};
   if (netConsumeRadioCfgRequest(rcReq)) {
@@ -229,6 +268,9 @@ void loop() {
   //   WIRE LEGACY  (txFramed=0 rxLegacy=1)
   //   WIRE FRAMED  (txFramed=1 rxLegacy=1)
   //   WIRE STRICT  (txFramed=1 rxLegacy=0)
+  //   TEST R2      (new game, jump straight to Round 2)
+  //   PIRARM 600   (set camera arm delay, ms)
+  //   REDLOOT DROP | REDLOOT STRICT
 
   auto handleChar = [&](char c) -> bool {
     if (c=='m' || c=='M') { Maint::begin(mcfg); digitalWrite(BOARD_BLUE_LED, HIGH); return true; }
@@ -335,7 +377,58 @@ void loop() {
         continue;
       }
 
-      Serial.println("[SERIAL] Unknown cmd. Try: CHAN <1..13> | WIRE LEGACY/FRAMED/STRICT | RADIO");
+      if (u.startsWith("TEST ")) {
+        String spec = u.substring(5);
+        spec.trim();
+        if (spec.startsWith("R")) spec = spec.substring(1);
+
+        int round = spec.toInt();
+        if (round >= 1 && round <= 5) {
+          startNewGame(g);
+          bcastLivesUpdate(g, /*reason=*/0, GAMEOVER_BLAME_ALL);
+          if (round != 1) {
+            modeClassicForceRound(g, (uint8_t)round, /*playWin=*/false);
+          }
+          Serial.printf("[TEST] Started new game at round %d\n", round);
+        } else {
+          Serial.println("[TEST] Usage: TEST R<1..5>");
+        }
+        continue;
+      }
+
+      if (u.startsWith("PIRARM ")) {
+        String val = u.substring(7);
+        val.trim();
+        long ms = val.toInt();
+        if (ms >= 0 && ms <= 65535L) {
+          g.pirArmDelayMs = (uint32_t)ms;
+          if (g.phase == Phase::PLAYING && g.light == LightState::RED) {
+            g.pirArmAt = g.lastFlipMs + g.pirArmDelayMs;
+          }
+          Serial.printf("[TEST] pirArmDelayMs=%u\n", (unsigned)g.pirArmDelayMs);
+        } else {
+          Serial.println("[TEST] Usage: PIRARM <0..65535>");
+        }
+        continue;
+      }
+
+      if (u.startsWith("REDLOOT ")) {
+        String mode = u.substring(8);
+        mode.trim();
+
+        if (mode == "DROP" || mode == "DROPONLY" || mode == "OFF") {
+          g.redLootPenaltyAfterGrace = false;
+          Serial.println("[TEST] redLootMode=DROP");
+        } else if (mode == "STRICT" || mode == "PENALTY" || mode == "ON") {
+          g.redLootPenaltyAfterGrace = true;
+          Serial.println("[TEST] redLootMode=STRICT");
+        } else {
+          Serial.println("[TEST] Usage: REDLOOT DROP | REDLOOT STRICT");
+        }
+        continue;
+      }
+
+      Serial.println("[SERIAL] Unknown cmd. Try: CHAN <1..13> | WIRE LEGACY/FRAMED/STRICT | RADIO | TEST R<1..5> | PIRARM <ms> | REDLOOT DROP/STRICT");
       continue;
     }
 
@@ -343,6 +436,26 @@ void loop() {
     if (lineLen < sizeof(lineBuf)-1) lineBuf[lineLen++] = c;
   }
 
+  // A fresh/new loot attempt during RED after the grace window can cost one life.
+  // (Active holds that survive past grace are handled later in the RED hold section.)
+  now = millis();
+  uint8_t redLootAttemptSid = 0;
+  if (netConsumeRedLootAttempt(redLootAttemptSid) &&
+      g.phase == Phase::PLAYING &&
+      g.light == LightState::RED &&
+      g.redLootPenaltyAfterGrace &&
+      now >= g.redGraceUntil &&
+      !g.pirLifeLostThisRed) {
+    const LifeLossResult r = applyLifeLoss(g, /*RED_PIR / loot-in-red*/3, redLootAttemptSid, /*obeyLockout=*/true);
+    if (r == LifeLossResult::GAME_OVER) {
+      return;
+    }
+    if (r == LifeLossResult::LIFE_LOST) {
+      g.pirLifeLostThisRed = true;
+      enterGreen(g);
+      return;
+    }
+  }
 
   // Drip broadcast on new game start (unchanged)
   static uint32_t lastSend = 0;
@@ -461,27 +574,50 @@ void loop() {
     }
   }
 
-  // Stop any active holds the moment we enter RED (non-punitive).
+  // RED looting behavior:
+  //   DROP mode   -> active holds are ended immediately when RED starts.
+  //   STRICT mode -> active holds get the grace window; if still active after grace, that RED costs one life.
   static LightState lastLight = LightState::RED;  // pessimistic init
   if (g.phase == Phase::PLAYING) {
     // RED rising edge
     if (g.light == LightState::RED && lastLight != LightState::RED) {
-      for (auto &h : g.holds) {
-        if (h.active) {
-          sendHoldEnd(g, h.holdId, /*RED*/2);
-          h.active = false;
+      if (!g.redLootPenaltyAfterGrace) {
+        for (auto &h : g.holds) {
+          if (h.active) {
+            sendHoldEnd(g, h.holdId, /*RED*/2);
+            h.active = false;
+          }
         }
       }
     }
-    // Safety net: after the configured grace window, make sure no hold lingers
-    if (g.light == LightState::RED && now >= g.redGraceUntil) {
+
+    // STRICT mode: after the grace window, any hold still active means the player
+    // kept looting into RED. End the hold(s) and consume one life for that RED period.
+    if (g.light == LightState::RED && g.redLootPenaltyAfterGrace && now >= g.redGraceUntil) {
+      uint8_t blameSid = 0;
+      bool hadActiveHold = false;
+
       for (auto &h : g.holds) {
-        if (h.active) {
-          sendHoldEnd(g, h.holdId, /*RED*/2);
-          h.active = false;
+        if (!h.active) continue;
+        if (!blameSid) blameSid = h.stationId;
+        hadActiveHold = true;
+        sendHoldEnd(g, h.holdId, /*RED*/2);
+        h.active = false;
+      }
+
+      if (hadActiveHold && !g.pirLifeLostThisRed) {
+        const LifeLossResult r = applyLifeLoss(g, /*RED_PIR / loot-in-red*/3, blameSid ? blameSid : GAMEOVER_BLAME_ALL, /*obeyLockout=*/true);
+        if (r == LifeLossResult::GAME_OVER) {
+          return;
+        }
+        if (r == LifeLossResult::LIFE_LOST) {
+          g.pirLifeLostThisRed = true;
+          enterGreen(g);
+          return;
         }
       }
     }
+
     lastLight = g.light;
   }
 

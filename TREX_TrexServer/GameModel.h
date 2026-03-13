@@ -54,7 +54,8 @@ struct Game {
   uint8_t   lastLifeLossReason   = 0;    // last reason that consumed a life (for UI/debug)
   uint8_t   lastLifeLossBlameSid = GAMEOVER_BLAME_ALL;
 
-  // Motion-input-in-RED: allow at most one life loss per RED period
+  // RED-period violations: allow at most one life loss per RED period
+  // (camera/PIR or loot-in-red).
   bool      pirLifeLostThisRed   = false;
 
   // Tunables (Telnet/maint will edit these)
@@ -149,6 +150,11 @@ struct Game {
   uint32_t pirArmDelayMs   = 400;   // camera motion input arms quickly; increase if light changes cause false trips
   uint32_t pirArmAt        = 0;
 
+  // RED looting policy:
+  // false => immediately drop holds on RED; no life loss for looting during RED
+  // true  => allow the grace window, then a continued/new loot attempt during RED can cost one life
+  bool     redLootPenaltyAfterGrace = true;
+
   // Drip broadcast
   PendingStart pending{};
   uint32_t lastTickSentMs = 0;
@@ -157,9 +163,6 @@ struct Game {
   PlayerRec players[MAX_PLAYERS];
   HoldRec   holds[MAX_HOLDS];
   PirRec    pir[4];
-  // Per-station suppression window used by newer Net.cpp/GameModel.cpp logic.
-  // Indexed by stationId (0 and 6 unused, stations are 1..5).
-  uint32_t  redLootSuppressUntil[7] = {0, 0,0,0,0,0, 0};
   uint16_t  stationCapacity[7]  = {0, 56,56,56,56,56, 0}; // index 0,6 unused
   uint16_t  stationInventory[7] = {0, 56,56,56,56,56, 0};
 };

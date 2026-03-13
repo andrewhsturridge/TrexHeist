@@ -21,8 +21,12 @@ static bool sLootOtaRequested      = false;
 static bool    sRedLootAttemptRequested  = false;
 static uint8_t sRedLootAttemptStationId = 0;
 
+// Server-side testing/tuning requests (CONTROL -> server)
+static bool             sServerCmdRequested = false;
+static ServerCmdPayload sServerCmd{};
+
 // --- Radio config request (CONTROL -> server) ---
-static bool           sRadioCfgRequested = false;
+static bool            sRadioCfgRequested = false;
 static RadioCfgPayload sRadioCfgReq{};
 
 bool netConsumeEnterMaintRequest() {
@@ -57,6 +61,12 @@ bool netConsumeRedLootAttempt(uint8_t& outStationId) {
   return true;
 }
 
+bool netConsumeServerCmdRequest(ServerCmdPayload& out) {
+  if (!sServerCmdRequested) return false;
+  out = sServerCmd;
+  sServerCmdRequested = false;
+  return true;
+}
 
 bool netConsumeRadioCfgRequest(RadioCfgPayload& out) {
   if (!sRadioCfgRequested) return false;
@@ -358,6 +368,32 @@ void onRx(const uint8_t* data, uint16_t len) {
       break;
     }
 
+    case MsgType::SERVER_CMD: {
+      if (h->payloadLen != sizeof(ServerCmdPayload)) {
+        Serial.printf("[TREX] SERVER_CMD bad len=%u (expected %u)\n",
+                      (unsigned)h->payloadLen,
+                      (unsigned)sizeof(ServerCmdPayload));
+        break;
+      }
+
+      if (h->srcStationId != 7) {
+        Serial.printf("[TREX] Ignoring SERVER_CMD from non-CONTROL station %u\n",
+                      (unsigned)h->srcStationId);
+        break;
+      }
+
+      const auto* p = (const ServerCmdPayload*)(data + sizeof(MsgHeader));
+      sServerCmd = *p;
+      sServerCmdRequested = true;
+
+      Serial.printf("[TREX] SERVER_CMD op=%u arg8=%u value16=%u from station %u\n",
+                    (unsigned)p->op,
+                    (unsigned)p->arg8,
+                    (unsigned)p->value16,
+                    (unsigned)h->srcStationId);
+      break;
+    }
+
     // CONTROL_CMD from Control station (START/STOP/MAINT/LOOT)
     case MsgType::CONTROL_CMD: {
       if (h->payloadLen != sizeof(ControlCmdPayload)) {
@@ -466,31 +502,31 @@ void onRx(const uint8_t* data, uint16_t len) {
 
       // --- RED handling only (YELLOW is allowed like GREEN) ---
       if (G.light == LightState::RED) {
-        // Gameplay: attempting to loot during RED costs a life (once per RED period).
-        // We ignore a short grace window right after RED begins (g.redHoldGraceMs)
-        // to avoid penalizing in-flight packets from the YELLOW→RED edge.
         const bool inRedGrace = (now < G.redGraceUntil);
+        const bool allowGraceHold = G.redLootPenaltyAfterGrace && inRedGrace;
 
-        // If we just force-ended a hold on this station due to RED, the station firmware
-        // may auto-retry HOLD_START while the tag is still present. Suppress penalties
-        // briefly so we don't double-punish.
-        const bool suppressed = (now < G.redLootSuppressUntil[p->stationId]);
+        // DROP mode: deny all RED starts immediately.
+        // STRICT mode: during the grace window we allow the hold to exist so the
+        // player can safely remove the tag; if the hold is still active after grace,
+        // the server will consume one life for that RED period.
+        if (!allowGraceHold) {
+          if (!inRedGrace && G.redLootPenaltyAfterGrace &&
+              !sRedLootAttemptRequested && !G.pirLifeLostThisRed) {
+            sRedLootAttemptRequested = true;
+            sRedLootAttemptStationId = p->stationId;
+          }
 
-        if (!inRedGrace && !suppressed &&
-            !sRedLootAttemptRequested && !G.pirLifeLostThisRed) {
-          sRedLootAttemptRequested  = true;
-          sRedLootAttemptStationId  = p->stationId;
+          uint8_t buf[sizeof(MsgHeader)+sizeof(LootHoldAckPayload)];
+          packHeader(G, (uint8_t)MsgType::LOOT_HOLD_ACK, sizeof(LootHoldAckPayload), buf, h->seq);
+          auto* a=(LootHoldAckPayload*)(buf+sizeof(MsgHeader));
+          a->holdId=p->holdId; a->accepted=0; a->rateHz=rateHz; a->maxCarry=G.maxCarry;
+          a->carried=0;
+          a->inventory= G.stationInventory[p->stationId];
+          a->capacity = G.stationCapacity[p->stationId];
+          a->denyReason = inRedGrace ? 6 : 2;
+          Transport::broadcast(buf,sizeof(buf));
+          break;
         }
-        uint8_t buf[sizeof(MsgHeader)+sizeof(LootHoldAckPayload)];
-        packHeader(G, (uint8_t)MsgType::LOOT_HOLD_ACK, sizeof(LootHoldAckPayload), buf, h->seq);
-        auto* a=(LootHoldAckPayload*)(buf+sizeof(MsgHeader));
-        a->holdId=p->holdId; a->accepted=0; a->rateHz=rateHz; a->maxCarry=G.maxCarry;
-        a->carried=0;
-        a->inventory= G.stationInventory[p->stationId];
-        a->capacity = G.stationCapacity[p->stationId];
-        if (inRedGrace || suppressed) a->denyReason=6; else a->denyReason=2;
-        Transport::broadcast(buf,sizeof(buf));
-        break;
       }
 
       // Ensure player record
