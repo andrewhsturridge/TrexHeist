@@ -133,6 +133,18 @@ void onRx(const uint8_t* data, uint16_t len) {
       break;
     }
 
+    case MsgType::ROUND_STATUS: {
+      if (h->payloadLen != sizeof(RoundStatusPayload)) break;
+      const auto* p = (const RoundStatusPayload*)(data + sizeof(MsgHeader));
+
+      // Safety: if MG_STOP was dropped but the server has already advanced into
+      // Round 5, leave the minigame anyway so normal gauge rendering resumes.
+      if (mgActive && p->roundIndex >= 5) {
+        mgStop();
+      }
+      break;
+    }
+
     case MsgType::LOOT_HOLD_ACK: {
       if (mgActive) break;
       if (h->payloadLen != sizeof(LootHoldAckPayload)) break;
@@ -239,8 +251,6 @@ void onRx(const uint8_t* data, uint16_t len) {
       const auto* p = (const HoldEndPayload*)(data + sizeof(MsgHeader));
       if (p->holdId != holdId) break;
 
-      stopEmptyBlink();
-
       holdActive = false;
       holdId     = 0;
 
@@ -248,6 +258,16 @@ void onRx(const uint8_t* data, uint16_t len) {
       g_bonusAtTap = false;
 
       fullAnnounced = false;
+
+      // Keep the depleted-station white tick visible while the RFID tag is still
+      // sitting on the reader, even though the server has already ended the hold.
+      // This restores the clearer "empty until tag removed" feel without keeping
+      // the looping loot audio alive.
+      if (tagPresent && inv == 0) {
+        startEmptyBlink();
+      } else {
+        stopEmptyBlink();
+      }
 
       if (tagPresent && carried >= maxCarry) {
         if (!fullBlinkActive) startFullBlinkImmediate();

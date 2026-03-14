@@ -163,6 +163,7 @@ const uint32_t RED   = C(255,0,0);
 const uint32_t GREEN = C(0,255,0);
 const uint32_t GOLD  = C(255, 180, 0);
 const uint32_t WHITE = C(255,255,255);
+const uint32_t OFF_WHITE = C(24,24,24);
 const uint32_t TAP_CYAN = C(0,200,255);
 const uint32_t TAP_BLUE = C(0,0,255);
 const uint32_t OFF   = 0;
@@ -184,6 +185,9 @@ static uint32_t pendingTeamScore = 0;       // latest score to render
 volatile uint8_t    roundIndex        = 1;
 volatile uint32_t   roundStartScore   = 0;
 volatile uint32_t   roundGoalAbs      = 100;
+volatile uint32_t   bonusActiveMask   = 0;
+static uint32_t     bonusVisualStartScore = 0;
+constexpr uint32_t  BONUS_VISUAL_TARGET = 100;
 inline uint32_t roundTargetCount() {
   return (roundGoalAbs > roundStartScore) ? (roundGoalAbs - roundStartScore) : 100;
 }
@@ -398,40 +402,46 @@ void fillRing(uint8_t idx, uint32_t c) {
 }
 
 void drawTeamGaugesRound(uint32_t score, uint32_t target) {
-  // progress this round
-  uint32_t prog = (score > roundStartScore) ? (score - roundStartScore) : 0;
-  if (target == 0) target = 1; // avoid div0
+  const bool bonusMode = (bonusActiveMask != 0);
+  const uint32_t startScore = bonusMode ? bonusVisualStartScore : roundStartScore;
+  uint32_t visualTarget = bonusMode ? BONUS_VISUAL_TARGET : target;
+  uint32_t prog = (score > startScore) ? (score - startScore) : 0;
+  if (visualTarget == 0) visualTarget = 1; // avoid div0
 
-  // Map % to the full pipe, reserve top green marker (in-game)
-  const bool goalReached = (prog >= target);
+  const bool goalReached = (prog >= visualTarget);
   uint16_t lit = 0;
   if (!goalReached) {
-    // generous ceil-ish mapping below the top marker
     uint32_t scaled = prog * (uint32_t)GAUGE_LEN;
-    lit = (uint16_t)(scaled / target);
+    lit = (uint16_t)(scaled / visualTarget);
   } else {
-    lit = GAUGE_LEN; // full bar
+    lit = GAUGE_LEN;
   }
+
   const uint16_t top = (GAUGE_LEN > 0) ? (GAUGE_LEN - 1) : 0;
-  const uint16_t goldCount = goalReached ? GAUGE_LEN : (uint16_t)min<uint16_t>(lit, top);
+  const uint16_t filledCount = bonusMode
+    ? (uint16_t)min<uint16_t>(lit, GAUGE_LEN)
+    : (goalReached ? GAUGE_LEN : (uint16_t)min<uint16_t>(lit, top));
 
   for (auto &g : gauge) {
-    // In-game paint: GOLD progress, remainder OFF
-    // (If goal reached, we paint all GREEN below)
     for (uint16_t i = 0; i < GAUGE_LEN; ++i) {
       uint32_t c;
-      if (goalReached) {
-        c = GREEN;                       // goal: whole bar GREEN
+      if (bonusMode) {
+        c = (i < filledCount) ? GOLD : OFF_WHITE;
+      } else if (goalReached) {
+        c = GREEN;
       } else {
-        c = (i < goldCount) ? GOLD : OFF;
+        c = (i < filledCount) ? GOLD : OFF_WHITE;
       }
       g.setPixelColor(i, c);
       if ((i & 15) == 0) pumpAudio();
     }
 
-    // Deterministic top marker: always green during the game
-    if (!goalReached && GAUGE_LEN > 0) {
-      g.setPixelColor(top, GREEN);
+    if (GAUGE_LEN > 0) {
+      if (bonusMode && !goalReached) {
+        g.setPixelColor(top, WHITE);
+      } else if (!bonusMode && !goalReached) {
+        g.setPixelColor(top, GREEN);
+      }
     }
 
     if (!audioExclusive) g.show();
@@ -561,6 +571,28 @@ void onRx(const uint8_t* data, uint16_t len) {
       break;
     }
 
+    case MsgType::BONUS_UPDATE: {
+      if (h->payloadLen < 4) break;
+      const uint8_t* pl = data + sizeof(MsgHeader);
+      uint32_t mask = (uint32_t)pl[0]
+                    | ((uint32_t)pl[1] << 8)
+                    | ((uint32_t)pl[2] << 16)
+                    | ((uint32_t)pl[3] << 24);
+
+      const bool wasBonus = (bonusActiveMask != 0);
+      const bool nowBonus = (mask != 0);
+      if (nowBonus && !wasBonus) {
+        bonusVisualStartScore = (teamScore < roundGoalAbs) ? teamScore : roundGoalAbs;
+      }
+      bonusActiveMask = mask;
+
+      if (gameActive) {
+        if (!audioExclusive) drawTeamGaugesRound(teamScore, roundTargetCount());
+        else { pendingTeamScore = teamScore; gaugeDirty = true; }
+      }
+      break;
+    }
+
     case MsgType::STATE_TICK: {
       if (h->payloadLen != sizeof(StateTickPayload)) break;
       auto* p = (const StateTickPayload*)(data + sizeof(MsgHeader));
@@ -640,6 +672,10 @@ void onRx(const uint8_t* data, uint16_t len) {
 
     case MsgType::GAME_START: {
       gameActive = true;
+      teamScore = 0;
+      roundStartScore = 0;
+      bonusActiveMask = 0;
+      bonusVisualStartScore = 0;
       Serial.println("[DROP] GAME_START");
       stopFinalBlink();
       scanLocked = false;
@@ -660,6 +696,7 @@ void onRx(const uint8_t* data, uint16_t len) {
 
     case MsgType::GAME_OVER: {
       gameActive = false;
+      bonusActiveMask = 0;
       Serial.printf("[DROP] GAME_OVER  final score=%lu / %lu\n",
                     (unsigned long)teamScore, (unsigned long)TEAM_GOAL);
 

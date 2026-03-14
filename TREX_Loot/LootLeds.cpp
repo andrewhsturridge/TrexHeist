@@ -53,6 +53,7 @@ static const uint32_t BLUE  = C_RGB(  0,  0,255);
 static const uint32_t CYAN  = C_RGB(  0,200,255);
 static const uint32_t YELLOW= C_RGB(255,180,  0);
 static const uint32_t WHITE = C_RGB(255,255,255);
+static const uint32_t OFF_WHITE = C_RGB(24,24,24);
 static const uint32_t OFF   = 0;
 
 // ===== ring layout (pair-symmetric order) =====
@@ -227,7 +228,7 @@ void drawGaugeInventory(uint16_t inventory, uint16_t capacity) {
 
   // Draw (bounded, no edge writes)
   for (uint16_t i = 0; i < GAUGE_LEN; ++i) {
-    gauge.setPixelColor(i, (i < lit) ? col : OFF);
+    gauge.setPixelColor(i, (i < lit) ? col : OFF_WHITE);
   }
   gauge.show();
 
@@ -255,7 +256,7 @@ void drawGaugeInventoryRainbowAnimated(uint16_t inventory, uint16_t capacity, ui
       uint32_t c = gauge.ColorHSV(hue, /*sat*/255, /*val*/255);
       gauge.setPixelColor(i, c);
     } else {
-      gauge.setPixelColor(i, 0);
+      gauge.setPixelColor(i, OFF_WHITE);
     }
   }
 

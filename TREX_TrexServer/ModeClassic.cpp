@@ -9,6 +9,21 @@
 #include <esp_random.h>
 #include <TrexProtocol.h>
 
+namespace {
+constexpr uint32_t GAME_TOTAL_MS          = 360000UL;  // 6:00 overall success timer
+constexpr uint32_t ROUND1_MS              = 75000UL;
+constexpr uint32_t ROUND2_MS              = 75000UL;
+constexpr uint32_t ROUND3_MS              = 75000UL;
+constexpr uint32_t ROUND4_MS              = 60000UL;
+constexpr uint32_t ROUND5_MS              = 60000UL;
+constexpr uint16_t BONUS_INTERMISSION_MS  = 12000;
+constexpr uint16_t BONUS_INTERMISSION2_MS = 12000;
+constexpr uint16_t BONUS2_HOP_MS          = 3000;
+constexpr uint16_t MINIGAME_MS            = 30000;
+constexpr uint8_t  ROUND_SYNC_PASSES      = 3;
+constexpr uint8_t  BONUS_SYNC_PASSES      = 2;
+}
+
 // --- Random split of TOTAL across 5 stations, each <= 56 ---
 static void splitInventoryRandom(Game& g, uint16_t total /*=100*/) {
   uint16_t remain = total;
@@ -173,8 +188,8 @@ static void startRound(Game& g, uint8_t idx) {
     // Only set the overall game timer when starting a *new* game.
     // (Avoids surprise timer resets if Round 1 is re-entered via FORCE/NEXT paths.)
     if (g.gameStartAt == 0) g.gameStartAt = now;
-    if (g.gameEndAt == 0)   g.gameEndAt   = now + 300000UL;  // 5:00 (legacy/placeholder)
-    g.roundEndAt  = now + 120000UL;  // 2:00
+    if (g.gameEndAt == 0)   g.gameEndAt   = now + GAME_TOTAL_MS;
+    g.roundEndAt  = now + ROUND1_MS;
 
     sendStateTick(g, (g.roundEndAt > now) ? (g.roundEndAt - now) : 0);
 
@@ -197,6 +212,7 @@ static void startRound(Game& g, uint8_t idx) {
 
     g.pending.needGameStart = true;
     g.pending.nextStation   = 1;
+    g.pending.stationPasses = ROUND_SYNC_PASSES;
     g.pending.needScore     = true;
 
     bonusResetForRound(g, now);
@@ -215,7 +231,7 @@ static void startRound(Game& g, uint8_t idx) {
 
     g.roundStartScore = g.teamScore;
     g.roundGoal       = g.roundStartScore + 40;
-    g.roundEndAt      = now + 120000UL;
+    g.roundEndAt      = now + ROUND2_MS;
 
     endAndClearHoldsAndCarried(g);
 
@@ -230,6 +246,7 @@ static void startRound(Game& g, uint8_t idx) {
     }
 
     g.pending.nextStation = 1;
+    g.pending.stationPasses = ROUND_SYNC_PASSES;
     g.pending.needScore   = true;
 
     bonusResetForRound(g, now);
@@ -248,7 +265,7 @@ static void startRound(Game& g, uint8_t idx) {
 
     g.roundStartScore = g.teamScore;
     g.roundGoal       = g.roundStartScore + 40;
-    g.roundEndAt      = now + 120000UL;
+    g.roundEndAt      = now + ROUND3_MS;
 
     endAndClearHoldsAndCarried(g);
 
@@ -262,6 +279,7 @@ static void startRound(Game& g, uint8_t idx) {
     g.yellowMsMin= g.yellowMs; g.yellowMsMax = g.yellowMs;
 
     g.pending.nextStation = 1;
+    g.pending.stationPasses = ROUND_SYNC_PASSES;
     g.pending.needScore   = true;
 
     bonusResetForRound(g, now);
@@ -280,7 +298,7 @@ static void startRound(Game& g, uint8_t idx) {
 
     g.roundStartScore = g.teamScore;
     g.roundGoal       = g.roundStartScore + 40;
-    g.roundEndAt      = now + 120000UL;
+    g.roundEndAt      = now + ROUND4_MS;
 
     endAndClearHoldsAndCarried(g);
 
@@ -296,6 +314,7 @@ static void startRound(Game& g, uint8_t idx) {
     g.yellowMsMin= 3000;                   g.yellowMsMax = 3000;
 
     g.pending.nextStation = 1;
+    g.pending.stationPasses = ROUND_SYNC_PASSES;
     g.pending.needScore   = true;
 
     bonusResetForRound(g, now);
@@ -318,7 +337,7 @@ static void startRound(Game& g, uint8_t idx) {
     // Same goal & timing model as Round 4
     g.roundStartScore = g.teamScore;
     g.roundGoal       = g.roundStartScore + 40;
-    g.roundEndAt      = now + 120000UL;
+    g.roundEndAt      = now + ROUND5_MS;
 
     // Broadcast timers like other rounds
     sendStateTick(g, (g.roundEndAt > now) ? (g.roundEndAt - now) : 0);
@@ -332,6 +351,10 @@ static void startRound(Game& g, uint8_t idx) {
 
     // *** Start the R5 hop engine ***
     r5Start(g, now);
+
+    g.pending.nextStation   = 1;
+    g.pending.stationPasses = ROUND_SYNC_PASSES;
+    g.pending.needScore     = true;
     return;
   }
 }
@@ -376,7 +399,7 @@ static void retryCurrentRoundAfterGoalFail(Game& g) {
 
   // Reset the round timer (keep overall gameStartAt/gameEndAt untouched).
   g.roundStartAt = now;
-  g.roundEndAt   = now + 120000UL;
+  g.roundEndAt   = now + ((idx == 1) ? ROUND1_MS : (idx == 2) ? ROUND2_MS : (idx == 3) ? ROUND3_MS : (idx == 4) ? ROUND4_MS : ROUND5_MS);
   sendStateTick(g, (g.roundEndAt > now) ? (g.roundEndAt - now) : 0);
 
   // Remaining points needed to hit the existing absolute goal.
@@ -406,6 +429,7 @@ static void retryCurrentRoundAfterGoalFail(Game& g) {
     bcastRoundStatus(g);
 
     g.pending.nextStation = 1;
+    g.pending.stationPasses = ROUND_SYNC_PASSES;
     g.pending.needScore   = true;
     return;
   }
@@ -431,6 +455,7 @@ static void retryCurrentRoundAfterGoalFail(Game& g) {
     bcastRoundStatus(g);
 
     g.pending.nextStation = 1;
+    g.pending.stationPasses = ROUND_SYNC_PASSES;
     g.pending.needScore   = true;
     return;
   }
@@ -455,6 +480,7 @@ static void retryCurrentRoundAfterGoalFail(Game& g) {
     bcastRoundStatus(g);
 
     g.pending.nextStation = 1;
+    g.pending.stationPasses = ROUND_SYNC_PASSES;
     g.pending.needScore   = true;
     return;
   }
@@ -480,6 +506,7 @@ static void retryCurrentRoundAfterGoalFail(Game& g) {
     bcastRoundStatus(g);
 
     g.pending.nextStation = 1;
+    g.pending.stationPasses = ROUND_SYNC_PASSES;
     g.pending.needScore   = true;
     return;
   }
@@ -506,6 +533,7 @@ static void retryCurrentRoundAfterGoalFail(Game& g) {
     r5Start(g, now);
 
     g.pending.nextStation = 1;
+    g.pending.stationPasses = ROUND_SYNC_PASSES;
     g.pending.needScore   = true;
   }
 }
@@ -513,12 +541,13 @@ static void retryCurrentRoundAfterGoalFail(Game& g) {
 static const uint8_t ST_FIRST = 1;
 static const uint8_t ST_LAST  = MAX_STATIONS;
 
-void startBonusIntermission(Game& g, uint16_t durationMs /*=15000*/) {
+void startBonusIntermission(Game& g, uint16_t durationMs /*=BONUS_INTERMISSION_MS*/) {
   // End any holds and clear carried so nothing rolls into intermission
   endAndClearHoldsAndCarried(g);
 
   // Mark intermission window
   g.bonusIntermission = true;
+  if (durationMs == 0) durationMs = BONUS_INTERMISSION_MS;
   g.bonusInterMs      = durationMs;
   g.bonusInterStart   = millis();
   g.bonusInterEnd     = g.bonusInterStart + durationMs;
@@ -543,6 +572,8 @@ void startBonusIntermission(Game& g, uint16_t durationMs /*=15000*/) {
     g.bonusActiveMask |= (1u << sid);
     g.bonusEndsAt[sid] = g.bonusInterEnd;
   }
+  g.pending.nextStation   = 1;
+  g.pending.stationPasses = BONUS_SYNC_PASSES;
   bcastBonusUpdate(g);  // clients: rainbow + spawn chime
 }
 
@@ -603,9 +634,11 @@ static uint8_t nextSidSeq(uint8_t cur) {
   return n;
 }
 
-void startBonusIntermission2(Game& g, uint16_t durationMs /*=15000*/, uint16_t hopMs /*=3000*/) {
+void startBonusIntermission2(Game& g, uint16_t durationMs /*=BONUS_INTERMISSION2_MS*/, uint16_t hopMs /*=BONUS2_HOP_MS*/) {
   endAndClearHoldsAndCarried(g);
 
+  if (durationMs == 0) durationMs = BONUS_INTERMISSION2_MS;
+  if (hopMs == 0) hopMs = BONUS2_HOP_MS;
   g.bonusIntermission2 = true;
   g.bonus2Start        = millis();
   g.bonus2End          = g.bonus2Start + durationMs;
@@ -634,6 +667,8 @@ void startBonusIntermission2(Game& g, uint16_t durationMs /*=15000*/, uint16_t h
   bcastStation(g, g.bonus2Sid);
 
   g.bonusActiveMask = (1u << g.bonus2Sid);
+  g.pending.nextStation   = 1;
+  g.pending.stationPasses = BONUS_SYNC_PASSES;
   bcastBonusUpdate(g);
 
   g.bonus2NextHopAt = g.bonus2Start + g.bonus2HopMs;
@@ -763,7 +798,7 @@ static inline void endR35Now(Game& g) {
 void modeClassicNextRound(Game& g, bool playWin) {
   // Finish R2 -> R2.5 path
   if (g.roundIndex == 2 && !g.bonusIntermission) {
-    startBonusIntermission(g, /*durationMs=*/15000);
+    startBonusIntermission(g, /*durationMs=*/BONUS_INTERMISSION_MS);
     return;
   }
 
@@ -782,7 +817,7 @@ void modeClassicNextRound(Game& g, bool playWin) {
 
   // Finish R3 -> R3.5 path
   if (g.roundIndex == 3 && !g.bonusIntermission2) {
-    startBonusIntermission2(g, /*durationMs=*/15000, /*hopMs=*/3000);
+    startBonusIntermission2(g, /*durationMs=*/BONUS_INTERMISSION2_MS, /*hopMs=*/BONUS2_HOP_MS);
     return;
   }
 
@@ -812,7 +847,7 @@ void modeClassicNextRound(Game& g, bool playWin) {
   if (g.roundIndex == 4) {
     g.mgActive     = true;
     g.mgCfg.seed   = esp_random();
-    g.mgCfg.timerMs= 60000;
+    g.mgCfg.timerMs= MINIGAME_MS;
     g.mgCfg.speedMinMs = 20;  g.mgCfg.speedMaxMs = 80;
     g.mgCfg.segMin = 6;       g.mgCfg.segMax = 16;
     g.mgStartedAt  = millis();
@@ -847,11 +882,27 @@ void modeClassicNextRound(Game& g, bool playWin) {
   startRound(g, next);
 }
 
+static void continueRound5UntilGameEnd(Game& g, uint32_t now) {
+  // TREX now uses the 6-minute overall timer as the primary success condition.
+  // In Round 5, hitting the local segment goal should keep the room running until
+  // that overall timer expires instead of ending early.
+  g.roundStartScore = g.teamScore;
+  g.roundGoal       = g.roundStartScore + 40;
+  g.roundEndAt      = now + ROUND5_MS;
+  if (g.gameEndAt > 0 && g.roundEndAt > g.gameEndAt) {
+    g.roundEndAt = g.gameEndAt;
+  }
+  sendStateTick(g, (g.roundEndAt > now) ? (g.roundEndAt - now) : 0);
+  bcastRoundStatus(g);
+  bcastGameStatus(g);
+}
+
+
 void modeClassicInit(Game& g) {
   const uint32_t now = millis();
-  // overall 5-minute game
+  // overall 6-minute success timer
   g.gameStartAt = now;
-  g.gameEndAt   = now + 300000UL;           // 5 minutes
+  g.gameEndAt   = now + GAME_TOTAL_MS;
 
   startRound(g, /*idx=*/1);                 // Round 1 starts immediately
 }
@@ -871,13 +922,13 @@ void modeClassicMaybeAdvance(Game& g) {
     gameAudioStop();
 
     if      (g.roundIndex == 1) { startRound(g, 2); return; }
-    else if (g.roundIndex == 2) { startBonusIntermission(g, /*durationMs=*/15000); return; }
-    else if (g.roundIndex == 3) { startRound(g, 4); return; }
+    else if (g.roundIndex == 2) { startBonusIntermission(g, /*durationMs=*/BONUS_INTERMISSION_MS); return; }
+    else if (g.roundIndex == 3) { startBonusIntermission2(g, /*durationMs=*/BONUS_INTERMISSION2_MS, /*hopMs=*/BONUS2_HOP_MS); return; }
     else if (g.roundIndex == 4) {
       // === START MINIGAME (between R4->R5) ===
       g.mgActive     = true;
       g.mgCfg.seed   = esp_random();
-      g.mgCfg.timerMs= 60000;
+      g.mgCfg.timerMs= MINIGAME_MS;
       g.mgCfg.speedMinMs = 20;  g.mgCfg.speedMaxMs = 80;
       g.mgCfg.segMin = 6;       g.mgCfg.segMax = 16;
       g.mgStartedAt  = now;
@@ -895,8 +946,8 @@ void modeClassicMaybeAdvance(Game& g) {
       return;
     }
     else if (g.roundIndex == 5) {
-      // R5 goal reached -> end game (success)
-      bcastGameOver(g, /*GOAL_MET*/0, GAMEOVER_BLAME_ALL);
+      // Round 5 now loops in 60s segments until the overall 6-minute timer ends.
+      continueRound5UntilGameEnd(g, now);
       return;
     }
   }
@@ -935,13 +986,13 @@ void modeClassicMaybeAdvance(Game& g) {
     gameAudioStop();
 
     if      (g.roundIndex == 1) { startRound(g, 2); return; }
-    else if (g.roundIndex == 2) { startBonusIntermission(g, /*durationMs=*/15000); return; }
-    else if (g.roundIndex == 3) { startRound(g, 4); return; }
+    else if (g.roundIndex == 2) { startBonusIntermission(g, /*durationMs=*/BONUS_INTERMISSION_MS); return; }
+    else if (g.roundIndex == 3) { startBonusIntermission2(g, /*durationMs=*/BONUS_INTERMISSION2_MS, /*hopMs=*/BONUS2_HOP_MS); return; }
     else if (g.roundIndex == 4) {
       // Timeout at R4 also enters the minigame
       g.mgActive     = true;
       g.mgCfg.seed   = esp_random();
-      g.mgCfg.timerMs= 60000;
+      g.mgCfg.timerMs= MINIGAME_MS;
       g.mgCfg.speedMinMs = 20;  g.mgCfg.speedMaxMs = 80;
       g.mgCfg.segMin = 6;       g.mgCfg.segMax = 16;
       g.mgStartedAt  = now;
@@ -959,9 +1010,10 @@ void modeClassicMaybeAdvance(Game& g) {
       return;
     }
     else if (g.roundIndex == 5) {
-      // R5 timeout -> success if goal was met, otherwise failure
+      // R5 timeout -> if the local segment goal was met, keep rolling until the
+      // overall game timer expires. Otherwise it is still a life-loss retry.
       if (g.teamScore >= g.roundGoal) {
-        bcastGameOver(g, /*GOAL_MET*/0, GAMEOVER_BLAME_ALL);
+        continueRound5UntilGameEnd(g, now);
       } else {
         // Round 5 goal failure also costs a life; retry R5 until lives run out.
         bool skipLife = false;

@@ -34,13 +34,14 @@ struct PirRec {
 
 struct PendingStart {
   bool    needGameStart = false;
-  uint8_t nextStation   = 0;  // 1..5
+  uint8_t nextStation   = 0;  // 1..5 (0 = idle)
+  uint8_t stationPasses = 0;  // how many full 1..5 sync passes remain
   bool    needScore     = false;
 };
 
 struct Game {
   // Core
-  Phase       phase      = Phase::PLAYING;
+  Phase       phase      = Phase::END;
   LightState  light      = LightState::GREEN;
   uint32_t    nextSwitch = 0;
   uint16_t    seq        = 1;
@@ -80,14 +81,14 @@ struct Game {
   bool     bonusIntermission = false;
   uint32_t bonusInterStart   = 0;
   uint32_t bonusInterEnd     = 0;
-  uint16_t bonusInterMs      = 15000;  // default 10s
+  uint16_t bonusInterMs      = 12000;  // default 12s
   bool     bonusWarnTickStarted = false;
 
   // --- Intermission after R3 (R3.5): single-station bonus that hops every N ms ---
   bool     bonusIntermission2   = false;
   uint32_t bonus2Start          = 0;
   uint32_t bonus2End            = 0;
-  uint16_t bonus2Ms             = 15000;   // 15 s window (like R2.5)
+  uint16_t bonus2Ms             = 12000;   // 12 s window (like R2.5)
   uint16_t bonus2HopMs          = 3000;    // hop the bonus every 3 s
   uint8_t  bonus2Sid            = 0;       // currently highlighted station
   uint32_t bonus2NextHopAt      = 0;       // next hop time (millis)
@@ -98,7 +99,7 @@ struct Game {
 
   // --- Bonus runtime state (cleared at round start) ---
   uint32_t bonusActiveMask = 0;                 // bit i => station i is bonus-active
-  uint32_t bonusEndsAt[MAX_STATIONS] = {0};     // per-station TTL end time (millis)
+  uint32_t bonusEndsAt[MAX_STATIONS + 1] = {0};     // per-station TTL end time (millis)
   uint32_t bonusNextSpawnAt = 0;                // scheduler next fire (millis)
   uint8_t  bonusSpawnsThisRound = 0;            // number of spawns so far in current round
 
@@ -147,7 +148,7 @@ struct Game {
   bool      noRedThisRound  = true;     // Round 1 = true
 
   bool     pirEnforce      = true;
-  uint32_t pirArmDelayMs   = 400;   // camera motion input arms quickly; increase if light changes cause false trips
+  uint32_t pirArmDelayMs   = 500;   // camera motion input arms quickly; increase if light changes cause false trips
   uint32_t pirArmAt        = 0;
 
   // RED looting policy:

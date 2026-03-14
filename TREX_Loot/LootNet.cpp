@@ -60,11 +60,15 @@ void sendHoldStop() {
 }
 
 void sendMgResult(const TrexUid& uid, uint8_t success) {
-  uint8_t buf[sizeof(MsgHeader)+sizeof(MgResultPayload)];
-  packHeader((uint8_t)MsgType::MG_RESULT, sizeof(MgResultPayload), buf);
-  auto* p = (MgResultPayload*)(buf + sizeof(MsgHeader));
-  p->uid        = uid;
-  p->stationId  = STATION_ID;
-  p->success    = success ? 1 : 0;
-  Transport::sendToServer(buf, sizeof(buf));
+  // Short burst for reliability: the server de-duplicates by station id, so
+  // duplicates are harmless but a lost MG_RESULT can stall the post-R4 advance.
+  for (uint8_t n = 0; n < 3; ++n) {
+    uint8_t buf[sizeof(MsgHeader)+sizeof(MgResultPayload)];
+    packHeader((uint8_t)MsgType::MG_RESULT, sizeof(MgResultPayload), buf);
+    auto* p = (MgResultPayload*)(buf + sizeof(MsgHeader));
+    p->uid        = uid;
+    p->stationId  = STATION_ID;
+    p->success    = success ? 1 : 0;
+    Transport::sendToServer(buf, sizeof(buf));
+  }
 }

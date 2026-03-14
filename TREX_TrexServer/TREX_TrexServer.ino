@@ -457,15 +457,28 @@ void loop() {
     }
   }
 
-  // Drip broadcast on new game start (unchanged)
+  // Drip broadcast on new game / round / bonus transitions.
+  // Re-send station inventory in a few full passes so Loot clients recover if
+  // one ESP-NOW broadcast gets dropped during a busy scene change.
   static uint32_t lastSend = 0;
   if (now - lastSend >= 50) { // ~20 msgs/sec
     if (g.pending.needGameStart) {
       bcastGameStart(g);
       g.pending.needGameStart = false;
       lastSend = now;
-    } else if (g.pending.nextStation >= 1 && g.pending.nextStation <= 5) {
-      bcastStation(g, g.pending.nextStation++);
+    } else if (g.pending.stationPasses && g.pending.nextStation >= 1 && g.pending.nextStation <= 5) {
+      const uint8_t sid = g.pending.nextStation;
+      bcastStation(g, sid);
+      ++g.pending.nextStation;
+      if (g.pending.nextStation > 5) {
+        g.pending.nextStation = 1;
+        if (g.pending.stationPasses > 0) {
+          --g.pending.stationPasses;
+        }
+        if (g.pending.stationPasses == 0) {
+          g.pending.nextStation = 0;
+        }
+      }
       lastSend = now;
     } else if (g.pending.needScore) {
       bcastScore(g);
@@ -478,13 +491,17 @@ void loop() {
   static uint8_t  lastRoundIdxForBcast      = 0;
   static uint32_t lastRoundStatusSentMs     = 0;
   static uint32_t roundStatusBurstUntilMs   = 0;
+  static uint32_t lastBonusMaskForSync      = 0xFFFFFFFFUL;
+  static uint32_t lastBonusSyncSentMs       = 0;
+  static uint32_t bonusSyncBurstUntilMs     = 0;
 
   // STATE_TICK @ tickHz (only while PLAYING; use current phase timer)
   const uint32_t tickMs = max<uint32_t>(10, 1000 / g.tickHz);
   if (now - g.lastTickSentMs >= tickMs) {
     if (g.phase == Phase::PLAYING) {
       uint32_t msLeft = 0;
-      if      (g.bonusIntermission)  msLeft = (g.bonusInterEnd  > now)?(g.bonusInterEnd  - now):0;
+      if      (g.mgActive)           msLeft = (g.mgDeadline    > now)?(g.mgDeadline    - now):0;
+      else if (g.bonusIntermission)  msLeft = (g.bonusInterEnd  > now)?(g.bonusInterEnd  - now):0;
       else if (g.bonusIntermission2) msLeft = (g.bonus2End      > now)?(g.bonus2End      - now):0;
       else                           msLeft = (g.roundEndAt     > now)?(g.roundEndAt     - now):0;
       sendStateTick(g, msLeft); 
@@ -505,6 +522,45 @@ void loop() {
       }
     }
     g.lastTickSentMs = now;
+  }
+
+  // Keep BONUS_UPDATE reliable too, especially at bonus start/hop transitions.
+  if (g.phase == Phase::PLAYING) {
+    if (g.bonusActiveMask != lastBonusMaskForSync) {
+      lastBonusMaskForSync  = g.bonusActiveMask;
+      bonusSyncBurstUntilMs = now + 1500;
+      lastBonusSyncSentMs   = 0;
+    }
+
+    if (g.bonusActiveMask != 0) {
+      const uint32_t bonusSyncIntervalMs = (now < bonusSyncBurstUntilMs) ? 500 : 1500;
+      if (now - lastBonusSyncSentMs >= bonusSyncIntervalMs) {
+        bcastBonusUpdate(g);
+        lastBonusSyncSentMs = now;
+      }
+    }
+  }
+
+  // Overall success timer: if the team makes it to 6:00, end successfully.
+  // One exception: if Round 4 has *already* been completed this loop, let the
+  // minigame start first instead of skipping it because the overall timer hit
+  // on the same transition. Once the minigame ends, the next loop can still
+  // end the room successfully if the 6:00 timer has expired.
+  const bool pendingRound4Minigame =
+      (g.phase == Phase::PLAYING) &&
+      !g.mgActive &&
+      !g.bonusIntermission &&
+      !g.bonusIntermission2 &&
+      (g.roundIndex == 4) &&
+      (g.teamScore >= g.roundGoal);
+
+  if (g.phase == Phase::PLAYING &&
+      g.gameEndAt > 0 &&
+      now >= g.gameEndAt &&
+      !pendingRound4Minigame &&
+      !g.mgActive) {
+    bcastGameOver(g, /*GOAL_MET*/0, GAMEOVER_BLAME_ALL);
+    return;
   }
 
   // === Minigame tick ===

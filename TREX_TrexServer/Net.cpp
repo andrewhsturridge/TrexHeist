@@ -5,6 +5,7 @@
 #include "Media.h"
 #include "OtaCampaign.h"
 #include "GameAudio.h"
+#include "Cadence.h"
 #include "Bonus.h"
 #include "ServerMini.h"
 
@@ -175,11 +176,15 @@ void bcastRoundStatus(Game& g) {
 }
 
 void bcastBonusUpdate(Game& g) {
-  uint8_t buf[sizeof(MsgHeader) + sizeof(BonusUpdatePayload)];
-  packHeader(g, (uint8_t)MsgType::BONUS_UPDATE, sizeof(BonusUpdatePayload), buf);
-  auto* p = (BonusUpdatePayload*)(buf + sizeof(MsgHeader));
-  p->mask = g.bonusActiveMask;
-  Transport::broadcast(buf, sizeof(buf));
+  // Short burst: a missed BONUS_UPDATE is what makes a station stay plain green
+  // until some later interaction re-syncs it.
+  for (uint8_t n = 0; n < 3; ++n) {
+    uint8_t buf[sizeof(MsgHeader) + sizeof(BonusUpdatePayload)];
+    packHeader(g, (uint8_t)MsgType::BONUS_UPDATE, sizeof(BonusUpdatePayload), buf);
+    auto* p = (BonusUpdatePayload*)(buf + sizeof(MsgHeader));
+    p->mask = g.bonusActiveMask;
+    Transport::broadcast(buf, sizeof(buf));
+  }
 }
 
 // --- Game status broadcast for Control station ---
@@ -281,22 +286,26 @@ LifeLossResult applyLifeLoss(Game& g, uint8_t reason, uint8_t blameSid /*=GAMEOV
 }
 
 void bcastMgStart(Game& g, const Game::MgConfig& c) {
-  uint8_t buf[sizeof(MsgHeader) + sizeof(MgStartPayload)];
-  packHeader(g, (uint8_t)MsgType::MG_START, sizeof(MgStartPayload), buf);
-  auto* p = (MgStartPayload*)(buf + sizeof(MsgHeader));
-  p->seed       = c.seed;
-  p->timerMs    = c.timerMs;
-  p->speedMinMs = c.speedMinMs;
-  p->speedMaxMs = c.speedMaxMs;
-  p->segMin     = c.segMin;
-  p->segMax     = c.segMax;
-  Transport::broadcast(buf, sizeof buf);
+  for (uint8_t n = 0; n < 3; ++n) {
+    uint8_t buf[sizeof(MsgHeader) + sizeof(MgStartPayload)];
+    packHeader(g, (uint8_t)MsgType::MG_START, sizeof(MgStartPayload), buf);
+    auto* p = (MgStartPayload*)(buf + sizeof(MsgHeader));
+    p->seed       = c.seed;
+    p->timerMs    = c.timerMs;
+    p->speedMinMs = c.speedMinMs;
+    p->speedMaxMs = c.speedMaxMs;
+    p->segMin     = c.segMin;
+    p->segMax     = c.segMax;
+    Transport::broadcast(buf, sizeof buf);
+  }
 }
 
 void bcastMgStop(Game& g) {
-  uint8_t buf[sizeof(MsgHeader)];
-  packHeader(g, (uint8_t)MsgType::MG_STOP, 0, buf);
-  Transport::broadcast(buf, sizeof buf);
+  for (uint8_t n = 0; n < 3; ++n) {
+    uint8_t buf[sizeof(MsgHeader)];
+    packHeader(g, (uint8_t)MsgType::MG_STOP, 0, buf);
+    Transport::broadcast(buf, sizeof buf);
+  }
 }
 
 void sendDropResult(Game& g, uint16_t dropped, uint8_t readerIndex /*=DROP_READER_UNKNOWN*/) {
@@ -630,6 +639,23 @@ void onRx(const uint8_t* data, uint16_t len) {
       auto* p = (const DropRequestPayload*)(data+sizeof(MsgHeader));
 
       extern Game g; Game& G = g;
+
+      // Dropping during RED is an immediate violation at the Drop-off station.
+      // Reject the drop (bank nothing), consume at most one life for this RED,
+      // and kick the room back to GREEN like the camera/PIR path does.
+      if (G.phase == Phase::PLAYING && G.light == LightState::RED) {
+        sendDropResult(G, /*dropped=*/0, p->readerIndex);
+
+        if (!G.pirLifeLostThisRed) {
+          const LifeLossResult r = applyLifeLoss(G, /*RED_PIR / red drop*/3, /*DROP station*/6, /*obeyLockout=*/true);
+          if (r == LifeLossResult::LIFE_LOST) {
+            G.pirLifeLostThisRed = true;
+            enterGreen(G);
+          }
+        }
+        break;
+      }
+
       int pi = ensurePlayer(G, p->uid);
       if (pi < 0) break;
 

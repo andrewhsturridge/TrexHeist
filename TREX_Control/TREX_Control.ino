@@ -431,9 +431,10 @@ static void pmsTick() {
   uint8_t  lives = statusValid ? gStatus.livesRemaining : 0;
   uint8_t  light = statusValid ? gStatus.lightState : 255;
   const char* lightStr = pmsLightStr(light);
-  // Stage timer: while PLAYING, expose the current stage countdown (round/intermission/minigame).
-  // Otherwise, fall back to the legacy msLeftGame field.
-  uint32_t tleft = (curKind == 2) ? (statusValid ? gStatus.msLeftRound : 0) : msLeftGame;
+
+  // PMS should show the current round/stage timer, not the overall game timer.
+  // The overall game timer still exists on the server for success/fail logic.
+  uint32_t tleft = statusValid ? gStatus.msLeftRound : 0;
 
   // Initialize baseline without emitting spurious events.
   if (!gPmsBaselineValid) {
