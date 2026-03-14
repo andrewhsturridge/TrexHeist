@@ -69,8 +69,9 @@ void forceGaugeRepaint();
 // True unless OTA or game-over or Yellow OFF phase blocks painting
 bool canPaintGaugeNow();
 
-// Game-over visual (3 fast red blinks → off)
+// Final visuals (3 quick blinks → off)
 void gameOverBlinkAndOff();
+void gameSuccessBlinkAndOff();
 
 // ---- OTA visual helpers (used by blocking URL OTA) ----
 void otaVisualStart();

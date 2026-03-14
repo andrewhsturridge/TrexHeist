@@ -515,26 +515,41 @@ void tickEmptyBlink() {
   }
 }
 
-// ===== Game-over visual =====
-void gameOverBlinkAndOff() {
-  // 3 quick red blinks on ring + gauge + MOSFET, then off
+// ===== Final visuals =====
+static void finalBlinkAndOff(uint32_t color) {
   const int cycles = 3;
-  for (int k = 0;k < cycles; ++k) {
+  for (int k = 0; k < cycles; ++k) {
     // ON
-    fillGauge(RED);
+    fillRing(color);
+    fillGauge(color);
     digitalWrite(PIN_MOSFET, HIGH);
     uint32_t t = millis();
-    while (millis() - t < 500);
+    while (millis() - t < 500) {
+      // intentional blocking one-shot
+    }
 
     // OFF
+    fillRing(OFF);
     fillGauge(OFF);
     digitalWrite(PIN_MOSFET, LOW);
     t = millis();
-    while (millis() - t < 500);
+    while (millis() - t < 500) {
+      // intentional blocking one-shot
+    }
   }
+
   // Final state: fully off
+  fillRing(OFF);
   fillGauge(OFF);
   digitalWrite(PIN_MOSFET, LOW);
+}
+
+void gameOverBlinkAndOff() {
+  finalBlinkAndOff(RED);
+}
+
+void gameSuccessBlinkAndOff() {
+  finalBlinkAndOff(GREEN);
 }
 
 // ===== OTA visuals (spinner + progress + success/fail) =====

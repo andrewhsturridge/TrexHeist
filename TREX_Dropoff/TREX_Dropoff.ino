@@ -210,12 +210,14 @@ static uint8_t  reqHead = 0, reqTail = 0;
 inline bool reqEnqueue(int8_t idx) { uint8_t n=(reqTail+1)&3; if(n==reqHead) return false; reqQueue[reqTail]=idx; reqTail=n; return true; }
 inline int8_t reqDequeue(){ if(reqHead==reqTail) return -1; int8_t v=reqQueue[reqHead]; reqHead=(reqHead+1)&3; return v; }
 
-// --- Post-game final bars blink (red blinks, green solid) ---
-static bool     finalBlinkActive  = false;
-static bool     finalBlinkOn      = false;
-static uint32_t finalBlinkLastMs  = 0;
+// --- Post-game final blink ---
+static bool     finalBlinkActive   = false;
+static bool     finalBlinkOn       = false;
+static bool     finalBlinkSuccess  = false;
+static uint32_t finalBlinkLastMs   = 0;
 constexpr uint32_t FINAL_BLINK_PERIOD_MS = 500;
-static uint32_t finalScoreSnapshot = 0;   // score to display during the blink
+static uint32_t finalScoreSnapshot = 0;   // score to display during a failure blink
+
 
 /* misc */
 uint16_t g_seq = 1;
@@ -449,32 +451,48 @@ void drawTeamGaugesRound(uint32_t score, uint32_t target) {
   }
 }
 
-void drawFinalBarsFrame(uint32_t score, uint32_t target, bool redOn) {
-  // Map score to the full gauge length (no reserved marker in post-game)
+void drawFinalBarsFrame(uint32_t score, uint32_t target, bool blinkOn, bool success) {
   uint16_t lit = 0;
-  if (target == 0) target = 1;
-  const uint32_t clamped = (score > target) ? target : score;
-  const uint32_t scaled  = clamped * GAUGE_LEN + (target - 1);
-  lit = (uint16_t)min<uint32_t>(GAUGE_LEN, scaled / TEAM_GOAL);
+
+  if (!success) {
+    // Map score to the full gauge length (no reserved marker in post-game)
+    if (target == 0) target = 1;
+    const uint32_t clamped = (score > target) ? target : score;
+    const uint32_t scaled  = clamped * GAUGE_LEN + (target - 1);
+    lit = (uint16_t)min<uint32_t>(GAUGE_LEN, scaled / TEAM_GOAL);
+  }
 
   for (auto &g : gauge) {
     for (uint16_t i=0; i<GAUGE_LEN; ++i) {
-      const bool inGreen = (i < lit);
-      const uint32_t c = inGreen ? GREEN : (redOn ? RED : OFF);
+      uint32_t c;
+      if (success) {
+        c = blinkOn ? GREEN : OFF;
+      } else {
+        const bool inGreen = (i < lit);
+        c = inGreen ? GREEN : (blinkOn ? RED : OFF);
+      }
       g.setPixelColor(i, c);
       if ((i & 15) == 0) pumpAudio();
     }
     if (!audioExclusive) g.show();
     pumpAudio();
   }
+
+  const uint32_t ringColor = success ? (blinkOn ? GREEN : OFF)
+                                     : (blinkOn ? RED   : OFF);
+  for (int i = 0; i < 4; ++i) {
+    fillRing((uint8_t)i, ringColor);
+    pumpAudio();
+  }
 }
 
-void startFinalBlink(uint32_t score, uint32_t target) {
+void startFinalBlink(uint32_t score, uint32_t target, bool success) {
   finalScoreSnapshot = score;
   finalBlinkActive   = true;
   finalBlinkOn       = true;
+  finalBlinkSuccess  = success;
   finalBlinkLastMs   = millis();
-  drawFinalBarsFrame(finalScoreSnapshot, target, finalBlinkOn);
+  drawFinalBarsFrame(finalScoreSnapshot, target, finalBlinkOn, finalBlinkSuccess);
 }
 
 void stopFinalBlink() {
@@ -487,7 +505,7 @@ void tickFinalBlink() {
   if ((now - finalBlinkLastMs) >= FINAL_BLINK_PERIOD_MS) {
     finalBlinkLastMs = now;
     finalBlinkOn = !finalBlinkOn;
-    drawFinalBarsFrame(finalScoreSnapshot, roundTargetCount(), finalBlinkOn);
+    drawFinalBarsFrame(finalScoreSnapshot, roundTargetCount(), finalBlinkOn, finalBlinkSuccess);
   }
 }
 
@@ -697,14 +715,26 @@ void onRx(const uint8_t* data, uint16_t len) {
     case MsgType::GAME_OVER: {
       gameActive = false;
       bonusActiveMask = 0;
-      Serial.printf("[DROP] GAME_OVER  final score=%lu / %lu\n",
-                    (unsigned long)teamScore, (unsigned long)TEAM_GOAL);
+
+      const auto* p = (const GameOverPayload*)(data + sizeof(MsgHeader));
+      const uint8_t reason = (h->payloadLen >= sizeof(GameOverPayload))
+        ? p->reason
+        : GAMEOVER_REASON_GOAL_NOT_MET;
+      const bool success = (reason == GAMEOVER_REASON_SUCCESS);
+
+      Serial.printf("[DROP] GAME_OVER reason=%u final score=%lu / %lu\n",
+                    (unsigned)reason,
+                    (unsigned long)teamScore,
+                    (unsigned long)TEAM_GOAL);
 
       stopAudioExclusive();
 
-      for (int i=0;i<4;i++) { tagPresent[i]=false; absentMs[i]=0; fillRing(i, RED); }
+      for (int i=0; i<4; ++i) {
+        tagPresent[i] = false;
+        absentMs[i]   = 0;
+      }
 
-      startFinalBlink(teamScore - roundStartScore, roundTargetCount());
+      startFinalBlink(teamScore - roundStartScore, roundTargetCount(), success);
       break;
     }
 

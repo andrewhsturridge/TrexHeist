@@ -109,15 +109,21 @@ void bcastGameStart(Game& g) {
 
 void bcastGameOver(Game& g, uint8_t reason, uint8_t blameSid /*=GAMEOVER_BLAME_ALL*/) {
   if (g.phase == Phase::END) return; // single-shot
-  g.phase = Phase::END;
 
-  // Kill any intermission/bonus and notify clients so rainbow stops
-  g.bonusIntermission = false;
-  g.bonusActiveMask   = 0;
+  const bool success = (reason == GAMEOVER_REASON_SUCCESS);
+
+  g.phase = Phase::END;
+  g.light = success ? LightState::GREEN : LightState::RED;
+
+  // Kill any intermission/bonus and notify clients so rainbow stops.
+  g.bonusIntermission  = false;
+  g.bonusIntermission2 = false;
+  g.bonusActiveMask    = 0;
+  g.mgActive           = false;
   for (uint8_t sid = 1; sid <= MAX_STATIONS; ++sid) g.bonusEndsAt[sid] = 0;
   bcastBonusUpdate(g);  // mask=0
 
-  // Stop any looping SFX before we play the lose sting
+  // Stop any looping SFX before we play the final one-shot.
   gameAudioStop();
 
   // GAME_OVER payload
@@ -133,11 +139,17 @@ void bcastGameOver(Game& g, uint8_t reason, uint8_t blameSid /*=GAMEOVER_BLAME_A
   // keep scheduler from immediately sending more ticks
   g.lastTickSentMs = millis();
 
-  // Clean up holds and media
+  // Clean up holds and play the appropriate ending media.
   for (auto &h : g.holds) h.active = false;
-  gameAudioPlayOnce(TRK_TREX_LOSE);
-  spritePlay(CLIP_GAME_OVER);
-  Serial.printf("[TREX] GAME OVER! reason=%u blameSid=%u\n", reason, blameSid);
+  if (success) {
+    gameAudioPlayOnce(TRK_TREX_WIN);
+    spritePlay(CLIP_SUCCESS);
+    Serial.printf("[TREX] SUCCESS! reason=%u blameSid=%u\n", reason, blameSid);
+  } else {
+    gameAudioPlayOnce(TRK_TREX_LOSE);
+    spritePlay(CLIP_GAME_OVER);
+    Serial.printf("[TREX] GAME OVER! reason=%u blameSid=%u\n", reason, blameSid);
+  }
 }
 
 void bcastScore(Game& g) {

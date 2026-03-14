@@ -51,6 +51,7 @@ extern void stopEmptyBlink();
 extern void startFullBlinkImmediate();
 extern void stopFullBlink();
 extern void gameOverBlinkAndOff();
+extern void gameSuccessBlinkAndOff();
 extern void drawRingCarried(uint8_t cur, uint8_t maxC);
 
 extern void playBonusSpawnChime();
@@ -329,21 +330,30 @@ void onRx(const uint8_t* data, uint16_t len) {
       tagPresent      = false;
       fullBlinkActive = false;
 
+      const bool success      = (reason == GAMEOVER_REASON_SUCCESS);
+      const bool redViolation = (reason == GAMEOVER_REASON_RED_VIOLATION);
+
       s_isBonusNow = false;
-      g_lightState = LightState::RED;
+      g_lightState = success ? LightState::GREEN : LightState::RED;
       stopYellowBlink();
       stopEmptyBlink();
       stopAudio();
 
       fillGauge(0);
-      if (!otaInProgress) fillRing(Adafruit_NeoPixel::Color(255,0,0));
+      if (!otaInProgress) {
+        fillRing(success
+          ? Adafruit_NeoPixel::Color(0,255,0)
+          : Adafruit_NeoPixel::Color(255,0,0));
+      }
 
-      const bool redViolation = (reason == 3); // 3 = RED_VIOLATION (PIR / loot-in-red)
-      const bool offender     = redViolation &&
-                                (blameSid != GAMEOVER_BLAME_ALL) &&
-                                (blameSid == STATION_ID);
-      const bool shouldBlink  = !redViolation || offender;
-      if (shouldBlink) gameOverBlinkAndOff();
+      const bool offender    = redViolation &&
+                               (blameSid != GAMEOVER_BLAME_ALL) &&
+                               (blameSid == STATION_ID);
+      const bool shouldBlink = success || !redViolation || offender;
+      if (shouldBlink) {
+        if (success) gameSuccessBlinkAndOff();
+        else         gameOverBlinkAndOff();
+      }
 
       Serial.printf("[LOOT] GAME_OVER reason=%u blame=%u me=%u\n",
                     reason, blameSid, STATION_ID);

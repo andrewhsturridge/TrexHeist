@@ -14,10 +14,10 @@
 //
 //   Control -> PMS:
 //     !PMS PONG v=1 game=trex role=control
-//     !PMS STATUS v=1 state=arming|playing level=1 score=.. lives=.. tleft_ms=.. last_reason=.. light=green|yellow|red
+//     !PMS STATUS v=1 state=arming|playing|success level=1 score=.. lives=.. tleft_ms=.. last_reason=.. light=green|yellow|red
 //       (STATUS is NOT emitted while idle)
 //     !PMS EVENT v=1 name=game_start level=1
-//     !PMS EVENT v=1 name=game_end reason=timeup|no_lives|stopped score=.. lives=..
+//     !PMS EVENT v=1 name=game_end reason=success|timeup|no_lives|stopped score=.. lives=..
 //     !PMS EVENT v=1 name=score delta=.. total=.. bonus=0|1
 //     !PMS EVENT v=1 name=life delta=-1 lives=..
 //     !PMS EVENT v=1 name=light light=green|yellow|red
@@ -138,16 +138,17 @@ static void applyRadioCfgAndReboot(const RadioCfgPayload& msg) {
 
 // Simple snapshot of latest game status from server
 struct GameStatusSnapshot {
-  bool     hasStatus     = false;
-  uint32_t teamScore     = 0;
-  uint32_t msLeftGame    = 0;
-  uint32_t msLeftRound   = 0;
-  uint8_t  roundIndex    = 0;
-  uint8_t  phase         = 0;   // Phase enum: 1=PLAYING, 2=END
-  uint8_t  lightState    = 0;   // LightState: 0=GREEN,1=RED,2=YELLOW
-  uint8_t  livesRemaining= 0;
-  uint8_t  livesMax      = 0;
-  uint32_t lastUpdateMs  = 0;
+  bool     hasStatus          = false;
+  uint32_t teamScore          = 0;
+  uint32_t msLeftGame         = 0;
+  uint32_t msLeftRound        = 0;
+  uint8_t  roundIndex         = 0;
+  uint8_t  phase              = 0;   // Phase enum: 1=PLAYING, 2=END
+  uint8_t  lightState         = 0;   // LightState: 0=GREEN,1=RED,2=YELLOW
+  uint8_t  livesRemaining     = 0;
+  uint8_t  livesMax           = 0;
+  uint8_t  lastGameOverReason = 255;
+  uint32_t lastUpdateMs       = 0;
 };
 
 static GameStatusSnapshot gStatus;
@@ -420,7 +421,6 @@ static void pmsTick() {
   }
 
   uint32_t msLeftGame = statusValid ? gStatus.msLeftGame : 0;
-
   uint8_t curKind  = pmsStateKind(statusValid, statusValid ? gStatus.phase : 0, msLeftGame);
   const char* curStateStr = pmsStateStr(curKind);
 
@@ -432,8 +432,7 @@ static void pmsTick() {
   uint8_t  light = statusValid ? gStatus.lightState : 255;
   const char* lightStr = pmsLightStr(light);
 
-  // PMS should show the current round/stage timer, not the overall game timer.
-  // The overall game timer still exists on the server for success/fail logic.
+  // PMS should show the current stage timer, not the overall game timer.
   uint32_t tleft = statusValid ? gStatus.msLeftRound : 0;
 
   // Initialize baseline without emitting spurious events.
@@ -454,15 +453,13 @@ static void pmsTick() {
     return;
   }
 
-  bool stateChanged = (curKind != gPmsLastStateKind);
+  const bool stateChanged = (curKind != gPmsLastStateKind);
+  const bool lightChanged = (statusValid && gPmsLastStatusValid && (light != gPmsLastLight));
 
-  bool lightChanged = (statusValid && gPmsLastStatusValid && (light != gPmsLastLight));
-
-  int32_t scoreDelta = (int32_t)score - (int32_t)gPmsLastScore;
-  int32_t livesDelta = (int32_t)lives - (int32_t)gPmsLastLives;
+  const int32_t scoreDelta = (int32_t)score - (int32_t)gPmsLastScore;
+  const int32_t livesDelta = (int32_t)lives - (int32_t)gPmsLastLives;
 
   // EVENTS (only when data is fresh)
-  // - game_start can be emitted when we first see PLAYING with fresh data
   if (statusValid && !stale) {
     if (curKind == 2 && gPmsLastStateKind != 2) {
       pmsPrintEventGameStart(level);
@@ -470,29 +467,46 @@ static void pmsTick() {
     }
   }
 
-  // Other events require both previous and current snapshots to be fresh & valid
+  // Other events require both previous and current snapshots to be fresh & valid.
   if (statusValid && gPmsLastStatusValid && !stale && !gPmsLastWasStale) {
-    // game_end: leaving PLAYING
-    if (gPmsLastStateKind == 2 && curKind != 2) {
+    const bool leavingPlaying = (gPmsLastStateKind == 2 && curKind != 2);
+
+    if (leavingPlaying) {
+      // Emit final deltas before game_end so PMS sees the true final snapshot.
+      if (scoreDelta > 0) {
+        bool bonus = (scoreDelta > 1);
+        pmsPrintEventScore(scoreDelta, score, bonus);
+      }
+      if (livesDelta < 0) {
+        pmsPrintEventLife(livesDelta, lives);
+      }
+
+      const bool success = (gStatus.lastGameOverReason == GAMEOVER_REASON_SUCCESS);
       const char* reason = "timeup";
-      if (gEndHintStopped) {
+      if (success) {
+        reason = "success";
+      } else if (gEndHintStopped || gStatus.lastGameOverReason == GAMEOVER_REASON_MANUAL) {
         reason = "stopped";
         gEndHintStopped = false;
       } else if (lives == 0) {
         reason = "no_lives";
       }
+
+      if (success) {
+        pmsPrintStatus("success", level, score, lives, 0, "state", "green");
+      }
       pmsPrintEventGameEnd(reason, score, lives);
-    }
+    } else {
+      // score: ignore negative deltas (resets)
+      if (scoreDelta > 0) {
+        bool bonus = (scoreDelta > 1);
+        pmsPrintEventScore(scoreDelta, score, bonus);
+      }
 
-    // score: ignore negative deltas (resets)
-    if (scoreDelta > 0) {
-      bool bonus = (scoreDelta > 1);
-      pmsPrintEventScore(scoreDelta, score, bonus);
-    }
-
-    // life: ignore positive deltas (resets)
-    if (livesDelta < 0) {
-      pmsPrintEventLife(livesDelta, lives);
+      // life: ignore positive deltas (resets)
+      if (livesDelta < 0) {
+        pmsPrintEventLife(livesDelta, lives);
+      }
     }
   }
 
@@ -651,6 +665,7 @@ void onRx(const uint8_t* data, uint16_t len) {
       gStatus.roundIndex   = p->roundIndex;
       gStatus.phase        = p->phase;
       gStatus.lightState   = p->lightState;
+      if (p->phase == 1) gStatus.lastGameOverReason = 255;
       gStatus.lastUpdateMs = millis();
       gServerInMaint       = false;   // fresh status => server back from maint
 
@@ -700,8 +715,13 @@ void onRx(const uint8_t* data, uint16_t len) {
     case MsgType::GAME_OVER: {
       if (h->payloadLen < sizeof(GameOverPayload)) break;
       auto* p = (const GameOverPayload*)payload;
-      (void)p;
-      gStatus.phase        = 2;  // END
+      gStatus.phase              = 2;  // END
+      gStatus.msLeftGame         = 0;
+      gStatus.msLeftRound        = 0;
+      gStatus.lastGameOverReason = p->reason;
+      if (p->reason == GAMEOVER_REASON_SUCCESS) {
+        gStatus.lightState = (uint8_t)LightState::GREEN;
+      }
       gStatus.hasStatus      = true;
       gStatus.lastUpdateMs   = millis();
       gServerInMaint         = false;
