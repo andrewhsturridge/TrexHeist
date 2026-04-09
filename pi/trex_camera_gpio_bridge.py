@@ -16,6 +16,8 @@ Electrical assumptions for the simple v1 wiring:
 Output behaviour:
 - Idle / no motion  => Pi drives the line HIGH.
 - Motion detected   => Pi drives the line LOW.
+- Release to HIGH is lightly debounced, and a short LOW hold can be enforced
+  so the Feather/ESP32 side reliably sees each motion event.
 
 This intentionally mimics the old active-LOW PIR input so the Feather code can
 reuse its existing logic.
@@ -82,6 +84,8 @@ class CameraBridge:
         self.child: subprocess.Popen[str] | None = None
         self.motion_state = False
         self.started_at = 0.0
+        self.motion_hold_until = 0.0
+        self.motion_stopped_at = 0.0
 
     def build_command(self) -> list[str]:
         cmd = [
@@ -104,7 +108,11 @@ class CameraBridge:
         return elapsed_ms < self.args.startup_ignore_ms
 
     def handle_motion_detected(self) -> None:
+        now = time.monotonic()
         self.motion_state = True
+        self.motion_stopped_at = 0.0
+        hold_sec = max(0.0, self.args.motion_hold_ms / 1000.0)
+        self.motion_hold_until = max(self.motion_hold_until, now + hold_sec)
         if self.startup_ignore_active():
             print("[bridge] Motion detected during startup-ignore window; output held HIGH.", flush=True)
             return
@@ -112,11 +120,28 @@ class CameraBridge:
 
     def handle_motion_stopped(self) -> None:
         self.motion_state = False
-        self.output.set_idle("motion_stopped")
+        self.motion_stopped_at = time.monotonic()
+        if self.output.active:
+            print("[bridge] Motion stopped; waiting for debounce/hold before releasing HIGH.", flush=True)
 
     def ensure_output_matches_state(self) -> None:
-        if self.motion_state and not self.output.active and not self.startup_ignore_active():
-            self.output.set_active("startup_ignore_elapsed")
+        now = time.monotonic()
+        if self.motion_state:
+            if not self.output.active and not self.startup_ignore_active():
+                self.output.set_active("startup_ignore_elapsed")
+            return
+
+        if not self.output.active:
+            return
+
+        if now < self.motion_hold_until:
+            return
+
+        debounce_sec = max(0.0, self.args.motion_stop_debounce_ms / 1000.0)
+        if self.motion_stopped_at > 0.0 and (now - self.motion_stopped_at) < debounce_sec:
+            return
+
+        self.output.set_idle("motion_stopped")
 
     def terminate_child(self) -> None:
         if self.child is None:
@@ -136,6 +161,8 @@ class CameraBridge:
         cmd = self.build_command()
         print("[bridge] launching:", " ".join(cmd), flush=True)
         self.motion_state = False
+        self.motion_hold_until = 0.0
+        self.motion_stopped_at = 0.0
         self.output.set_idle("camera_start")
         self.started_at = time.monotonic()
 
@@ -197,6 +224,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lores-height", type=int, default=540, help="Low-res height for motion_detect (default: 540)")
     parser.add_argument("--startup-ignore-ms", type=int, default=3000,
                         help="Ignore motion output for this many ms after launching rpicam (default: 3000)")
+    parser.add_argument("--motion-hold-ms", type=int, default=250,
+                        help="Keep GPIO LOW for at least this many ms after motion is detected (default: 250)")
+    parser.add_argument("--motion-stop-debounce-ms", type=int, default=150,
+                        help="Require motion to stay stopped for this many ms before releasing HIGH (default: 150)")
     parser.add_argument("--restart-delay-sec", type=float, default=2.0,
                         help="Delay before restarting rpicam if it exits (default: 2.0)")
     parser.add_argument("--camera-index", type=int, default=None,

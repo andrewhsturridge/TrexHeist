@@ -138,17 +138,19 @@ static void applyRadioCfgAndReboot(const RadioCfgPayload& msg) {
 
 // Simple snapshot of latest game status from server
 struct GameStatusSnapshot {
-  bool     hasStatus          = false;
-  uint32_t teamScore          = 0;
-  uint32_t msLeftGame         = 0;
-  uint32_t msLeftRound        = 0;
-  uint8_t  roundIndex         = 0;
-  uint8_t  phase              = 0;   // Phase enum: 1=PLAYING, 2=END
-  uint8_t  lightState         = 0;   // LightState: 0=GREEN,1=RED,2=YELLOW
-  uint8_t  livesRemaining     = 0;
-  uint8_t  livesMax           = 0;
-  uint8_t  lastGameOverReason = 255;
-  uint32_t lastUpdateMs       = 0;
+  bool     hasStatus            = false;
+  uint32_t teamScore            = 0;
+  uint32_t msLeftGame           = 0;
+  uint32_t msLeftRound          = 0;
+  uint8_t  roundIndex           = 0;
+  uint8_t  phase                = 0;   // Phase enum: 1=PLAYING, 2=END
+  uint8_t  lightState           = 0;   // LightState: 0=GREEN,1=RED,2=YELLOW
+  uint8_t  livesRemaining       = 0;
+  uint8_t  livesMax             = 0;
+  uint8_t  lastGameOverReason   = 255;
+  uint8_t  lastLifeLossReason   = 0;
+  uint8_t  lastLifeLossBlameSid = GAMEOVER_BLAME_ALL;
+  uint32_t lastUpdateMs         = 0;
 };
 
 static GameStatusSnapshot gStatus;
@@ -206,9 +208,29 @@ static const char* pmsLightStr(uint8_t ls) {
 }
 
 
-static const char* pmsLastReasonStr(bool stale, bool stateChanged, bool lightChanged, int32_t scoreDelta, int32_t livesDelta) {
+static const char* pmsLifeReasonStr(uint8_t reason) {
+  switch (reason) {
+    case 3: return "red_violation";
+    case 4: return "round_timeout";
+    case 0: return "none";
+    default: return "unknown";
+  }
+}
+
+static const char* pmsLastReasonStr(bool stale,
+                                    bool stateChanged,
+                                    bool lightChanged,
+                                    int32_t scoreDelta,
+                                    int32_t livesDelta,
+                                    uint8_t lifeReason) {
   if (stale) return "stale";
-  if (livesDelta < 0) return "life";
+  if (livesDelta < 0) {
+    switch (lifeReason) {
+      case 3: return "life_red_violation";
+      case 4: return "life_round_timeout";
+      default: return "life";
+    }
+  }
   if (scoreDelta > 0) return "score";
   if (lightChanged)   return "light";
   if (stateChanged)   return "state";
@@ -277,12 +299,14 @@ static void pmsPrintEventScore(int32_t delta, uint32_t total, bool bonus) {
 #endif
 }
 
-static void pmsPrintEventLife(int32_t delta, uint8_t lives) {
+static void pmsPrintEventLife(int32_t delta, uint8_t lives, const char* reason) {
 #if PMS_STD_ENABLED
   Serial.print(F("!PMS EVENT v=1 name=life delta="));
   Serial.print(delta);
   Serial.print(F(" lives="));
-  Serial.println((unsigned)lives);
+  Serial.print((unsigned)lives);
+  Serial.print(F(" reason="));
+  Serial.println(reason ? reason : "unknown");
 #endif
 }
 
@@ -458,6 +482,8 @@ static void pmsTick() {
 
   const int32_t scoreDelta = (int32_t)score - (int32_t)gPmsLastScore;
   const int32_t livesDelta = (int32_t)lives - (int32_t)gPmsLastLives;
+  const uint8_t lifeReason = statusValid ? gStatus.lastLifeLossReason : 0;
+  const char* lifeReasonStr = pmsLifeReasonStr(lifeReason);
 
   // EVENTS (only when data is fresh)
   if (statusValid && !stale) {
@@ -478,7 +504,7 @@ static void pmsTick() {
         pmsPrintEventScore(scoreDelta, score, bonus);
       }
       if (livesDelta < 0) {
-        pmsPrintEventLife(livesDelta, lives);
+        pmsPrintEventLife(livesDelta, lives, lifeReasonStr);
       }
 
       const bool success = (gStatus.lastGameOverReason == GAMEOVER_REASON_SUCCESS);
@@ -505,14 +531,14 @@ static void pmsTick() {
 
       // life: ignore positive deltas (resets)
       if (livesDelta < 0) {
-        pmsPrintEventLife(livesDelta, lives);
+        pmsPrintEventLife(livesDelta, lives, lifeReasonStr);
       }
     }
   }
 
   // STATUS (only while active; no STATUS while idle)
   if (curKind != 0) {
-    const char* lastReason = pmsLastReasonStr(stale, stateChanged, lightChanged, scoreDelta, livesDelta);
+    const char* lastReason = pmsLastReasonStr(stale, stateChanged, lightChanged, scoreDelta, livesDelta, lifeReason);
     pmsPrintStatus(curStateStr, level, score, lives, tleft, lastReason, lightStr);
   }
 
@@ -689,6 +715,14 @@ void onRx(const uint8_t* data, uint16_t len) {
       gStatus.hasStatus      = true;
       gStatus.lastUpdateMs   = millis();
       gServerInMaint         = false;
+
+      if (p->reason != 0) {
+        gStatus.lastLifeLossReason   = p->reason;
+        gStatus.lastLifeLossBlameSid = p->blameSid;
+      } else if (p->livesRemaining >= p->livesMax) {
+        gStatus.lastLifeLossReason   = 0;
+        gStatus.lastLifeLossBlameSid = GAMEOVER_BLAME_ALL;
+      }
 
       // Only emit an event when this update corresponds to an actual failure
       if (p->reason != 0) {

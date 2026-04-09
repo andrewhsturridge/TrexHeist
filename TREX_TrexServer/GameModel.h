@@ -148,7 +148,7 @@ struct Game {
   bool      noRedThisRound  = true;     // Round 1 = true
 
   bool     pirEnforce      = true;
-  uint32_t pirArmDelayMs   = 500;   // camera motion input arms quickly; increase if light changes cause false trips
+  uint32_t pirArmDelayMs   = 900;   // camera motion input arming delay after RED; raised to better ignore video/light-change lag
   uint32_t pirArmAt        = 0;
 
   // RED looting policy:

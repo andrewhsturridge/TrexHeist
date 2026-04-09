@@ -109,6 +109,7 @@ constexpr uint32_t TEAM_GOAL = 100;  // 1:1 mapping by default
 
 // --- One-at-a-time scan lock (unlocks on DROP_RESULT or timeout) ---
 static bool     scanLocked = false;
+static bool     scanAwaitingResult = false;
 static uint32_t scanUnlockAt = 0;
 constexpr uint32_t SCAN_LOCK_TIMEOUT_MS = 1000;  // safety if result is delayed
 
@@ -210,12 +211,20 @@ static uint8_t  reqHead = 0, reqTail = 0;
 inline bool reqEnqueue(int8_t idx) { uint8_t n=(reqTail+1)&3; if(n==reqHead) return false; reqQueue[reqTail]=idx; reqTail=n; return true; }
 inline int8_t reqDequeue(){ if(reqHead==reqTail) return -1; int8_t v=reqQueue[reqHead]; reqHead=(reqHead+1)&3; return v; }
 
+// DROP_RESULT is now re-broadcast as a short burst from the server.
+// De-dupe repeated packets that reuse the same header seq.
+static uint16_t lastDropResultSeq   = 0;
+static uint32_t lastDropResultSeqAt = 0;
+constexpr uint32_t DROP_RESULT_DEDUPE_MS = 500;
+
 // --- Post-game final blink ---
 static bool     finalBlinkActive   = false;
 static bool     finalBlinkOn       = false;
 static bool     finalBlinkSuccess  = false;
 static uint32_t finalBlinkLastMs   = 0;
+static uint32_t finalBlinkStopAt   = 0;
 constexpr uint32_t FINAL_BLINK_PERIOD_MS = 500;
+constexpr uint32_t FINAL_BLINK_TOTAL_MS  = 10000;
 static uint32_t finalScoreSnapshot = 0;   // score to display during a failure blink
 
 
@@ -374,11 +383,23 @@ bool cardPresent(MFRC522 &m) {
   byte atqa[2]; byte len = 2;
   return m.PICC_WakeupA(atqa, &len) == MFRC522::STATUS_OK;
 }
+
+void finishCardRead(MFRC522 &m) {
+  m.PICC_HaltA();
+  m.PCD_StopCrypto1();
+}
+
 bool readUid(MFRC522 &m, TrexUid &out) {
-  if (!m.PICC_ReadCardSerial()) return false;
-  out.len = m.uid.size;
-  for (uint8_t i=0;i<out.len && i<10;i++) out.bytes[i] = m.uid.uidByte[i];
-  return true;
+  for (uint8_t attempt = 0; attempt < 3; ++attempt) {
+    if (m.PICC_ReadCardSerial()) {
+      out.len = m.uid.size;
+      for (uint8_t i=0;i<out.len && i<10;i++) out.bytes[i] = m.uid.uidByte[i];
+      finishCardRead(m);
+      return true;
+    }
+    delayMicroseconds(400);
+  }
+  return false;
 }
 void packHeader(uint8_t type, uint16_t payLen, uint8_t* buf) {
   auto* h = (MsgHeader*)buf;
@@ -459,7 +480,7 @@ void drawFinalBarsFrame(uint32_t score, uint32_t target, bool blinkOn, bool succ
     if (target == 0) target = 1;
     const uint32_t clamped = (score > target) ? target : score;
     const uint32_t scaled  = clamped * GAUGE_LEN + (target - 1);
-    lit = (uint16_t)min<uint32_t>(GAUGE_LEN, scaled / TEAM_GOAL);
+    lit = (uint16_t)min<uint32_t>(GAUGE_LEN, scaled / target);
   }
 
   for (auto &g : gauge) {
@@ -486,22 +507,45 @@ void drawFinalBarsFrame(uint32_t score, uint32_t target, bool blinkOn, bool succ
   }
 }
 
+void clearAllVisualsOff() {
+  for (auto &g : gauge) {
+    for (uint16_t i=0; i<GAUGE_LEN; ++i) {
+      g.setPixelColor(i, OFF);
+      if ((i & 15) == 0) pumpAudio();
+    }
+    if (!audioExclusive) g.show();
+    pumpAudio();
+  }
+
+  for (uint8_t i=0; i<4; ++i) {
+    ringHoldActive[i] = false;
+    fillRing(i, OFF);
+  }
+}
+
 void startFinalBlink(uint32_t score, uint32_t target, bool success) {
   finalScoreSnapshot = score;
   finalBlinkActive   = true;
   finalBlinkOn       = true;
   finalBlinkSuccess  = success;
   finalBlinkLastMs   = millis();
+  finalBlinkStopAt   = finalBlinkLastMs + FINAL_BLINK_TOTAL_MS;
   drawFinalBarsFrame(finalScoreSnapshot, target, finalBlinkOn, finalBlinkSuccess);
 }
 
 void stopFinalBlink() {
   finalBlinkActive = false;
+  finalBlinkStopAt = 0;
 }
 
 void tickFinalBlink() {
   if (!finalBlinkActive) return;
   const uint32_t now = millis();
+  if ((int32_t)(now - finalBlinkStopAt) >= 0) {
+    stopFinalBlink();
+    clearAllVisualsOff();
+    return;
+  }
   if ((now - finalBlinkLastMs) >= FINAL_BLINK_PERIOD_MS) {
     finalBlinkLastMs = now;
     finalBlinkOn = !finalBlinkOn;
@@ -623,6 +667,13 @@ void onRx(const uint8_t* data, uint16_t len) {
     case MsgType::DROP_RESULT: {
       if (h->payloadLen < 6) break;
 
+      const uint32_t nowMs = millis();
+      if (h->seq == lastDropResultSeq && (uint32_t)(nowMs - lastDropResultSeqAt) < DROP_RESULT_DEDUPE_MS) {
+        break;
+      }
+      lastDropResultSeq   = h->seq;
+      lastDropResultSeqAt = nowMs;
+
       const uint8_t* pl = data + sizeof(MsgHeader);
       uint32_t newTeamScore =  (uint32_t)pl[2]
                             | ((uint32_t)pl[3] << 8)
@@ -631,6 +682,7 @@ void onRx(const uint8_t* data, uint16_t len) {
 
       uint32_t prev = teamScore;
       teamScore = newTeamScore;
+      scanAwaitingResult = false;
 
       int8_t idxFromFifo = reqDequeue();
 
@@ -658,11 +710,13 @@ void onRx(const uint8_t* data, uint16_t len) {
           }
 
           ringHoldActive[idx] = true;
-          ringHoldUntil[idx]  = millis() + 1000;
+          ringHoldUntil[idx]  = nowMs + 1000;
           fillRing((uint8_t)idx, GREEN);
 
           scanLocked   = true;
           scanUnlockAt = ringHoldUntil[idx];
+        } else {
+          scanLocked = false;
         }
         startAudioExclusiveShort();
 
@@ -678,10 +732,14 @@ void onRx(const uint8_t* data, uint16_t len) {
     case MsgType::SCORE_UPDATE: {
       if (h->payloadLen != sizeof(ScoreUpdatePayload)) break;
       auto* p = (const ScoreUpdatePayload*)(data + sizeof(MsgHeader));
-      teamScore = p->teamScore;
+      const uint32_t newScore = p->teamScore;
+      const bool scoreChanged = (newScore != teamScore);
+      teamScore = newScore;
       if (gameActive) {
-        if (!audioExclusive) drawTeamGaugesRound(teamScore, roundTargetCount());
-        else { pendingTeamScore = teamScore; gaugeDirty = true; }
+        if (scoreChanged) {
+          if (!audioExclusive) drawTeamGaugesRound(teamScore, roundTargetCount());
+          else { pendingTeamScore = teamScore; gaugeDirty = true; }
+        }
       } else {
         finalScoreSnapshot = teamScore;
       }
@@ -690,6 +748,7 @@ void onRx(const uint8_t* data, uint16_t len) {
 
     case MsgType::GAME_START: {
       gameActive = true;
+      wasPaused = false;
       teamScore = 0;
       roundStartScore = 0;
       bonusActiveMask = 0;
@@ -697,6 +756,7 @@ void onRx(const uint8_t* data, uint16_t len) {
       Serial.println("[DROP] GAME_START");
       stopFinalBlink();
       scanLocked = false;
+      scanAwaitingResult = false;
       stopAudioExclusive();
 
       for (int i=0;i<4;i++) {
@@ -714,6 +774,8 @@ void onRx(const uint8_t* data, uint16_t len) {
 
     case MsgType::GAME_OVER: {
       gameActive = false;
+      scanLocked = false;
+      scanAwaitingResult = false;
       bonusActiveMask = 0;
 
       const auto* p = (const GameOverPayload*)(data + sizeof(MsgHeader));
@@ -844,9 +906,18 @@ void loop() {
 
   if (scanLocked && (int32_t)(now - scanUnlockAt) >= 0) {
     scanLocked = false;
-    int8_t dropped = reqDequeue();
-    if (dropped >= 0 && !ringHoldActive[dropped] && !audioExclusive) {
-      if (!tagPresent[dropped]) fillRing((uint8_t)dropped, RED);
+    int8_t pendingIdx = reqDequeue();
+    if (scanAwaitingResult) {
+      scanAwaitingResult = false;
+      if (pendingIdx >= 0 && pendingIdx < 4) {
+        tagPresent[pendingIdx] = false;
+        absentMs[pendingIdx] = 0;
+        if (!ringHoldActive[pendingIdx] && !audioExclusive) {
+          fillRing((uint8_t)pendingIdx, RED);
+        }
+      }
+    } else if (pendingIdx >= 0 && !ringHoldActive[pendingIdx] && !audioExclusive) {
+      if (!tagPresent[pendingIdx]) fillRing((uint8_t)pendingIdx, RED);
     }
   }
 
@@ -880,8 +951,9 @@ void loop() {
         tagPresent[i] = true;
         reqEnqueue(i);
 
-        scanLocked   = true;
-        scanUnlockAt = now + SCAN_LOCK_TIMEOUT_MS;
+        scanLocked          = true;
+        scanAwaitingResult  = true;
+        scanUnlockAt        = now + SCAN_LOCK_TIMEOUT_MS;
         break;
       }
 
@@ -889,17 +961,6 @@ void loop() {
     }
 
     rrStart = (rrStart + 1) & 3;
-  }
-
-  if (gameActive) {
-    if (audioExclusive) {
-      pendingTeamScore = teamScore;
-      gaugeDirty = true;
-    } else {
-      drawTeamGaugesRound(teamScore, roundTargetCount());
-    }
-  } else {
-    tickFinalBlink();
   }
 
   updateIdleRfidAttractor(now);

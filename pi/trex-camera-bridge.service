@@ -4,7 +4,7 @@ After=multi-user.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /opt/trex-camera/trex_camera_gpio_bridge.py --gpio-pin 17 --motion-json /opt/trex-camera/motion_detect.json --lens-position 0.0 --framerate 15 --lores-width 960 --lores-height 540 --startup-ignore-ms 3000
+ExecStart=/usr/bin/python3 /opt/trex-camera/trex_camera_gpio_bridge.py --gpio-pin 17 --motion-json /opt/trex-camera/motion_detect.json --lens-position 0.0 --framerate 15 --lores-width 960 --lores-height 540 --startup-ignore-ms 3000 --motion-hold-ms 250 --motion-stop-debounce-ms 150
 Restart=always
 RestartSec=2
 StandardOutput=journal

@@ -11,7 +11,7 @@
 
 namespace {
 constexpr uint32_t GAME_TOTAL_MS          = 360000UL;  // 6:00 overall success timer
-constexpr uint32_t ROUND1_MS              = 75000UL;
+constexpr uint32_t ROUND1_MS              = 70000UL;
 constexpr uint32_t ROUND2_MS              = 75000UL;
 constexpr uint32_t ROUND3_MS              = 75000UL;
 constexpr uint32_t ROUND4_MS              = 60000UL;

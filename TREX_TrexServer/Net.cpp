@@ -108,7 +108,7 @@ void bcastGameStart(Game& g) {
 }
 
 void bcastGameOver(Game& g, uint8_t reason, uint8_t blameSid /*=GAMEOVER_BLAME_ALL*/) {
-  if (g.phase == Phase::END) return; // single-shot
+  if (g.phase == Phase::END) return; // single-shot local transition
 
   const bool success = (reason == GAMEOVER_REASON_SUCCESS);
 
@@ -132,10 +132,16 @@ void bcastGameOver(Game& g, uint8_t reason, uint8_t blameSid /*=GAMEOVER_BLAME_A
   auto *p = (GameOverPayload*)(buf + sizeof(MsgHeader));
   p->reason   = reason;
   p->blameSid = blameSid;
-  Transport::broadcast(buf,sizeof(buf));
 
-  // Final STATE_TICK with 0 to freeze any wall timers
-  sendStateTick(g, 0);
+  // A one-shot transition packet can occasionally get missed during a busy RED
+  // violation moment. Send a short spaced burst so Loot/Drop/Control all make
+  // the end-state transition instead of sitting in the last RED frame.
+  for (uint8_t n = 0; n < 4; ++n) {
+    Transport::broadcast(buf, sizeof(buf));
+    sendStateTick(g, 0); // freeze timers alongside each end-state pass
+    if (n + 1 < 4) delay(12);
+  }
+
   // keep scheduler from immediately sending more ticks
   g.lastTickSentMs = millis();
 
@@ -153,10 +159,15 @@ void bcastGameOver(Game& g, uint8_t reason, uint8_t blameSid /*=GAMEOVER_BLAME_A
 }
 
 void bcastScore(Game& g) {
+  // Short burst: score rollbacks on round timeout and drop completions are both
+  // important UI sync points for DROP/CONTROL, and a single ESP-NOW packet can
+  // occasionally get lost during busy transitions.
   uint8_t buf[sizeof(MsgHeader)+sizeof(ScoreUpdatePayload)];
   packHeader(g, (uint8_t)MsgType::SCORE_UPDATE, sizeof(ScoreUpdatePayload), buf);
   ((ScoreUpdatePayload*)(buf+sizeof(MsgHeader)))->teamScore = g.teamScore;
-  Transport::broadcast(buf,sizeof(buf));
+  for (uint8_t n = 0; n < 3; ++n) {
+    Transport::broadcast(buf,sizeof(buf));
+  }
 }
 
 void bcastStation(Game& g, uint8_t stationId) {
@@ -298,7 +309,10 @@ LifeLossResult applyLifeLoss(Game& g, uint8_t reason, uint8_t blameSid /*=GAMEOV
 }
 
 void bcastMgStart(Game& g, const Game::MgConfig& c) {
-  for (uint8_t n = 0; n < 3; ++n) {
+  // Use a short spaced burst here instead of only back-to-back copies. If a
+  // single instant is busy, the Loot stations can miss the whole transition and
+  // never show the R4->R5 minigame.
+  for (uint8_t n = 0; n < 5; ++n) {
     uint8_t buf[sizeof(MsgHeader) + sizeof(MgStartPayload)];
     packHeader(g, (uint8_t)MsgType::MG_START, sizeof(MgStartPayload), buf);
     auto* p = (MgStartPayload*)(buf + sizeof(MsgHeader));
@@ -309,18 +323,23 @@ void bcastMgStart(Game& g, const Game::MgConfig& c) {
     p->segMin     = c.segMin;
     p->segMax     = c.segMax;
     Transport::broadcast(buf, sizeof buf);
+    if (n + 1 < 5) delay(10);
   }
 }
 
 void bcastMgStop(Game& g) {
-  for (uint8_t n = 0; n < 3; ++n) {
+  for (uint8_t n = 0; n < 4; ++n) {
     uint8_t buf[sizeof(MsgHeader)];
     packHeader(g, (uint8_t)MsgType::MG_STOP, 0, buf);
     Transport::broadcast(buf, sizeof buf);
+    if (n + 1 < 4) delay(8);
   }
 }
 
 void sendDropResult(Game& g, uint16_t dropped, uint8_t readerIndex /*=DROP_READER_UNKNOWN*/) {
+  // Short burst: DROP_RESULT unlocks the reader UX at the DROP station, so make
+  // it resilient to a single missed packet. The header is packed once so all
+  // retransmissions share the same seq and can be de-duped client-side.
   uint8_t buf[sizeof(MsgHeader) + sizeof(DropResultPayload)];
   packHeader(g, (uint8_t)MsgType::DROP_RESULT, sizeof(DropResultPayload), buf);
 
@@ -329,7 +348,9 @@ void sendDropResult(Game& g, uint16_t dropped, uint8_t readerIndex /*=DROP_READE
   p->teamScore   = g.teamScore;
   p->readerIndex = readerIndex;
 
-  Transport::broadcast(buf, sizeof(buf));
+  for (uint8_t n = 0; n < 3; ++n) {
+    Transport::broadcast(buf, sizeof(buf));
+  }
 }
 
 void sendHoldEnd(Game& g, uint32_t holdId, uint8_t reason) {
